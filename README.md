@@ -1,14 +1,14 @@
 # Agent Team Skill
 
-把一个 AI 会话拆成一套“多部门协作系统”的 Codex Skill。
+把一个 AI 会话拆成一套“多部门协作系统”的 Agent 协作协议与脚手架。
 
 它适合在项目变复杂以后使用：一个会话负责统筹，一个或多个会话负责执行，再用独立会话做审核把关。每个会话都有自己的职责边界、收件箱、交接班文档、日志和确认闸，避免 AI 在长上下文里越权、乱推进、忘记交接。
 
 ## 这个仓库是什么
 
-这是一个可以安装到 Codex 的 Skill 仓库。
+这是一个面向多 Agent / 多会话协作的项目脚手架仓库。它可以作为 Codex Skill 安装使用，也可以由其他支持本地文件读写和 Python 脚本执行的 AI Agent 直接调用。
 
-GitHub 页面里的 `README.md` 和 `LICENSE` 是展示说明与开源许可；真正参与 Skill 运行的是这 3 个文件：
+GitHub 页面里的 `README.md` 和 `LICENSE` 是展示说明与开源许可；真正参与协作层生成的是这 3 个文件：
 
 ```text
 SKILL.md
@@ -16,7 +16,7 @@ agents/openai.yaml
 scripts/scaffold_team.py
 ```
 
-开发验证材料只保留在本地开发母本中，不进入 GitHub 运行版，也不进入全局安装版。
+开发验证材料只保留在本地开发母本中，不进入 GitHub 公开运行版，也不进入全局安装版。
 
 ## 它解决什么问题
 
@@ -47,9 +47,11 @@ scripts/scaffold_team.py
 - **体验先于测试**：可运行功能先给用户体验，再进入专业测试。
 - **设计意图必须可视化**：涉及 UI/交互/视觉时，不能只交文字说明；但设计预览不得声称等同真实 App UI，最终 UI 验收以运行中的 App / 真实路由 / 构建或打包态截图为准。
 
-## 安装到 Codex
+## 使用方式
 
-如果你希望 Codex 自动发现这个 Skill，并保持全局安装版尽量纯净，可以同步运行三件套到 `~/.codex/skills/agent-team`：
+### 作为 Codex Skill 安装
+
+如果你希望 Codex 自动发现它，并保持全局安装版尽量纯净，可以同步运行三件套到 `~/.codex/skills/agent-team`：
 
 ```bash
 mkdir -p ~/.codex/skills
@@ -71,9 +73,22 @@ rsync -a --delete SKILL.md agents scripts ~/.codex/skills/agent-team/
 
 安装后，如果当前 Codex 环境不会自动热加载新 Skill，请重启或刷新 Codex。
 
+### 作为普通脚手架使用
+
+任何能执行 Python、能读写项目文件的 Agent 或开发者，都可以直接运行：
+
+```bash
+python3 scripts/scaffold_team.py "/path/to/project" \
+  --profile "通用项目协作" \
+  --roles "lead,do,review" \
+  --session-mode "manual"
+```
+
+脚本会在目标项目中生成 `docs/collaboration/`，包括部门表、会话启动清单、岗位说明、上岗引导、收件箱、交接班文档、日志目录、审核报告目录和读取路由脚本。
+
 ## 如何触发
 
-你可以对 Codex 说类似这样的话：
+在 Codex 里，可以直接用自然语言触发：
 
 ```text
 帮我给这个项目搭建一个多部门协作团队。
@@ -85,7 +100,9 @@ rsync -a --delete SKILL.md agents scripts ~/.codex/skills/agent-team/
 这个项目需要多个 Agent 分工协作，帮我诊断应该有哪些部门。
 ```
 
-Skill 触发后，不应该直接默认软件项目，也不应该立刻创建部门。它会先确认项目最终交付物和会话创建模式，再推荐部门配置。
+在其他 Agent 或人工流程中，也可以先让 Agent 阅读 `SKILL.md`，再由它根据项目类型选择角色并调用 `scripts/scaffold_team.py`。
+
+无论在哪种环境中使用，都不应该直接默认软件项目，也不应该立刻创建部门。它应先确认项目最终交付物和会话创建模式，再推荐部门配置。
 
 ## 直接运行脚本
 
