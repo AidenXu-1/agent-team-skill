@@ -6,7 +6,7 @@
 
 ## 这个仓库是什么
 
-这是一个面向多 Agent / 多会话协作的项目脚手架仓库。它可以作为 Codex Skill 安装使用，也可以由其他支持本地文件读写和 Python 脚本执行的 AI Agent 直接调用。
+这是一个面向多 Agent / 多会话协作的项目脚手架仓库。它可以作为全局 Skill / 工具安装使用，也可以由任何支持本地文件读写和 Python 脚本执行的 AI Agent 直接调用。
 
 GitHub 页面里的 `README.md` 和 `LICENSE` 是展示说明与开源许可；真正参与协作层生成的是这 3 个文件：
 
@@ -49,9 +49,32 @@ scripts/scaffold_team.py
 
 ## 使用方式
 
-### 作为 Codex Skill 安装
+### 1. 仓库地址
 
-如果你希望 Codex 自动发现它，并保持全局安装版尽量纯净，可以同步运行三件套到 `~/.codex/skills/agent-team`：
+```text
+https://github.com/AidenXu-1/agent-team-skill
+```
+
+### 2. 让 Agent 全局安装
+
+把下面这段话复制给你的 Agent，让它按自己的 Skill / 工具目录规则安装：
+
+```text
+请把这个仓库安装成全局可用的 Agent Team Skill：
+
+https://github.com/AidenXu-1/agent-team-skill
+
+安装要求：
+1. 克隆或下载仓库。
+2. 只把运行所需文件放进全局 Skill 目录：
+   - SKILL.md
+   - agents/openai.yaml
+   - scripts/scaffold_team.py
+3. 不要把 README.md、LICENSE、.git 或其他说明 / 开发材料放进运行目录。
+4. 安装后确认全局运行目录至少包含以上三项，并能读取 SKILL.md、执行 scripts/scaffold_team.py。
+```
+
+如果你的 Agent 使用 `~/.codex/skills/` 作为全局 Skill 目录，可以执行：
 
 ```bash
 mkdir -p ~/.codex/skills
@@ -64,18 +87,26 @@ rsync -a --delete \
   ~/.codex/skills/agent-team/
 ```
 
-如果你已经有本地副本，也可以从仓库根目录同步：
+如果你已经有本地仓库副本，也可以从仓库根目录同步：
 
 ```bash
 mkdir -p ~/.codex/skills/agent-team
 rsync -a --delete SKILL.md agents scripts ~/.codex/skills/agent-team/
 ```
 
-安装后，如果当前 Codex 环境不会自动热加载新 Skill，请重启或刷新 Codex。
+如果当前 Agent 环境不会自动热加载新 Skill，请重启、刷新，或开启一个新会话。
 
-### 作为普通脚手架使用
+### 3. 安装后怎么用
 
-任何能执行 Python、能读写项目文件的 Agent 或开发者，都可以直接运行：
+在目标项目里，对 Agent 说：
+
+```text
+请使用 Agent Team Skill，帮我判断这个项目需要哪些部门，并搭建多会话协作团队。
+```
+
+Agent 应先阅读 `SKILL.md`，确认项目最终交付物和会话创建模式，再决定部门配置。不要直接默认软件项目，也不要立刻创建部门。
+
+也可以直接运行脚本：
 
 ```bash
 python3 scripts/scaffold_team.py "/path/to/project" \
@@ -88,7 +119,7 @@ python3 scripts/scaffold_team.py "/path/to/project" \
 
 ## 如何触发
 
-在 Codex 里，可以直接用自然语言触发：
+安装后，可以直接用自然语言触发：
 
 ```text
 帮我给这个项目搭建一个多部门协作团队。
@@ -100,7 +131,7 @@ python3 scripts/scaffold_team.py "/path/to/project" \
 这个项目需要多个 Agent 分工协作，帮我诊断应该有哪些部门。
 ```
 
-在其他 Agent 或人工流程中，也可以先让 Agent 阅读 `SKILL.md`，再由它根据项目类型选择角色并调用 `scripts/scaffold_team.py`。
+在人工流程中，也可以先让 Agent 阅读 `SKILL.md`，再由它根据项目类型选择角色并调用 `scripts/scaffold_team.py`。
 
 无论在哪种环境中使用，都不应该直接默认软件项目，也不应该立刻创建部门。它应先确认项目最终交付物和会话创建模式，再推荐部门配置。
 
