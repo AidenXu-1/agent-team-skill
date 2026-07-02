@@ -435,13 +435,3 @@ git commit -m "chore: 搭建多会话协作层"
    * 报告、审核报告、专项结论、关键决策都用 YAML frontmatter 写 `type / department / target / status / date / related_task / decision / tags / summary`;脚本只返回这些人工预写字段,不做创造性总结。
 
    * 查证据前优先运行 `agent_team_read.py find --type audit_report --status blocked`、`agent_team_read.py find --type special_conclusion --tag 用户可见出口` 或 `agent_team_read.py meta <path>`;只有摘要不足、路径异常、结论冲突、涉及放行/返工/安全/费用/发布/用户可见质量、用户要求查证据、当前任务明确依赖正文时,才读取最小必要正文。
-
-## Skill 开发与验证
-
-修改本 skill 或 `scripts/scaffold_team.py` 后:
-
-```bash
-python3 <skill目录>/scripts/verify_agent_team.py
-```
-
-只有验证通过,才能声称生成物保留了启动前硬闸、会话创建模式分流、三类节点闸、短唤醒、收件箱真相源、日志收据、错题自检、统筹不读部门正文、体验节点默认打开 App、体验卡、体验先于测试、设计可视化确认、OpenDesign 兜底、功能 OK 不等于 UI 通过、统筹自主推进停止条件和确认状态枚举。如果新增规则改变部门行为,同步更新 `tests/pressure_scenarios.md` 和验证脚本。
