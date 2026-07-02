@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Team"
+  short_description: "Build a multi-session AI department team for any project"
+  default_prompt: "根据我的项目，判断需要哪些部门，为它搭建多会话协作团队。"
