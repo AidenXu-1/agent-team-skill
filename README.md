@@ -1,8 +1,8 @@
 # Agent Team Skill
 
-把一个 AI 会话拆成一套“多部门协作系统”的 Agent 协作协议与脚手架。
+面向互联网 AI 产品开发的多会话部门协作协议与脚手架,同时兼容内容、运营、调研等非软件团队。
 
-它适合在项目变复杂以后使用：一个会话负责统筹，一个或多个会话负责执行，再用独立会话做审核把关。每个会话都有自己的职责边界、收件箱、交接班文档、日志和确认闸，避免 AI 在长上下文里越权、乱推进、忘记交接。
+主要组织产品、设计、开发、AI 工程/评测、测试、安全和成本节点。每个会话都有职责边界、收件箱、交接班和审核闸;长文通过有硬输出预算的路由脚本先检索再切片,避免为了找一段内容把整篇文章塞进 Agent 上下文。
 
 ## 这个仓库是什么
 
@@ -16,7 +16,7 @@ agents/openai.yaml
 scripts/scaffold_team.py
 ```
 
-开发验证材料只保留在本地开发母本中，不进入 GitHub 公开运行版，也不进入全局安装版。
+源码仓库保留验证脚本、压力场景和 CI,保证每次修改可回归;全局安装时仍只同步下面三项运行内容,不把开发材料载入 Skill 运行上下文。
 
 ## 它解决什么问题
 
@@ -37,13 +37,14 @@ scripts/scaffold_team.py
 
 - **三层架构**：管理层 / 执行层 / 审核层必须齐全。
 - **收件箱是真相源**：任务详情写文件，不靠聊天窗口口头传递。
-- **读取路由器**：新会话先运行生成的 `agent_team_read.py`，只返回本部门必读文件和报告 YAML 摘要，避免默认扫全局长文。
+- **读取路由器**：`onboard/meta/find/search/slice` 均有默认 16 KiB 输出总预算。`find` 找报告元数据,`search` 找长文命中行,`slice` 只返回必要行。
 - **短唤醒**：跨会话通知只说“有新任务 / 任务已完成 / 遇到阻断”。
 - **节点式推进**：一个功能或环节只推进一个验收节点。
 - **完成回报四件套**：产出路径、验证结果、日志收据、错题自检。
 - **用户确认闸**：产品体验、功能取舍、UI/视觉、上线、外发、成本、安全等重大节点必须由用户拍板。
 - **审核层独立**：测试、安全、财务等审核部门亲自验证，不采信执行部门转述。
-- **报告元数据**：报告、审核报告、专项结论、关键决策统一使用 YAML frontmatter，脚本只读人工预写的 `summary`，不创造性总结正文。
+- **报告元数据**：使用受限单行元数据;重复键、未知字段、多行值和超长值直接拒绝,不对正文做创造性总结。
+- **AI 工程部**：当模型/API/Prompt/RAG/Agent/评测集/推理成本是独立核心链路时启用 `ai`,不为了“有 AI”就强拆部门。
 - **体验先于测试**：可运行功能先给用户体验，再进入专业测试。
 - **设计意图必须可视化**：涉及 UI/交互/视觉时，不能只交文字说明；但设计预览不得声称等同真实 App UI，最终 UI 验收以运行中的 App / 真实路由 / 构建或打包态截图为准。
 
@@ -80,18 +81,24 @@ https://github.com/AidenXu-1/agent-team-skill
 mkdir -p ~/.codex/skills
 git clone https://github.com/AidenXu-1/agent-team-skill.git /tmp/agent-team-skill
 mkdir -p ~/.codex/skills/agent-team
-rsync -a --delete \
-  /tmp/agent-team-skill/SKILL.md \
-  /tmp/agent-team-skill/agents \
-  /tmp/agent-team-skill/scripts \
-  ~/.codex/skills/agent-team/
+rsync -a --delete --delete-excluded \
+  --include='/SKILL.md' \
+  --include='/agents/' --include='/agents/openai.yaml' \
+  --include='/scripts/' --include='/scripts/scaffold_team.py' \
+  --exclude='*' \
+  /tmp/agent-team-skill/ ~/.codex/skills/agent-team/
 ```
 
 如果你已经有本地仓库副本，也可以从仓库根目录同步：
 
 ```bash
 mkdir -p ~/.codex/skills/agent-team
-rsync -a --delete SKILL.md agents scripts ~/.codex/skills/agent-team/
+rsync -a --delete --delete-excluded \
+  --include='/SKILL.md' \
+  --include='/agents/' --include='/agents/openai.yaml' \
+  --include='/scripts/' --include='/scripts/scaffold_team.py' \
+  --exclude='*' \
+  ./ ~/.codex/skills/agent-team/
 ```
 
 如果当前 Agent 环境不会自动热加载新 Skill，请重启、刷新，或开启一个新会话。
@@ -146,13 +153,22 @@ python3 scripts/scaffold_team.py "/path/to/project" \
   --session-mode "manual"
 ```
 
-软件项目团队：
+互联网 AI 产品团队：
 
 ```bash
 python3 scripts/scaffold_team.py "/path/to/project" \
-  --profile "软件产品 + UI + 质量关" \
-  --roles "lead,product,design,dev,test" \
+  --profile "互联网 AI 产品 + UI + 模型评测 + 质量关" \
+  --roles "lead,product,design,dev,ai,test" \
   --session-mode "manual"
+```
+
+从长文中只取相关内容：
+
+```bash
+python3 docs/collaboration/scripts/agent_team_read.py search path/to/article.md \
+  --query "用户可见错误" --context 2 --limit 20
+python3 docs/collaboration/scripts/agent_team_read.py slice path/to/article.md \
+  --start-line 120 --end-line 170
 ```
 
 非软件项目，并由 Skill 补一个最小业务地基：
@@ -174,12 +190,18 @@ python3 scripts/scaffold_team.py "/path/to/project" \
 ├── agents/
 │   └── openai.yaml
 ├── scripts/
-│   └── scaffold_team.py
+│   ├── scaffold_team.py
+│   └── verify_agent_team.py
+├── tests/
+│   └── pressure_scenarios.md
+├── docs/rules/
+│   └── agent-team-reading-router-design.md
+├── .github/workflows/ci.yml
 ├── README.md
 └── LICENSE
 ```
 
-> 注：本项目本地开发母本中还保留验证脚本、压力场景和设计留档，用于调试与回归；它们不属于公开运行版。
+> 注：源码仓库包含验证脚本、压力场景、设计留档和 CI；全局安装规则会排除它们,只保留运行文件。
 
 ## 适合哪些项目
 
