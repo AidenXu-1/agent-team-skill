@@ -13,6 +13,29 @@ import tempfile
 from pathlib import Path
 
 
+UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_UTF8_BOOTSTRAPPED"
+
+
+def ensure_utf8_filesystem_runtime() -> None:
+    """Restart once in UTF-8 mode when the process filesystem codec is ASCII."""
+    encoding = (sys.getfilesystemencoding() or "").lower().replace("_", "-")
+    if encoding not in {"ascii", "us-ascii", "ansi-x3.4-1968"}:
+        return
+    if os.environ.get(UTF8_BOOTSTRAP_MARKER) == "1":
+        raise SystemExit("无法启用 UTF-8 文件系统编码,已停止以避免生成不完整协作层。")
+
+    env = os.environ.copy()
+    env["PYTHONUTF8"] = "1"
+    env[UTF8_BOOTSTRAP_MARKER] = "1"
+    try:
+        os.execve(sys.executable, [sys.executable, *sys.argv], env)
+    except OSError as exc:
+        raise SystemExit(f"无法以 UTF-8 模式重启脚手架: {exc}") from exc
+
+
+ensure_utf8_filesystem_runtime()
+
+
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
