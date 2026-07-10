@@ -2,22 +2,21 @@
 
 面向互联网 AI 产品开发的多会话部门协作协议与脚手架,同时兼容内容、运营、调研等非软件团队。
 
-主要组织产品、设计、开发、AI 工程/评测、测试、安全和成本节点。每个会话都有职责边界、收件箱、交接班和审核闸。已知文件用确定性搜索/切片;跨文档且遗漏代价高时,用“AI 加法式扩词 + 脚本高召回候选 + 有界证据包 + 覆盖报告”,避免整篇通读,也避免为了省 token 静默漏证据。
+主要组织产品、设计、开发、AI 工程/评测、测试、安全和成本节点。每个会话都有职责边界、收件箱、交接班和审核闸;会话可以一键换班,部门职责和项目状态继续由文件承载。
 
 ## 这个仓库是什么
 
 这是一个面向多 Agent / 多会话协作的项目脚手架仓库。它可以作为全局 Skill / 工具安装使用，也可以由任何支持本地文件读写和 Python 脚本执行的 AI Agent 直接调用。
 
-GitHub 页面里的 `README.md` 和 `LICENSE` 是展示说明与开源许可；真正参与协作层生成的是这 4 个文件：
+GitHub 页面里的 `README.md` 和 `LICENSE` 是展示说明与开源许可；真正参与协作层生成的是这 3 个文件：
 
 ```text
 SKILL.md
 agents/openai.yaml
 scripts/scaffold_team.py
-scripts/agent_team_research.py
 ```
 
-源码仓库保留验证脚本、压力场景和 CI,保证每次修改可回归;全局安装时仍只同步上面四项运行内容,不把开发材料载入 Skill 运行上下文。
+源码仓库保留验证脚本、压力场景和 CI,保证每次修改可回归;全局安装时仍只同步上面三项运行内容,不把开发材料载入 Skill 运行上下文。
 
 ## 它解决什么问题
 
@@ -38,9 +37,9 @@ scripts/agent_team_research.py
 
 - **三层架构**：管理层 / 执行层 / 审核层必须齐全。
 - **收件箱是真相源**：任务详情写文件，不靠聊天窗口口头传递。
-- **接班包**：`onboard` 直接返回岗位核心、交接摘要和最新待办,Agent 不再按文件路径全文通读。
-- **两级检索**：已知文件/关键词用 `find/search/slice`;跨文档、术语未知或高遗漏风险才用研究路由器。单次硬输出预算负责防失控,不冒充“证据已经完整”。
-- **召回不被 AI 静默裁掉**：原问题和精确命中永久保留;AI 只做加法式扩词、分组和重排,完整候选留在 manifest,并用 coverage 暴露未扫描范围与截断。
+- **四文档接班**：上岗引导、岗位说明、交接班文档、收件箱就是接班真相源,不再生成第五份脚本摘要。
+- **局部信息提取**：不按固定字数定义长文;只需要已知文件中的局部事实时用一次 `search`,需要连续段落再用一次 `slice`。
+- **一键换班**：用户说“换会话 / 切换会话 / 换班”,旧会话先交班,新会话按四文档接班;只登记本部门的新会话 ID 后再归档旧会话,失败则保留旧会话并使用固定手动回退模板。
 - **短唤醒**：跨会话通知只说“有新任务 / 任务已完成 / 遇到阻断”。
 - **节点式推进**：一个功能或环节只推进一个验收节点。
 - **完成回报四件套**：产出路径、验证结果、日志收据、错题自检。
@@ -74,9 +73,8 @@ https://github.com/AidenXu-1/agent-team-skill
    - SKILL.md
    - agents/openai.yaml
    - scripts/scaffold_team.py
-   - scripts/agent_team_research.py
 3. 不要把 README.md、LICENSE、.git 或其他说明 / 开发材料放进运行目录。
-4. 安装后确认全局运行目录至少包含以上四项，并能读取 SKILL.md、执行两个 Python 运行脚本。
+4. 安装后确认全局运行目录至少包含以上三项，并能读取 SKILL.md、执行 scripts/scaffold_team.py。
 ```
 
 如果你的 Agent 使用 `~/.codex/skills/` 作为全局 Skill 目录，可以执行：
@@ -88,7 +86,7 @@ mkdir -p ~/.codex/skills/agent-team
 rsync -a --delete --delete-excluded \
   --include='/SKILL.md' \
   --include='/agents/' --include='/agents/openai.yaml' \
-  --include='/scripts/' --include='/scripts/scaffold_team.py' --include='/scripts/agent_team_research.py' \
+  --include='/scripts/' --include='/scripts/scaffold_team.py' \
   --exclude='*' \
   /tmp/agent-team-skill/ ~/.codex/skills/agent-team/
 ```
@@ -100,7 +98,7 @@ mkdir -p ~/.codex/skills/agent-team
 rsync -a --delete --delete-excluded \
   --include='/SKILL.md' \
   --include='/agents/' --include='/agents/openai.yaml' \
-  --include='/scripts/' --include='/scripts/scaffold_team.py' --include='/scripts/agent_team_research.py' \
+  --include='/scripts/' --include='/scripts/scaffold_team.py' \
   --exclude='*' \
   ./ ~/.codex/skills/agent-team/
 ```
@@ -166,7 +164,7 @@ python3 scripts/scaffold_team.py "/path/to/project" \
   --session-mode "manual"
 ```
 
-从长文中只取相关内容：
+从已知文件中只取局部信息：
 
 ```bash
 python3 docs/collaboration/scripts/agent_team_read.py search path/to/article.md \
@@ -192,18 +190,15 @@ python3 scripts/scaffold_team.py "/path/to/project" \
   --foundation-risks "术语过时、案例失真;由业务专家复核"
 ```
 
-跨文档且不能漏证据的研究任务：
+`search` 的命中片段够用时立即停止;只有需要命中附近更完整的连续段落才调用一次 `slice`。任务要求理解整份文档时直接读取原文,不要堆叠检索调用。
 
-```bash
-python3 docs/collaboration/scripts/agent_team_research.py candidates \
-  --task-id auth-risk --query "登录稳定性风险" \
-  --expand "鉴权失败" --expand "令牌过期" --expand "反例" --path docs
-python3 docs/collaboration/scripts/agent_team_research.py pack \
-  --task-id auth-risk --ids <候选ID1> <候选ID2> --target-tokens 6000
-python3 docs/collaboration/scripts/agent_team_research.py coverage --task-id auth-risk
+同部门自动换班时,在当前部门会话直接说：
+
+```text
+换会话
 ```
 
-每个 `--expand` 只放一个短词或短语,不要把多个概念拼成长句。`target-tokens` 是可调软目标,复杂任务可以调高或拆多个证据包;它不是完成条件。第一版刻意不引入向量数据库,先用中文安全的词法特征、逐查询配额和融合排序建立可复现基线。覆盖仍不足时最多补一轮限制条件/失败模式/反证词检索,再不足就列为未验证项或拆任务。
+有 Codex 会话工具时,旧会话会先交班,创建同项目同部门的新会话;新会话按四文档接班,只登记本部门的新会话 ID 后归档旧会话。工具不全时使用生成的固定手动换班模板,不会误归档旧会话。
 
 ## 仓库结构
 
@@ -214,7 +209,6 @@ python3 docs/collaboration/scripts/agent_team_research.py coverage --task-id aut
 │   └── openai.yaml
 ├── scripts/
 │   ├── scaffold_team.py
-│   ├── agent_team_research.py
 │   └── verify_agent_team.py
 ├── tests/
 │   └── pressure_scenarios.md

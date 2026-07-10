@@ -9,13 +9,11 @@ import sys
 import tempfile
 import os
 import re
-import json
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = ROOT / "scripts" / "scaffold_team.py"
-RESEARCH_SCRIPT = ROOT / "scripts" / "agent_team_research.py"
 SPEC_TEXT = """# Spec
 
 ## 目标与用户需求
@@ -92,12 +90,18 @@ REQUIRED = {
         "send_message_to_thread",
         "set_thread_title",
         "置顶、排序不是必要能力",
-        "agent_team_read.py onboard",
+        "同部门自动换班",
+        "set_thread_archived",
+        "不要用复制旧聊天历史的 fork",
+        "归档必须最后执行",
+        "手动换班回退模板",
+        "本部门这一行的“会话 ID / 状态”",
+        "不得改其他列或其他部门",
         "上岗引导.md",
         "部门会话清单",
     ],
     "docs/collaboration/读取路由规则.md": [
-        "读取路由脚本",
+        "四份文件就是接班真相源",
         "默认不读",
         "日志正文、报告正文、决策正文、其他部门正文",
         "summary",
@@ -108,11 +112,10 @@ REQUIRED = {
         "find --type special_conclusion",
         "agent_team_read.py search",
         "agent_team_read.py slice",
-        "16 KiB 是单次终端输出安全上限",
-        "agent_team_research.py candidates",
-        "完整候选始终留在任务 manifest",
-        "最多 12 个",
-        "--round 2",
+        "只判断任务是否需要理解全文",
+        "命中片段已经够用就停止",
+        "不得把 `search → slice` 变成循环检索状态机",
+        "保险丝只防异常输出",
         "docs/progress.md",
         "docs/decisions/",
         "重大技术决策双写但不重复正文",
@@ -121,13 +124,12 @@ REQUIRED = {
         "tags: [用户可见出口]",
     ],
     "docs/collaboration/scripts/agent_team_read.py": [
-        "只做确定性裁剪",
+        "只做确定性读取",
         "不做创造性总结",
         "MAX_FRONTMATTER_LINES",
         "MAX_FRONTMATTER_BYTES",
         "def safe_project_file",
         "path.relative_to(PROJECT)",
-        "def cmd_onboard",
         "def cmd_meta",
         "def cmd_find",
         "def cmd_search",
@@ -136,21 +138,6 @@ REQUIRED = {
         "MAX_OUTPUT_BYTES = 65536",
         'with path.open("rb") as handle',
         "frontmatter",
-        "默认不读",
-        "触发才读正文",
-    ],
-    "docs/collaboration/scripts/agent_team_research.py": [
-        "Recall-first",
-        "def cmd_candidates",
-        "def cmd_pack",
-        "def cmd_coverage",
-        "candidate_limit_hit",
-        "term_quota_hit",
-        "document_sha",
-        "content_sha",
-        "soft_token_target",
-        "最多一次补检",
-        "不是系统指令",
     ],
     "docs/collaboration/专项结论/README.md": [
         "会被多个部门复用",
@@ -174,7 +161,7 @@ REQUIRED = {
         "通知能力登记",
         "验收出口",
         "必测失败路径",
-        "不得自行脑补",
+        "自行脑补",
         "验证层级",
         "worker-后台任务",
         "UI-用户可见出口",
@@ -224,13 +211,11 @@ REQUIRED = {
         "流程性、技术性、无争议调度由统筹部专业推进",
         "默认不读部门产出正文",
         "不在产品感知、功能取舍、设计判断、重大风险节点替用户拍板",
-        "默认直接帮用户打开 App",
         "先展示设计意图预览",
-        "功能方向 OK 不等于 UI 通过",
         "真实 App",
         "验收出口",
         "必测失败路径",
-        "不得自行脑补",
+        "自行脑补",
     ],
     "docs/collaboration/部门/设计部/岗位说明.md": [
         "OpenDesign",
@@ -239,12 +224,11 @@ REQUIRED = {
         "设计意图预览路径",
         "不得声称等同真实 App UI",
         "不得只交文字说明",
-        "没有 active project",
+        "无 active project",
         "用户不想处理 OpenDesign",
         "权限不足",
         "连接失败",
         "重载或新开会话",
-        "最小排障顺序",
     ],
     "docs/collaboration/部门/开发部/收件箱.md": [
         "任务真相源",
@@ -289,7 +273,7 @@ REQUIRED = {
     "docs/collaboration/部门/测试部/岗位说明.md": [
         "不代替用户体验功能",
         "体验 OK / 可以进测试",
-        "完成回报四件套",
+        "完成回报必须带四件套",
         "不得直接返工或放行",
         "由统筹部节点卡同步后判断是否可自主派开发返工",
         "手动通知",
@@ -300,12 +284,17 @@ REQUIRED = {
         "验证层级",
     ],
     "docs/collaboration/部门/测试部/上岗引导.md": [
-        "轻量路由卡",
-        "agent_team_read.py onboard --dept 测试部",
+        "四文档接班",
+        "上岗引导.md",
+        "岗位说明.md",
+        "交接班文档.md",
+        "收件箱.md",
         "默认不读日志正文、报告正文、决策正文、其他部门正文",
-        "脚本直接返回",
-        "裁剪接班包",
-        "不做创造性总结",
+        "换会话 / 切换会话 / 换班",
+        "不要 fork 旧聊天历史",
+        "归档旧会话",
+        "任一步失败都保留旧会话",
+        "不要推测四文档没有记录的项目阶段",
         "人工模式",
         "自动模式",
     ],
@@ -387,7 +376,7 @@ PRESSURE_SCENARIO_REQUIRED = [
     "自设计反向探针",
     "是否触发子 Agent 盲审 / 抽检",
     "不直接改代码、不自动放行",
-    "场景 20: 读取路由脚本防止长文误读",
+    "场景 20: 四文档接班不制造第五份摘要",
     "场景 21: 专项结论升格与检索",
     "场景 5A: 测试不通过涉及取舍",
     "纯代码 / 质量 / 异常路径",
@@ -395,7 +384,10 @@ PRESSURE_SCENARIO_REQUIRED = [
     "用户确认正式收口后",
     "git status --short",
     "默认不读日志正文、报告正文、决策正文、其他部门正文",
-    "agent_team_read.py onboard",
+    "上岗引导.md",
+    "岗位说明.md",
+    "交接班文档.md",
+    "收件箱.md",
     "frontmatter",
     "summary",
     "search",
@@ -403,14 +395,13 @@ PRESSURE_SCENARIO_REQUIRED = [
     "输出总预算",
     "场景 26: docs 符号链接不得越界写入",
     "场景 27: 并发增设部门保持一致",
-    "场景 28: 接班包有界且不漏最新待办",
+    "场景 28: 同部门一键换班",
     "场景 29: 地基语义闸与事务回滚",
-    "场景 30: 高召回研究模式不被精排静默截断",
+    "场景 30: 默认流程不引入研究状态机",
     "场景 31: Unicode 与文本编码失败必须显式",
-    "扩词只能增加",
-    "完整候选 manifest",
-    "target-tokens",
-    "--round 2",
+    "而不是 fork",
+    "归档旧会话",
+    "四文档接班",
 ]
 
 
@@ -424,7 +415,7 @@ def fail(message: str) -> int:
 
 
 def main() -> int:
-    compile_result = run([sys.executable, "-m", "py_compile", str(SCAFFOLD), str(RESEARCH_SCRIPT)], ROOT)
+    compile_result = run([sys.executable, "-m", "py_compile", str(SCAFFOLD)], ROOT)
     if compile_result.returncode != 0:
         print(compile_result.stderr, file=sys.stderr)
         return fail("scaffold_team.py does not compile")
@@ -886,60 +877,41 @@ def main() -> int:
                 if needle not in text:
                     return fail(f"{relative} missing required text: {needle}")
 
+        # 岗位与上岗文件是每次接班的热路径。通用制度必须留在共享文档，
+        # 防止未来修改又把整套手册复制进每个部门并放大上下文消耗。
+        department_root = target / "docs" / "collaboration" / "部门"
+        for role_path in department_root.glob("*/岗位说明.md"):
+            role_text = role_path.read_text()
+            if "本部门这一行的“会话 ID / 状态”" not in role_text:
+                return fail(f"role document missing the narrow switch registration exception: {role_path}")
+            if len(role_text) > 4_000:
+                return fail(f"role document regressed into a duplicated handbook: {role_path}")
+        for bootstrap_path in department_root.glob("*/上岗引导.md"):
+            if len(bootstrap_path.read_text()) > 4_000:
+                return fail(f"bootstrap document regressed into a duplicated handbook: {bootstrap_path}")
+
+        agent_guide = (target / "docs" / "agent-guide.md").read_text()
+        shared_marker = "## 多会话协作(三层框架)"
+        if shared_marker not in agent_guide:
+            return fail("agent guide missing the lightweight collaboration entrypoint")
+        if len(agent_guide.split(shared_marker, 1)[1]) > 3_000:
+            return fail("agent guide collaboration entrypoint regressed into a duplicated handbook")
+
         read_router = target / "docs" / "collaboration" / "scripts" / "agent_team_read.py"
         read_router_text = read_router.read_text()
+        if (target / "docs" / "collaboration" / "scripts" / "agent_team_research.py").exists():
+            return fail("default collaboration layer still generates the removed research state machine")
+        read_help = run([sys.executable, str(read_router), "--help"], target)
+        if read_help.returncode != 0 or "onboard" in read_help.stdout or not all(
+            command in read_help.stdout for command in ("meta", "find", "search", "slice")
+        ):
+            return fail("read router should expose only metadata and local extraction commands")
         frontmatter_body = read_router_text.split("def frontmatter", 1)[1].split("def metadata_files", 1)[0]
         if "read_text(path)" in frontmatter_body:
             return fail("read router frontmatter parser still reads the whole markdown file")
         for required_guard in ("MAX_FRONTMATTER_LINES", "MAX_FRONTMATTER_BYTES"):
             if required_guard not in frontmatter_body:
                 return fail(f"read router frontmatter parser missing guard: {required_guard}")
-        onboard_result = run([sys.executable, str(read_router), "onboard", "--dept", "测试部"], target)
-        if onboard_result.returncode != 0:
-            print(onboard_result.stdout)
-            print(onboard_result.stderr, file=sys.stderr)
-            return fail("read router onboard failed")
-        for needle in (
-            "你是: 测试部",
-            "本次接班包",
-            "岗位核心:",
-            "交接摘要:",
-            "当前待办正文:",
-            "默认不读:",
-            "日志正文",
-            "报告正文",
-            "触发才读正文:",
-            "无结构化待办",
-        ):
-            if needle not in onboard_result.stdout:
-                return fail(f"read router onboard output missing: {needle}")
-
-        role_path = target / "docs" / "collaboration" / "部门" / "测试部" / "岗位说明.md"
-        role_backup = role_path.read_text()
-        role_path.unlink()
-        role_path.symlink_to(temp_root / "outside-linked.md")
-        unsafe_onboard = run([sys.executable, str(read_router), "onboard", "--dept", "测试部"], target)
-        role_path.unlink()
-        role_path.write_text(role_backup)
-        if "缺失或路径非法，禁止直接读取" not in unsafe_onboard.stdout:
-            return fail("onboard presents a symlinked required file as safe to read")
-
-        long_dept = "A" * 12000
-        bounded_error = run(
-            [sys.executable, str(read_router), "onboard", "--dept", long_dept, "--max-output-bytes", "1024"],
-            target,
-        )
-        if len(bounded_error.stderr.encode("utf-8")) > 1024:
-            return fail("read router error output bypasses the configured byte budget")
-
-        inbox_path = target / "docs" / "collaboration" / "部门" / "测试部" / "收件箱.md"
-        inbox_backup = inbox_path.read_text()
-        inbox_path.write_text(("x" * 140000) + "\n## [紧急] LATEST_AFTER_128K\n- 任务详情:检查尾部最新任务。\n")
-        tail_onboard = run([sys.executable, str(read_router), "onboard", "--dept", "测试部"], target)
-        inbox_path.write_text(inbox_backup)
-        if "LATEST_AFTER_128K" not in tail_onboard.stdout or "检查尾部最新任务" not in tail_onboard.stdout:
-            return fail("onboard misses the newest structured task after the old 128 KiB prefix")
-
         conclusion = target / "docs" / "collaboration" / "专项结论" / "2026-07-02-用户可见出口-专项结论.md"
         conclusion.write_text("""---
 type: special_conclusion
@@ -1188,118 +1160,7 @@ summary: 近似字段不能被 find 当成精确命中。
         if slice_result.returncode != 0 or "L2: context-a" not in slice_result.stdout or "L4: context-b" not in slice_result.stdout:
             return fail("read router slice does not return the requested line range")
 
-        research_router = target / "docs" / "collaboration" / "scripts" / "agent_team_research.py"
-        research_a = target / "docs" / "research-a.md"
-        research_b = target / "docs" / "research-b.md"
-        research_a.write_text(
-            "# 高可用设计\n\n主节点不可用时自动切换到备用实例，确保服务持续可用。\n\n"
-            "## 限制与反例\n\n如果备用实例也不可用，系统会显示降级提示而不是声称无中断。\n"
-        )
-        research_b.write_text("# 其他内容\n\n本文只介绍界面颜色和按钮间距。\n")
-        candidate_result = run(
-            [
-                sys.executable, str(research_router), "candidates",
-                "--task-id", "recall-demo",
-                "--query", "系统故障如何保证服务不中断",
-                "--expand", "备用实例",
-                "--expand", "故障转移",
-                "--path", "docs/research-a.md",
-                "--path", "docs/research-b.md",
-            ],
-            target,
-        )
-        candidate_id_match = re.search(r"id=([0-9a-f]{16})", candidate_result.stdout)
-        if candidate_result.returncode != 0 or candidate_id_match is None or "research-a.md" not in candidate_result.stdout:
-            return fail("research retrieval does not create a recall-first candidate manifest")
-        candidate_id = candidate_id_match.group(1)
-        manifest_path = target / "docs" / "collaboration" / ".retrieval" / "recall-demo" / "manifest.json"
-        initial_manifest = json.loads(manifest_path.read_text())
-        initial_candidate_ids = {item["id"] for item in initial_manifest["candidates"]}
-        pack_result = run(
-            [
-                sys.executable, str(research_router), "pack",
-                "--task-id", "recall-demo", "--ids", candidate_id,
-                "--target-tokens", "1200", "--max-output-bytes", "8192",
-            ],
-            target,
-        )
-        if pack_result.returncode != 0 or "自动切换到备用实例" not in pack_result.stdout or "estimated_tokens" not in pack_result.stdout:
-            return fail("research retrieval cannot create a bounded evidence pack from candidate ids")
-        coverage_result = run(
-            [sys.executable, str(research_router), "coverage", "--task-id", "recall-demo"],
-            target,
-        )
-        for needle in ("files_scanned: 2", "term_hits:", "candidate_limit_hit:", "unsupported_files:"):
-            if coverage_result.returncode != 0 or needle not in coverage_result.stdout:
-                return fail(f"research coverage report missing: {needle}")
-        changed_query_result = run(
-            [
-                sys.executable, str(research_router), "candidates",
-                "--task-id", "recall-demo", "--round", "2",
-                "--query", "已被改写的问题", "--expand", "备用实例",
-                "--path", "docs/research-a.md",
-            ],
-            target,
-        )
-        if changed_query_result.returncode == 0 or "原始 query 不变" not in changed_query_result.stderr:
-            return fail("research supplement allows the original query to drift")
-        supplement_result = run(
-            [
-                sys.executable, str(research_router), "candidates",
-                "--task-id", "recall-demo", "--round", "2",
-                "--query", "系统故障如何保证服务不中断",
-                "--expand", "限制与反例",
-                "--max-candidates", "1",
-                "--path", "docs/research-a.md",
-                "--path", "docs/research-b.md",
-            ],
-            target,
-        )
-        if supplement_result.returncode != 0 or "第二轮已完成" not in supplement_result.stdout:
-            return fail("research retrieval does not support one controlled counter-evidence supplement")
-        supplemented_manifest = json.loads(manifest_path.read_text())
-        if not initial_candidate_ids.issubset({item["id"] for item in supplemented_manifest["candidates"]}):
-            return fail("research supplement permanently deletes first-round candidates under a lower cap")
-        if "限制与反例" not in supplemented_manifest["coverage"]["term_hits"]:
-            return fail("research coverage does not accumulate second-round query evidence")
-        repeated_supplement = run(
-            [
-                sys.executable, str(research_router), "candidates",
-                "--task-id", "recall-demo", "--round", "2",
-                "--query", "系统故障如何保证服务不中断", "--expand", "相反结论",
-                "--path", "docs/research-a.md",
-            ],
-            target,
-        )
-        if repeated_supplement.returncode == 0 or "最多一次补检" not in repeated_supplement.stderr:
-            return fail("research retrieval allows more than one supplement round")
-
-        research_locale_env = os.environ.copy()
-        research_locale_env.update({"LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"})
-        research_locale_result = subprocess.run(
-            [
-                sys.executable, str(research_router), "candidates",
-                "--task-id", "locale-research", "--query", "备用实例",
-                "--path", "docs/research-a.md",
-            ],
-            cwd=target, text=True, capture_output=True, check=False, env=research_locale_env,
-        )
-        if research_locale_result.returncode != 0 or "research-a.md" not in research_locale_result.stdout:
-            return fail("generated research router is not stable under a non-UTF-8 process locale")
-
-        outside_dept = target / "docs" / "outside-dept"
-        outside_dept.mkdir()
-        (outside_dept / "收件箱.md").write_text("## [待办] OUTSIDE_TASK_SECRET\n")
         registry_path = target / "docs" / "collaboration" / "部门表.md"
-        original_registry = registry_path.read_text()
-        registry_path.write_text(
-            original_registry + "\n| 执行层 | ../../outside-dept | `evil` | 待登记 | 人工 | probe | none | none | 待启用 |\n"
-        )
-        traversal_result = run([sys.executable, str(read_router), "onboard", "--dept", "evil"], target)
-        registry_path.write_text(original_registry)
-        if traversal_result.returncode == 0 or "OUTSIDE_TASK_SECRET" in traversal_result.stdout:
-            return fail("read router onboard trusts a path-traversal department name")
-
         add_role_result = run([sys.executable, str(SCAFFOLD), str(target), "--add-roles", "auto"], ROOT)
         if add_role_result.returncode != 0:
             return fail("transactional add-roles failed on a valid collaboration layer")

@@ -344,7 +344,7 @@ def read_router_script() -> str:
 # -*- coding: utf-8 -*-
 """agent-team 读取路由器。
 
-只做确定性裁剪:返回接班包、提取受限单行元数据、搜索/切片长文。
+只做确定性读取:提取受限单行元数据、定位局部信息、按行切片。
 不做创造性总结、不替代统筹判断、不替代审核结论、不自动放行。
 """
 
@@ -386,9 +386,6 @@ PROJECT = COLLAB.parents[1]
 MAX_FRONTMATTER_BYTES = 32768
 MAX_FRONTMATTER_LINES = 200
 MAX_METADATA_VALUE_CHARS = 500
-MAX_REGISTRY_BYTES = 131072
-MAX_INBOX_BYTES = 131072
-MAX_INBOX_SCAN_BYTES = 64 * 1024 * 1024
 MAX_SOURCE_LINE_BYTES = 65536
 DEFAULT_LIMIT = 20
 MAX_LIMIT = 100
@@ -446,17 +443,6 @@ def unsupported_text_encoding(path: Path) -> str | None:
     return None
 
 
-def read_prefix(path: Path, max_bytes: int) -> tuple[str, bool]:
-    with path.open("rb") as handle:
-        data = handle.read(max_bytes + 1)
-    truncated = len(data) > max_bytes
-    data = data[:max_bytes]
-    try:
-        return data.decode("utf-8-sig"), truncated
-    except UnicodeDecodeError:
-        return "", truncated
-
-
 def inside_project(path: Path) -> bool:
     try:
         path.relative_to(PROJECT)
@@ -496,65 +482,6 @@ def safe_project_file(raw_path: str | Path) -> Path | None:
     if not inside_project(resolved) or not resolved.is_file():
         return None
     return resolved
-
-
-def safe_department_dir(name: str) -> Path | None:
-    if not name or name in {".", ".."} or "/" in name or "\\" in name:
-        return None
-    root_lexical = COLLAB / "部门"
-    if has_symlink_component(root_lexical):
-        return None
-    root = root_lexical.resolve()
-    candidate = root_lexical / name
-    if has_symlink_component(candidate):
-        return None
-    try:
-        resolved = candidate.resolve()
-        resolved.relative_to(root)
-    except (OSError, ValueError):
-        return None
-    if not resolved.is_dir():
-        return None
-    return resolved
-
-
-def parse_table_row(line: str) -> list[str]:
-    return [part.strip().strip("`") for part in line.strip().strip("|").split("|")]
-
-
-def departments() -> list[dict[str, str]]:
-    registry = COLLAB / "部门表.md"
-    if not registry.is_file() or registry.is_symlink():
-        return []
-    text, _ = read_prefix(registry, MAX_REGISTRY_BYTES)
-    if not text:
-        return []
-    rows: list[dict[str, str]] = []
-    for line in text.splitlines():
-        if not line.startswith("|") or "---" in line or "角色 ID" in line:
-            continue
-        parts = parse_table_row(line)
-        if len(parts) < 9:
-            continue
-        rows.append({
-            "layer": parts[0],
-            "department": parts[1],
-            "role_id": parts[2],
-            "thread_id": parts[3],
-            "notify_mode": parts[4],
-            "mission": parts[5],
-            "can_write": parts[6],
-            "cannot_write": parts[7],
-            "status": parts[8],
-        })
-    return rows
-
-
-def find_department(name: str) -> dict[str, str] | None:
-    for row in departments():
-        if row["department"] == name or row["role_id"] == name:
-            return row
-    return None
 
 
 def frontmatter(path: Path) -> dict[str, str]:
@@ -647,158 +574,6 @@ def rel(path: Path) -> str:
         return str(path.relative_to(PROJECT))
     except ValueError:
         return str(path)
-
-
-def pending_titles(inbox: Path, limit: int = DEFAULT_LIMIT) -> tuple[list[str], bool]:
-    safe = safe_project_file(inbox)
-    if safe is None:
-        return [], False
-    titles: deque[str] = deque(maxlen=clamp(limit, 1, MAX_LIMIT))
-    in_comment = False
-    for _line_no, _searchable, line, _display_truncated, _line_truncated, _decode_invalid in iter_bounded_lines(safe, MAX_INBOX_SCAN_BYTES):
-        stripped = line.strip()
-        if stripped.startswith("<!--"):
-            in_comment = True
-        if not in_comment and (line.startswith("## [待办]") or line.startswith("## [紧急]")):
-            titles.append(clean_text(line.lstrip("# ").strip(), 240))
-        if stripped.endswith("-->"):
-            in_comment = False
-    return list(titles), safe.stat().st_size > MAX_INBOX_SCAN_BYTES
-
-
-def extract_markdown_sections(path: Path, wanted: tuple[str, ...], max_chars: int) -> tuple[list[str], bool]:
-    safe = safe_project_file(path)
-    if safe is None:
-        return [], False
-    text, truncated = read_prefix(safe, 65536)
-    sections: list[str] = []
-    heading = ""
-    body: list[str] = []
-
-    def flush() -> None:
-        if not heading or not any(key in heading.casefold() for key in wanted):
-            return
-        content = "\n".join(body).strip()
-        if content:
-            sections.append(f"### {heading}\n{content}")
-
-    for line in text.splitlines():
-        match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
-        if match:
-            flush()
-            heading = clean_text(match.group(1), 160)
-            body = []
-        elif heading:
-            body.append(line)
-    flush()
-    joined = "\n\n".join(sections)
-    if len(joined) > max_chars:
-        joined = joined[:max_chars] + "…"
-        truncated = True
-    return ([joined] if joined else []), truncated
-
-
-def latest_pending_blocks(inbox: Path, limit: int) -> tuple[list[str], bool]:
-    safe = safe_project_file(inbox)
-    if safe is None:
-        return [], False
-    blocks: deque[str] = deque(maxlen=clamp(limit, 1, 5))
-    current: list[str] = []
-    capture = False
-    in_comment = False
-
-    def flush() -> None:
-        if not current:
-            return
-        block = "\n".join(current).strip()
-        if len(block) > 4000:
-            block = block[:4000] + "… [待办正文已截断]"
-        blocks.append(block)
-
-    for _line_no, _searchable, line, _display_truncated, _line_truncated, _decode_invalid in iter_bounded_lines(safe, MAX_INBOX_SCAN_BYTES):
-        stripped = line.strip()
-        if stripped.startswith("<!--"):
-            in_comment = True
-        if not in_comment and line.startswith("## "):
-            if capture:
-                flush()
-            capture = line.startswith("## [待办]") or line.startswith("## [紧急]")
-            current = [line] if capture else []
-        elif capture and not in_comment:
-            current.append(line)
-        if stripped.endswith("-->"):
-            in_comment = False
-    if capture:
-        flush()
-    return list(blocks), safe.stat().st_size > MAX_INBOX_SCAN_BYTES
-
-
-def cmd_onboard(args: argparse.Namespace) -> int:
-    row = find_department(args.dept)
-    if row is None:
-        error_limited(f"未在部门表找到部门: {clean_text(args.dept, 200)}", args.max_output_bytes)
-        return 2
-    dept_dir = safe_department_dir(row["department"])
-    if dept_dir is None:
-        error_limited(f"部门路径非法或不存在: {clean_text(row['department'], 200)}", args.max_output_bytes)
-        return 2
-    role_path = dept_dir / "岗位说明.md"
-    handoff_path = dept_dir / "交接班文档.md"
-    inbox_path = dept_dir / "收件箱.md"
-    required = [role_path, handoff_path, inbox_path]
-    progress_path: Path | None = None
-    if row["layer"] == "管理层":
-        progress_path = PROJECT / "docs" / "progress.md"
-        required.append(progress_path)
-    lines = [
-        f"你是: {clean_text(row['department'])}",
-        f"层级: {clean_text(row['layer'])}",
-        f"角色ID: {clean_text(row['role_id'])}",
-        f"会话ID: {clean_text(row['thread_id'])}",
-        f"通知模式: {clean_text(row['notify_mode'])}",
-        "", "本次接班包（已由脚本裁剪，不要再默认全文打开这些文件）:",
-    ]
-    invalid_required = False
-    for path in required:
-        safe = safe_project_file(path)
-        if safe is None:
-            state = " [缺失或路径非法，禁止直接读取]"
-            invalid_required = True
-        else:
-            state = ""
-        lines.append(f"- {rel(path)}{state}")
-    role_sections, role_truncated = extract_markdown_sections(
-        role_path,
-        ("负责什么", "不负责什么", "输入", "输出", "可写文件", "禁止写入", "必须请用户确认"),
-        3600,
-    )
-    handoff_sections, handoff_truncated = extract_markdown_sections(
-        handoff_path,
-        ("进行中", "已定", "下一步", "已知坑", "关键文件"),
-        2600,
-    )
-    progress_sections: list[str] = []
-    progress_truncated = False
-    if progress_path is not None:
-        progress_sections, progress_truncated = extract_markdown_sections(
-            progress_path, ("当前阶段", "进行中", "下一步", "已完成"), 2200,
-        )
-    task_blocks, tasks_truncated = latest_pending_blocks(inbox_path, args.limit)
-    lines.extend(["", "岗位核心:"] + (role_sections or ["- 无可用岗位摘要或路径非法"]))
-    lines.extend(["", "交接摘要:"] + (handoff_sections or ["- 无可用交接摘要或路径非法"]))
-    if progress_path is not None:
-        lines.extend(["", "项目进度摘要:"] + (progress_sections or ["- 无可用项目进度摘要或路径非法"]))
-    lines.extend(["", "当前待办正文:"] + (task_blocks or ["- 无结构化待办"]))
-    lines.extend(["", "按需查询（不固定通读）:", f"- {rel(COLLAB / '错题集.md')}", f"- {rel(COLLAB / '读取路由规则.md')}"])
-    lines.extend(["", "默认不读:"])
-    for item in ("日志正文", "报告正文", "决策正文", "其他部门正文", "代码 diff", "测试证据全文"):
-        lines.append(f"- {item}")
-    lines.extend(["", "触发才读正文:", "- 摘要不足 / 路径异常 / 结论冲突 / 涉及放行、返工、安全、费用、发布、用户可见质量 / 用户要求查证据 / 当前任务明确依赖正文"])
-    truncated = any((role_truncated, handoff_truncated, progress_truncated, tasks_truncated, invalid_required))
-    if truncated:
-        lines.extend(["", "接班包存在截断或非法路径；仅围绕当前任务用 search/slice 追加最小证据，不得直接通读全部历史。"])
-    emit_limited(lines, args.max_output_bytes, truncated=truncated)
-    return 0
 
 
 def cmd_meta(args: argparse.Namespace) -> int:
@@ -1043,11 +818,6 @@ def cmd_slice(args: argparse.Namespace) -> int:
 def main() -> int:
     parser = argparse.ArgumentParser(description="agent-team 读取路由器")
     sub = parser.add_subparsers(dest="cmd", required=True)
-    onboard = sub.add_parser("onboard", help="返回部门身份、裁剪后的岗位/交接/待办接班包和阅读边界")
-    onboard.add_argument("--dept", required=True)
-    onboard.add_argument("--limit", type=int, default=3, help="最多返回的最新待办正文数，范围1-5")
-    onboard.add_argument("--max-output-bytes", type=int, default=DEFAULT_OUTPUT_BYTES)
-    onboard.set_defaults(func=cmd_onboard)
     meta = sub.add_parser("meta", help="只读取一个 Markdown 文件的受限单行元数据")
     meta.add_argument("path")
     meta.add_argument("--max-output-bytes", type=int, default=DEFAULT_OUTPUT_BYTES)
@@ -1063,7 +833,7 @@ def main() -> int:
     find.add_argument("--max-files", type=int, default=DEFAULT_MAX_FILES)
     find.add_argument("--max-output-bytes", type=int, default=DEFAULT_OUTPUT_BYTES)
     find.set_defaults(func=cmd_find)
-    search = sub.add_parser("search", help="在单个长文中按字面查询词返回有上限的命中片段")
+    search = sub.add_parser("search", help="从单个文件定位局部信息并返回有上限的命中片段")
     search.add_argument("path")
     search.add_argument("--query", required=True)
     search.add_argument("--ignore-case", action="store_true")
@@ -1088,21 +858,24 @@ if __name__ == "__main__":
 '''
 
 
-def read_research_script() -> str:
-    source = Path(__file__).with_name("agent_team_research.py")
-    try:
-        return source.read_text(encoding="utf-8-sig")
-    except (OSError, UnicodeError) as exc:
-        raise RuntimeError(f"无法读取研究检索运行脚本 {source}: {exc}") from exc
-
-
 # ---- 每部门文件(在 部门/<部门名>/ 下) -------------------------------------
 
 def role_markdown(key: str, role: dict[str, str], date: str) -> str:
     layer_cn = LAYER_CN.get(role.get("layer", ""), "")
+    audit_rule = (
+        "- 审核层必须亲自验证、覆盖验收出口与失败路径,不采信执行部门转述;结论只回统筹部,不直接改产物或放行。"
+        if role.get("layer") == "audit"
+        else "- 执行/管理层先自检再回报,不得替审核层给出最终质量、风险或成本放行结论。"
+    )
+    management_rule = (
+        "- 统筹部先读自己的收件箱和项目总进度;只有回报不足、收据错误、部门冲突或用户要求时才读部门最小必要正文。"
+        if key == "lead"
+        else "- 项目总进度由统筹部维护;本部门用收件箱、交接班文档和产出路径完成闭环。"
+    )
     return f"""# {role['name']}岗位说明
 
 > 角色 ID:`{key}` ·所在层:{layer_cn} ·创建日期:{date}
+> 本文件只放本岗位长期职责与边界;通用流程细则按需查 `../../README.md`、`../../任务交接模板.md` 和 `../../读取路由规则.md`。
 
 ## 负责什么
 
@@ -1132,116 +905,43 @@ def role_markdown(key: str, role: dict[str, str], date: str) -> str:
 
 {role['confirm']}
 
-## 节点式推进与确认闸
+## 核心协作纪律
 
-- 每个功能 / 环节都必须拆成明确的验收节点;一个节点完成后,执行层和审核层先停止推进并把结果回到统筹部。
-- 统筹部收到回报后按三类节点判断:必须用户确认 / 可自主推进 / 可自主推进但必须汇报。
-- 产品感知、功能取舍、设计判断、重大风险和大阶段收口必须用户确认;流程性、技术性、无争议调度可由统筹部自主推进。
-- "建议下一步"只能作为建议,不能默认视为用户已同意;统筹自主推进也必须保留简短汇报。
-- 没有明确写"用户已确认"或"统筹已按三类节点判断可自主推进"的任务,接收部门应暂停并回统筹部核对。
-- 节点状态只使用:待用户体验 / 待设计视觉确认 / 设计视觉通过 / 用户体验通过 / 用户要求返工 / 可进入测试 / 测试通过 / 测试不通过 / 可进入下一节点 / 用户已确认放行。
-
-## 统筹部三类节点决策
-
-- **必须用户确认**:影响产品体验、用户感知、功能取舍、界面设计、交互流程、视觉呈现、MVP 边界、产品路线、上线发布、外发交付、成本明显增加、隐私/安全/云端/密钥/授权风险。
-- **统筹可以自主推进**:用户不适合判断、且不改变产品体验和重大边界的流程性 / 技术性节点,如边界确认后派设计草案、设计草案后派开发评估、设计视觉 / 交互已确认且技术评估风险可控时派开发正式实现、用户体验 OK 后派测试质量关、测试发现纯代码 / 质量 / 异常路径问题后派开发返工、日志/交接/共享错题集/进度记录/轻量验证/用户确认收口后的 commit 存档;UI 未确认前只能推进实现评估 / 技术可行性。
-- **可以自主推进但必须汇报**:开发评估完成且风险可控、体验 OK 后已派测试、测试发现代码层问题且已派开发返工、测试无 P0/P1/P2 阻断准备收口、安全/财务本节点未触发等,用简短节点卡告诉用户“已推进到哪一步”。
-- **自主推进停止条件**:结论明显不确定、部门判断冲突、需要牺牲体验/范围/成本/速度、要新增依赖/云端/联网/模型/成本、改变用户已确认方向、进入可运行功能体验、UI 视觉确认、发布/打包/外发、大阶段收口。
-
-## 验收出口、失败路径与反向探针
-
-- 统筹部派单必须写清 `验收出口` 和 `必测失败路径`;缺失时接收部门应回统筹部补齐,不得自行脑补。
-- `验收出口` 指用户最终在哪里看到结果 / 提示 / 错误 / 状态 / 弹窗 / 结果摘要 / 导出文件名 / 打包态窗口。凡涉及用户可见内容,不得只写 engine / API / helper 层。
-- `必测失败路径` 至少列 1-3 个打破 happy path 的失败、异常或边界场景。
-- 审核层独立不等于盲审充分;审核部门不能只沿执行部门 happy path 重跑一遍。
-- 凡是用户看到 / 提示 / 错误文案 / 进度 / 状态 / 弹窗 / 结果摘要 / 导出文件名 / 打包态窗口的验收,必须测到 worker / UI / 用户最终出口;只测底层不算通过。
-- 每个关键风险至少有一个自设计反向探针。
-- 审核/测试报告必须写明:验证层级(engine / adapter-service / worker-后台任务 / UI-用户可见出口 / 打包态 / 未覆盖层级)、用户可见出口、自设计反向探针、未覆盖层级、是否触发子 Agent 盲审 / 抽检。
-- 盲审/抽检触发条件:同一功能链连续多轮无阻断通过(默认 3 轮,可解释调整)、链路跨 engine→worker→UI→用户出口、涉及错误文案/状态/发布/打包/安全/费用等高风险、用户或统筹感觉结论依据不足。
-- 触发后子 Agent 只做盲审/抽检结论回报,不直接改代码、不自动放行。
-
-## 设计可视化确认节点
-
-- 凡涉及 UI、交互、视觉呈现、页面布局、设计稿、用户体验路径的节点,设计部必须提供用户可直接判断的设计意图预览,不能只交文字说明、ASCII 线框、Markdown 表格或抽象结论。
-- 设计意图预览用于判断方向、布局、信息层级和交互感觉,不得声称等同真实 App UI;真实 UI 验收必须来自运行中的 App / 真实路由 / 构建或打包态截图。
-- 设计部优先使用 OpenDesign 等专用设计工具生成可编辑设计产物或 artifact;如果当前会话未热加载 OpenDesign MCP、OpenDesign 没有 active project、权限不足、工具连接失败,必须明确说明失败原因。
-- OpenDesign 不可用时,设计部必须用本地 HTML + PNG 截图、Figma、可打开图片预览等方式兜底,保证用户看到设计意图,但不得承诺这就是最终真实 UI。
-- 设计部回报四件套中的产出路径必须同时包含设计说明文档路径和设计意图预览路径;若使用兜底方案,必须写清 OpenDesign 当前状态和后续恢复条件。
-- OpenDesign 接入顺序:先确认本机 OpenDesign App 是否运行,再确认 daemon 健康状态;不要假设默认端口一定是 7456,应从 OpenDesign 日志或本机监听端口确认实际 daemon URL;确认后注册 open-design MCP。当前会话可能无法热加载新 MCP,必要时提示用户重载 / 新开会话。
-- 若 OpenDesign artifact 写入提示没有 active project,要求用户在 OpenDesign 内创建或点进项目,或改用本地 HTML / PNG 兜底交付,不能卡住节点。
-- 若发现未安装 / 未运行 OpenDesign、权限不足、连接失败或 MCP 未热加载,设计部必须主动询问用户是否需要帮忙安装 / 启动 / 授权 / 注册 MCP / 重载或新开会话;用户不想处理 OpenDesign 或不愿意重载 / 新开会话时,不得卡住,应按用户偏好直接选择本地 HTML + PNG、Figma 或可打开图片预览。
-- 最小排障顺序:查 App 是否运行 → 查监听端口或日志里的 daemon URL → 查 MCP 是否已注册 / 当前会话是否已热加载 → 查 active project → 查权限 / 连接错误;任一步失败都同时给兜底预览方案。
-- 统筹部收到设计回报后,先展示设计意图预览,再给用户成果 / 判断点 / 建议 / 风险 / 下一步短节点卡,不要把长技术说明或设计正文直接丢给用户判断。
-- 用户确认设计视觉或交互方向前,统筹部不得派开发部进入正式实现;如果用户只反馈功能方向 OK 但 UI 未确认,只能推进功能可行性或技术评估。功能方向 OK 不等于 UI 通过;开发完成后的 UI 通过判断必须回到真实 App / 真实路由 / 构建或打包态截图。
-- OpenDesign 只是增强设计表达和可视化确认能力,不代表自动进入完整 UI 重设计、品牌升级或开发实现。
-
-## App 体验节点与专业验证分工
-
-- 可运行功能完成后,先交给用户体验;进入“需要用户体验 App”的节点时,统筹部默认直接帮用户打开 App,不先问“要不要打开”。
-- 如果当前环境能启动 / 打开 App,统筹部直接打开;如果启动失败,说明失败原因、已尝试命令和用户可手动打开的入口。
-- 统筹部必须给用户一张短体验卡,格式固定为:入口 / 重点 / 建议试法 / 判断口径。
-- 体验卡里的“建议试法”给 2-4 个具体操作;“判断口径”只要求用户回复“体验 OK”或指出哪里不顺。
-- 用户只判断体验是否顺手、是否符合预期、流程是否对;用户不负责代码质量、异常覆盖、打包、隐私、安全、成本等专业验证。
-- 用户体验不通过时,先按体验反馈返工;用户明确确认"体验 OK / 可以进测试"后,测试部才介入专业质量关。
-
-## 完成回报四件套
-
-- 部门完成节点后,必须把 `[回报]` 写入统筹部收件箱,并包含四件套:产出路径、验证结果(含未验证项)、日志收据、错题自检。
-- 设计节点的产出路径必须同时包含设计说明文档路径和设计意图预览路径;只给文字说明或表格时,统筹部不得视为完整回报。
-- 日志收据只是一条可机器式核验的归档索引,格式包含:日志文件、节点ID、索引行。部门自己负责日志内容质量;统筹部只核验索引存在和可倒查。
-- 错题自检必须说明已检查哪些相关错题、是否命中、如何处理。`../../错题集.md` 是跨部门共享错题集,只收会让多个部门反复踩坑的流程错误;部门局部问题写本部门日志或交接,不另建部门错题集。
-- 四件套缺任一项,统筹部不得视为完整回报,不得进入下一环节。
-
-## 统筹部读取边界
-
-- 统筹部的主入口是统筹部收件箱,不是各部门正文。统筹部根据收件箱回报写节点卡,只核验日志收据存在。
-- 默认不得读取部门产出正文、完整日志、测试证据全文或代码 diff,以保护多会话隔离。
-- 只有收件箱回报不足、日志收据不存在/指针错误、多部门结论冲突、或用户明确要求复核正文时,才读取最小必要范围,优先只读结论 / 验证 / 风险三段。
-
-## 跨部门流转规则(混合路由)
-
-- **澄清类直连**:不改任何已确认产物、不下裁决、不推进状态、问清就能继续干的事(如“这个字段能为空吗?”),直接写对方 `收件箱.md`,并发一句短唤醒。
-- **要改东西 / 要裁决 / 要变状态 → 经统筹部**:返工、放行、进入下一阶段、改变需求或设计范围、审核结论、阻断、是否上线、状态升级、增删部门。
-- 口诀:**“只问一句、不改东西” → 直连;“要改 / 要裁决 / 要变状态” → 经统筹。**
-- 通知分两种:
-  - 自动模式:本部门在 `../../部门表.md` 的通知模式为"自动",后续默认直接调用会话发送工具发一句短唤醒。
-  - 人工模式:本部门通知模式为"人工",写完收件箱后默认直接给用户可复制的短唤醒,请用户手动通知目标部门查看收件箱。
-- 通知能力只在上岗/接班时登记一次;若工具能力后来变化,请用户通知统筹部更新 `../../部门表.md`,不要每次任务完成都重新探测。
-- 自动模式实际调用失败时,本次回退为人工提醒,并请用户通知统筹部更新 `../../部门表.md`。
-- 通知只允许表达三类状态:有新任务 / 任务已完成 / 遇到阻断;任务全文、报告全文和长上下文只写 `收件箱.md`。
-
-## 会话使用规则
-
-- 本岗位对应一个长期会话。**新会话用 `上岗引导.md` 启动**(先接班再干活)。
-- **接班**:先运行读取路由器并直接使用它返回的裁剪接班包;不要默认再次全文读取岗位说明、交接班或收件箱。只有接班包明确截断、路径异常或当前任务依赖正文时,才用 `search/slice` 补最小证据。
-- **手上只做一件**(在"交接班文档 · 进行中"),干活时不刷收件箱;一件做完才去收件箱取下一件。
-- **交班**:发跨部门消息前、完成可交付工作后、压缩前自动交班;更新 `交接班文档.md`,档案级事件追加 `日志/<本周>.md`,完成回报必须带产出路径、验证结果、日志收据、错题自检;新错题进 `../../错题集.md`。
-- 会话过长 / 偏离职责 / 质量下降 → 新建会话并更新 `../../部门表.md`。
+- 手上只做一件,写在 `交接班文档.md` 的“进行中”;干活时不刷收件箱,做完才取下一件。
+- 任务详情和回报只认收件箱;通知只做短唤醒。自动模式直接发送,人工模式提醒用户手动通知;不要每次任务完成都重新探测能力。
+- 派单必须写验收出口和必测失败路径;缺失时回统筹补齐,不要自行脑补。
+- 产品体验、功能取舍、UI/交互、范围、发布、明显成本和安全隐私风险由用户拍板;“建议下一步”不等于授权。
+- 完成回报必须带四件套:产出路径、验证结果(含未验证项)、日志收据、错题自检。
+{audit_rule}
+{management_rule}
+- 接班按“上岗引导 → 岗位说明 → 交接班文档 → 收件箱”;不另造接班摘要。交班更新当前状态和必要日志,不等于 git commit。
+- 用户说“换会话 / 切换会话 / 换班”时,按上岗引导的一键换班协议创建同部门新会话;新会话登记成功后才归档旧会话。换班登记是唯一例外:新会话只能改 `../../部门表.md` 中本部门这一行的“会话 ID / 状态”,不得改其他列或其他部门。
 """
+
 
 
 def bootstrap_markdown(key: str, role: dict[str, str]) -> str:
     layer_cn = LAYER_CN.get(role.get("layer", ""), "")
     return f"""# {role['name']} 上岗引导
 
-> 定位:轻量路由卡。先裁剪上下文,再读必要文件;不要把本文件当长制度手册。
+> 定位:本部门接班与换班的唯一入口。四份文件各司其职,不要让脚本再生成接班摘要。
 > 手动模式:新开一个会话当本部门,把下面整段粘进去即可。
 > 自动模式(Codex 等有会话工具):由工具自动发送本段作为初始化消息。
 
 ```
 你现在是【{role['name']}】(角色 ID:{key} ·所在层:{layer_cn})。
 
-## 第一步:读取路由(先裁剪上下文,别急着扫全局)
-先运行固定读取路由脚本:
+## 第一步:四文档接班
+按以下顺序直接读取,不运行接班总结脚本:
 
-python3 docs/collaboration/scripts/agent_team_read.py onboard --dept {role['name']}
+1. `docs/collaboration/部门/{role['name']}/上岗引导.md`:本接班/换班入口。
+2. `docs/collaboration/部门/{role['name']}/岗位说明.md`:职责、输入输出、可写范围和确认边界。
+3. `docs/collaboration/部门/{role['name']}/交接班文档.md`:进行中、下一步、已定决策、已知坑和关键文件。
+4. `docs/collaboration/部门/{role['name']}/收件箱.md`:尚未领取的待办和任务真相。
 
-脚本直接返回本部门身份、通知模式、岗位核心、交接摘要、最新待办正文和默认阅读边界。它不做创造性总结、不替代统筹判断、不替代审核结论、不自动放行。
-
-## 第二步:使用裁剪接班包
-- 先依靠脚本输出恢复状态,不要默认再次全文打开岗位说明、交接班或收件箱;错题集和读取路由规则只按当前任务查询。
+- 只在与当前任务相关时查共享错题集、项目级正文、报告或日志;统筹部按条件读取 `docs/progress.md`。
 - 默认不读日志正文、报告正文、决策正文、其他部门正文、代码 diff、测试证据全文。
-- 只有接班包截断、摘要不足、路径异常、结论冲突、涉及放行/返工/安全/费用/发布/用户可见质量、用户要求查证据、当前任务明确依赖正文时,才用 `search/slice` 读取最小必要正文。
+- 接班后只汇报:职责、进行中、下一步、收件箱是否有待办、待确认问题;不要推测四文档没有记录的项目阶段,也不要立刻开始业务任务。
 
 ## 本部门职责边界
 负责:{role['mission']}
@@ -1260,6 +960,11 @@ python3 docs/collaboration/scripts/agent_team_read.py onboard --dept {role['name
 - 自动模式:本部门在 `../../部门表.md` 的通知模式为“自动”时,默认直接调用会话发送工具发短唤醒。
 - 人工模式:通知模式为“人工”或工具发送失败时,写完收件箱后提醒用户手动通知目标部门。
 - 不要每次任务完成都重新探测工具能力;能力变化时请用户通知统筹部更新部门表。
+
+## 快捷指令:接班 / 交班 / 换会话
+- 用户说“接班”:按四文档顺序恢复状态并短汇报。
+- 用户说“交班”:更新 `交接班文档.md`;需归档的档案级事件追加到本周日志。交班不创建新会话,也不等于 git commit。
+- 用户说“换会话 / 切换会话 / 换班”:读取 `../../会话启动清单.md` 的“同部门自动换班”并执行。新会话登记成功后才归档旧会话;不要 fork 旧聊天历史,任一步失败都保留旧会话。
 ```
 """
 
@@ -1268,7 +973,7 @@ def state_markdown(key: str, role: dict[str, str], date: str) -> str:
     return f"""# {role['name']} · 交接班文档
 
 > 角色 ID:`{key}` ·最近更新:{date}
-> 这是本部门的**当前状态**(给接班的人看),不是流水账。接班先读这里恢复;会话变长或交接前回来更新成最新。
+> 这是本部门的**当前状态**(给接班的人看),不是流水账。接班先读这里恢复;交班、压缩或“换会话”前更新成最新。
 > 铁律:从这里删掉的旧内容,必须先追加到 `日志/<本周>.md`(只增不改),绝不直接丢。
 
 ## 进行中(在办)
@@ -1499,13 +1204,9 @@ def reading_rules_markdown(date: str) -> str:
 > 创建日期:{date}
 > 目标:让部门会话默认吃短上下文,只有触发条件成立才扩大阅读范围。
 
-## 固定入口
+## 接班入口
 
-新会话或接班时,先运行:
-
-```bash
-python3 docs/collaboration/scripts/agent_team_read.py onboard --dept 【部门名】
-```
+新会话按本部门 `上岗引导.md → 岗位说明.md → 交接班文档.md → 收件箱.md` 的顺序直接接班。四份文件就是接班真相源;不要运行脚本把它们再次总结成第五份接班内容。
 
 要查报告、审核报告、专项结论、关键决策时,优先只查受限单行元数据:
 
@@ -1515,30 +1216,26 @@ python3 docs/collaboration/scripts/agent_team_read.py find --type special_conclu
 python3 docs/collaboration/scripts/agent_team_read.py meta docs/collaboration/专项结论/示例.md
 ```
 
-要从一篇长文中只取相关内容,禁止先打开全文;先查命中行,再切片:
+## 局部信息提取
+
+不要让 Agent 判断抽象的“长文”或猜测当前会话还剩多少 token。只判断任务是否需要理解全文:
+
+- 当前任务需要理解整份契约、Spec、决策或完整上下文:直接读原文;若会话已压缩、偏离或质量下降,先交班换会话。
+- 当前任务只需要已知文件中的一个事实、主题或段落:先 `search` 一次;命中片段已经够用就停止。
+- 命中位置明确但需要更完整的连续段落:再 `slice` 一次。不得把 `search → slice` 变成循环检索状态机。
 
 ```bash
-python3 docs/collaboration/scripts/agent_team_read.py search <path> --query "关键词" --context 2 --limit 20
+python3 docs/collaboration/scripts/agent_team_read.py search <path> --query "关键词" --context 2 --limit 8
 python3 docs/collaboration/scripts/agent_team_read.py slice <path> --start-line 120 --end-line 170
 ```
 
-跨文件、术语未知、证据可能分散或遗漏代价高时,才启用高召回研究模式。AI 先冻结原问题,再给最多 12 个“只增加、不替换原问题”的同义词、实体名、上下位概念和反证词;脚本负责确定性召回和保留候选清单:
+`search/slice` 只用于“局部需求”,不以固定字数作为触发条件。术语未知、跨文件关系复杂或任务要求完整理解时,不要连续扩词调用脚本;改为选择必要原文完整读取、换新会话承载,或明确未验证项。
 
-```bash
-python3 docs/collaboration/scripts/agent_team_research.py candidates --task-id <任务ID> --query "原问题" --expand "扩展词" --path docs
-python3 docs/collaboration/scripts/agent_team_research.py pack --task-id <任务ID> --ids <候选ID1> <候选ID2> --target-tokens 6000
-python3 docs/collaboration/scripts/agent_team_research.py coverage --task-id <任务ID>
-```
-
-- 每个 `--expand` 只放一个短词或短语,不要把多个概念拼成长句。AI 可把候选标成相关 / 不确定 / 暂不相关并重排,但不得永久删除候选,不得把“当前没有命中”说成“确定不存在”。完整候选始终留在任务 manifest。
-- 证据包的 `target-tokens` 是软目标,复杂任务可调高或拆包;它不是完成条件。16 KiB 是单次终端输出安全上限,不是证据总量上限。
-- 如果 coverage 显示术语覆盖不足或结论存在明显反例风险,只允许追加一次 `candidates --round 2`,且必须加入限制条件、失败模式和反证词;第二轮后仍不足就列为未验证项或拆成子任务,禁止无限扩词。
-
-脚本不做创造性总结、不替代统筹判断、不替代审核结论、不自动放行。`onboard/meta/find/search/slice` 有命中数、字段长度和单次输出预算;研究脚本另保留候选清单、来源哈希、覆盖报告和选择账本,所有截断与未扫描范围必须显式报告。
+脚本不做创造性总结、不替代统筹判断、不替代审核结论、不自动放行。`meta/find/search/slice` 保留路径、编码、命中数、扫描范围和单次输出保险丝;保险丝只防异常输出,不代表证据充分。
 
 ## 默认阅读边界
 
-- 默认读:读取路由脚本返回的裁剪接班包。不要默认再次全文读取岗位说明、交接班或收件箱。
+- 接班必读:本部门上岗引导、岗位说明、交接班文档、收件箱。
 - 按需读:错题集中与当前任务相关的条目、读取路由规则、已命中的报告片段。
 - 默认不读:日志正文、报告正文、决策正文、其他部门正文、代码 diff、测试证据全文。
 - 触发才读正文:摘要不足、路径异常、结论冲突、涉及放行/返工/安全/费用/发布/用户可见质量、用户要求查证据、当前任务明确依赖正文。
@@ -1649,6 +1346,7 @@ def registry_markdown(roles: list[str], profile: str, date: str, session_mode: s
 - 明确是 App/Web/SaaS/AI 工具/Vibe Coding 时直接走互联网 AI 产品主分支;只有最终交付物不明时才追问。会话创建模式仍必须确认,不得在未调用会话工具时声称已创建部门会话。
 - 新增 / 删除 / 替换部门前必须让用户确认;之后用脚本 `--add-roles` 增量补建,并回来更新本表与相关流转规则。
 - 会话 ID / 通知模式变更只改本表,不动历史。通知模式只用:待登记 / 自动 / 人工。
+- 同部门换班时,新会话可在四文档读取成功、职责核对一致后,只更新本部门这一行的“会话 ID / 状态”;这是普通部门写本表的唯一例外,不得改职责、权限、通知模式、其他列或其他部门。
 - 自动会话模式:当前 Agent 必须实际调用会话管理工具创建部门会话,把返回的会话 ID 写入本表,并把 `上岗引导.md` 发给对应会话;工具不可用或调用失败时,回退手动模式并明说未创建会话。
 - 手动会话模式:用户自行创建部门窗口,本 skill 只生成部门文件、上岗引导和 `会话启动清单.md`;会话 ID 保持待登记,不得声称已创建会话。
 - 每个部门:状态看 `部门/<部门>/交接班文档.md`,历史看 `部门/<部门>/日志/`,待办看 `部门/<部门>/收件箱.md`。
@@ -1960,9 +1658,17 @@ def session_startup_markdown(roles: list[str], session_mode: str, date: str) -> 
 
 1. 用户按下表手动创建各部门会话窗口。
 2. 给每个窗口粘贴对应 `上岗引导.md`。
-3. 部门会话先接班:运行 `python3 docs/collaboration/scripts/agent_team_read.py onboard --dept 【部门名】`,直接使用脚本返回的裁剪接班包;不要默认全文打开列出的来源文件。
-4. 部门会话只汇报职责 / 阶段 / 进行中 / 收件箱 / 待确认问题,不要立刻做业务任务。
+3. 部门会话先按 `上岗引导.md → 岗位说明.md → 交接班文档.md → 收件箱.md` 接班。
+4. 部门会话只汇报职责 / 进行中 / 下一步 / 收件箱 / 待确认问题,不要推测四文档没有记录的项目阶段,也不要立刻做业务任务。
 5. 后续交接全部写对应部门文件夹里的 `收件箱.md`;会话消息只做短唤醒。
+
+## 同部门自动换班
+
+- 用户在部门会话说“换会话 / 切换会话 / 换班”,即明确授权本次创建同部门新会话并在接班成功后归档旧会话。
+- 旧会话先按现有交班规则更新 `交接班文档.md` 和必要日志,再读取部门表中的旧会话 ID;没有已登记 ID 时不得自动归档。
+- 使用 `list_projects → create_thread → set_thread_title → send_message_to_thread` 创建同项目本地新会话。不要用复制旧聊天历史的 fork。
+- 新会话接班消息必须带部门名、新旧会话 ID 和四文档路径;新会话读取成功、职责一致后,只把部门表中本部门这一行的“会话 ID / 状态”更新为新 ID / 已启用,再调用 `set_thread_archived` 归档旧会话。
+- 归档必须最后执行。创建、发消息、接班或登记任一步失败都保留旧会话并明确回报;工具不全则使用下方固定“手动换班回退模板”。
 
 ## 部门会话清单
 
@@ -1973,7 +1679,27 @@ def session_startup_markdown(roles: list[str], session_mode: str, date: str) -> 
 ## 手动上岗提醒模板
 
 ```text
-请打开本项目的 docs/collaboration/部门/【部门名】/上岗引导.md,按里面的顺序接班。先只汇报:你的职责、当前阶段、进行中、收件箱是否有待办、待确认问题。不要开始业务任务。
+请打开本项目的 docs/collaboration/部门/【部门名】/上岗引导.md,按里面的顺序接班。先只汇报:你的职责、进行中、下一步、收件箱是否有待办、待确认问题。不要推测四文档没有记录的项目阶段,不要开始业务任务。
+```
+
+## 手动换班回退模板
+
+```text
+请在同一项目中手动新建一个全新会话,标题建议沿用“【序号】 【部门名】”,不要 fork 旧聊天。
+
+你是【部门名】的新接班会话。
+项目根目录:【绝对路径】
+旧会话 ID:【旧 ID;没有则写待登记】
+新会话 ID:【取得后填写】
+
+请按以下顺序直接读取,不要运行接班总结脚本:
+1. docs/collaboration/部门/【部门名】/上岗引导.md
+2. docs/collaboration/部门/【部门名】/岗位说明.md
+3. docs/collaboration/部门/【部门名】/交接班文档.md
+4. docs/collaboration/部门/【部门名】/收件箱.md
+
+读取成功后只汇报职责、进行中、下一步、收件箱是否有待办、待确认问题;不要推测四文档没有记录的项目阶段,不要开始业务任务。
+确认职责一致后,只把部门表中本部门这一行的“会话 ID / 状态”登记为新 ID / 已启用,不得改其他列或其他部门。登记成功后才归档旧会话;旧 ID 无效、无法登记或无法归档时,明确报告切换未完成并保留旧会话。
 ```
 """
 
@@ -2016,9 +1742,7 @@ def readme_markdown(date: str) -> str:
 ├── 任务交接模板.md       把任务派给别部门的模板(含路由判断,共享)
 ├── 专项结论/            多部门复用的结论,用受限单行元数据检索
 ├── scripts/
-│   ├── agent_team_read.py      接班/元数据/单文档裁剪路由器
-│   └── agent_team_research.py  跨文档高召回候选与证据包
-├── .retrieval/           研究任务 manifest、覆盖报告和选择账本(运行后生成)
+│   └── agent_team_read.py 元数据定位与单文件局部提取工具
 └── 部门/
     └── <部门名>/
         ├── 岗位说明.md       职责与边界(静态,含所在层与路由规则)
@@ -2030,14 +1754,11 @@ def readme_markdown(date: str) -> str:
             (审核层部门另有 把关报告/,标题为审核报告)
 ```
 
-## 读取路由:先裁剪,再判断是否读正文
+## 接班与读取路由
 
-- 新会话或接班先运行 `python3 docs/collaboration/scripts/agent_team_read.py onboard --dept 【部门名】`。
-- 脚本直接返回本部门身份、通知模式、岗位核心、交接摘要、最新待办正文和默认阅读边界;先使用这个接班包,不要默认再次全文读取来源文件。
+- 新会话按本部门 `上岗引导.md → 岗位说明.md → 交接班文档.md → 收件箱.md` 直接接班;四份文件就是接班真相源,不要再生成接班摘要。
 - 报告、审核报告、专项结论、关键决策都必须带受限单行元数据,其中 `summary` 是人工预写的一句话摘要。脚本只读允许字段,不读正文后自动总结。
-- 长文内容先用 `search` 取有上限命中片段,再用 `slice` 取不超过 200 行的必要正文;禁止为了找一段内容先打开全文。
-- 跨文档、术语未知、遗漏代价高时才启用 `agent_team_research.py`:原问题永久保留,AI 只做加法式扩词和候选重排,脚本保留完整候选 manifest、来源哈希、证据包、覆盖报告和选择账本。AI 不得永久删除候选或声称检索已绝对完整。
-- `pack --target-tokens` 是可调软目标,不是任务完成条件;单次输出硬上限只负责保护终端和上下文。覆盖不足时最多追加一轮限制条件/失败模式/反证检索,再不足就列未验证项或拆任务。
+- 不按固定字数定义“长文”。任务只需要已知文件中的局部信息时先用 `search`;命中已够就停止,需要连续段落时再用一次 `slice`。任务需要理解整份文档时直接读原文;会话状态已经变差时先换会话,不要堆检索调用。
 - 默认不读日志正文、报告正文、决策正文、其他部门正文、代码 diff、测试证据全文。
 - 只有摘要不足、路径异常、结论冲突、涉及放行/返工/安全/费用/发布/用户可见质量、用户要求查证据、当前任务明确依赖正文时,才读取最小必要正文。
 - 查元数据优先用读取路由脚本,如 `agent_team_read.py find --type audit_report --status blocked`、`agent_team_read.py find --type special_conclusion --tag 用户可见出口`。
@@ -2062,12 +1783,13 @@ def readme_markdown(date: str) -> str:
 
 ## 接班 / 交班:让记忆转起来
 
-- **接班(读档,接手即做)**:先运行读取路由器并直接使用裁剪接班包;不要默认全文读 `交接班文档.md`、`收件箱.md` 或岗位说明。仅在截断、异常或当前任务明确依赖正文时用 `search/slice` 补最小证据。
+- **接班(读档,接手即做)**:直接按四文档顺序恢复岗位、当前状态与待办;错题、日志、报告和项目正文只按当前任务读取。
 - **交班(写档,分层触发)**:
   - 硬节点自动:发跨部门消息前、完成可交付工作后。
-  - 压缩 / 换会话前:先交班再压,在途推理也倒进日志(标 [进行中])。
+  - 压缩 / 换会话前:先交班再压;只在交接班文档记录目标、已完成进度、关键中间结论、产出路径和阻断,不要抄完整推理过程。
   - 随时手动。
   - **交班 ≠ git commit**:交班只写记忆文件,commit 是入版本库。用户确认正式收口后,统筹部应检查 `git status --short`;若工作区只包含本节点相关变更,可执行 commit 存档;若有无关或用户未确认变更,先向用户说明并等待确认。
+- **换会话(一键换班)**:用户说“换会话 / 切换会话 / 换班”后,旧会话先交班,再用原生会话工具创建同项目、同部门新会话;新会话按四文档接班,只登记部门表中本部门的“会话 ID / 状态”,成功后才归档旧会话。不得用 fork 复制旧聊天历史;失败时保留旧会话并使用会话启动清单中的固定手动回退模板。
 
 ## 收件箱怎么转(防止新任务冲掉手上的活)
 
@@ -2242,29 +1964,19 @@ def append_agent_guide(target: Path) -> None:
 
 ## 多会话协作(三层框架)
 
-如果项目启用了 `docs/collaboration/`,团队按**三层框架**组织:管理层(统筹部)/ 执行层(产出)/ 审核层(质量·风险·成本把关)。新会话用 `docs/collaboration/部门/<本部门>/上岗引导.md` 启动:先运行 `python3 docs/collaboration/scripts/agent_team_read.py onboard --dept 【部门名】`,直接使用脚本返回的裁剪接班包,不要默认全文读取来源文件。默认不读日志正文、报告正文、决策正文、其他部门正文、代码 diff、测试证据全文;只有接班包截断、摘要不足、路径异常、结论冲突、涉及放行/返工/安全/费用/发布/用户可见质量、用户要求查证据、当前任务明确依赖正文时,才用 `search/slice` 读取最小必要正文。跨文档、术语未知或遗漏代价高时,才用 `agent_team_research.py` 做“原问题 + 加法式 AI 扩词 + 确定性召回 + 候选 manifest + 证据包 + coverage”;AI 可重排但不得永久删除候选或声称绝对完整,覆盖不足最多补一轮反证检索。**手上只做一件(交接班文档·进行中),干活时不刷收件箱**;做完才取下一件。发跨部门消息前 / 完成可交付工作后 / 压缩前**交班**:更新本部门 `交接班文档.md`,形成产出/报告/设计稿/spec/代码交付/把关结论/阶段建议时追加 `日志/<本周>.md` 单行索引,并在回报里提供日志收据;跨部门可复发流程错题进共享 `错题集.md`,部门局部坑进本部门日志/交接。**交班 ≠ git commit**;用户确认正式收口后,统筹部检查 `git status --short`,仅本节点相关变更可 commit 存档,有无关变更先请用户决定。
+> 详细制度与模板以 `docs/collaboration/README.md`、`部门表.md` 和 `任务交接模板.md` 为准;本节只保留项目级入口,不要复制整套部门手册。
 
-**三类节点闸**:每个功能 / 环节拆成验收节点;部门完成节点后先停下回报统筹部。统筹部按三类判断:必须用户确认 / 可自主推进 / 可自主推进但必须汇报。产品体验、用户感知、功能取舍、UI / 交互 / 视觉、MVP 边界、产品路线、上线发布、外发交付、成本明显增加、隐私/安全/云端/密钥/授权风险必须用户确认;不改变体验和重大边界的流程性 / 技术性节点可自主推进;用户体验 OK 后派测试、测试发现纯代码 / 质量 / 异常路径问题后派开发返工、开发评估完成、测试无 P0/P1/P2 阻断、安全/财务未触发等节点必须简短汇报。自主推进停止条件:明显不确定、部门冲突、牺牲体验/范围/成本/速度、新增依赖/云端/联网/模型/成本、改变已确认方向、进入体验/视觉确认/发布打包外发/大阶段收口。"建议下一步"不等于授权。
-**收件箱**:任务详情、背景、输入、输出、报告路径、确认点和节点状态只写对应部门 `收件箱.md`;通知只做短唤醒,只表达有新任务 / 任务已完成 / 遇到阻断。通知能力在上岗/接班时登记到 `部门表.md`,后续按登记模式执行;人工模式直接请用户手动提醒,自动模式直接调用工具发送。自动发送失败时回退为人工提醒,并请用户通知统筹部更新登记。
-**完成回报四件套**:产出路径、验证结果、日志收据、错题自检。统筹部先读统筹部收件箱,只核日志收据存在,默认不读部门产出正文、长日志、测试证据全文或代码 diff;只有回报不足、收据错误、部门结论冲突或用户要求时,才读取最小必要正文。
-**路由(混合)**:澄清类(不改产物、不裁决、不推进状态)直接写对方收件箱;裁决/返工/改需求设计范围/审核结论/阻断/放行/进入下一阶段/状态升级/增删部门经统筹部。
-**体验与测试**:可运行功能先给用户体验。进入“需要用户体验 App”的节点时,统筹部默认直接帮用户打开 App,不先问“要不要打开”;打开后给短体验卡:入口 / 重点 / 建议试法 / 判断口径。建议试法给 2-4 个具体操作,判断口径只要求用户回复“体验 OK”或指出哪里不顺。用户明确确认体验 OK / 可以进测试后,统筹部可自主派测试部介入专业质量关,并用简短节点卡汇报。测试不通过时,测试部只回统筹部;统筹部节点卡同步后分流:纯代码 / 质量 / 异常路径问题可自主派开发返工,涉及体验取舍、范围变化、成本/安全/发布、方案选择或重大事项才等用户确认。
-**设计可视化确认**:凡涉及 UI、交互、视觉呈现、页面布局、设计稿、用户体验路径的节点,设计部必须提供用户可直接判断的设计意图预览,不能只交文字说明、ASCII 线框、Markdown 表格或抽象结论。设计预览不得声称等同真实 App UI;真实 UI 验收必须来自运行中的 App / 真实路由 / 构建或打包态截图。优先用 OpenDesign 等专用设计工具生成可编辑 artifact;当前会话未热加载 OpenDesign MCP、没有 active project、权限不足或工具连接失败时,必须写清失败原因,主动询问用户是否需要帮忙安装 / 启动 / 授权 / 注册 MCP / 重载或新开会话。用户不想处理 OpenDesign 或不愿意重载 / 新开会话时,按用户偏好直接用本地 HTML + PNG 截图、Figma、可打开图片兜底。OpenDesign 接入先确认 App 是否运行,再确认 daemon 健康状态;不要假设端口一定是 7456,应从日志或监听端口确认实际 daemon URL。统筹部收到设计回报后,先展示设计意图预览,再给成果 / 判断点 / 建议 / 风险 / 下一步短节点卡。用户确认设计视觉或交互方向前,不得派开发部正式实现;用户只确认功能方向 OK 不等于 UI 通过;开发完成后的 UI 通过判断必须回到真实 App / 真实路由 / 构建或打包态截图。
-**放行**:审核层三关通过后,统筹部给出放行建议,标记完成/对外发布由用户拍板。
-**成本**:财务部只在成本节点介入并预警上报,不自动卡死发布。
-
-### 与地基记忆文件的分工(避免重复记)
-
-启用协作层后,按下面分工,别两头重复:
-
-- **优先级**:本节覆盖上方“完成标准”里对 `docs/progress.md` / `docs/handoff.md` 的通用要求,避免部门和项目级记忆重复写。
-- **部门级(各部门自己维护)**:本部门 `交接班文档`(当前状态/换班)、`日志`(部门历史)。日常“做到哪、为什么、踩了坑”都记这里。
-- **项目级总进度 → 只由统筹部维护**:`docs/progress.md` 是各部门状态的汇总,由统筹部从各部门交接班文档汇总后单写;**其他部门不直接写 `docs/progress.md`**。
-- **`docs/handoff.md` 已被部门级交接班文档取代**:启用多会话后不再单独维护(整个项目状态 = `部门表` + 各部门 `交接班文档`)。
-- **最终把关以审核层为准,但不能替用户拍板**:执行部门“完成=已验证”只是交检前自检;审核层结论必须回统筹部收件箱。无 P0/P1/P2 阻断时统筹部可建议通过并准备收口,但正式收口、进入下一大阶段、对外发布仍由用户拍板;用户确认正式收口后,统筹部可按本节点相关变更执行 commit 存档。
-- **确认节点**:agent-guide 的改动分级(A/B/C)是全局底线,各部门岗位说明里的确认节点是本部门细化,冲突从严;没有明确写“用户已确认”或“统筹已按三类节点判断可自主推进”的任务,接收部门暂停并回统筹部核对。
+- 团队分管理层、执行层、审核层;每个节点由统筹部派单,执行层产出,审核层独立验证,产品体验与重大边界由用户拍板。
+- 部门接班按“上岗引导 → 岗位说明 → 交接班文档 → 收件箱”;四份文件就是接班真相源,不另造接班摘要。
+- 手上只做一件,写在本部门交接班文档的“进行中”;干活时不刷收件箱,做完才领取下一件。
+- 任务详情和回报只认收件箱;跨会话消息只做“有新任务 / 已完成 / 遇到阻断”短唤醒。
+- 完成回报必须包含产出路径、验证结果、日志收据、错题自检;统筹部默认不通读部门长正文。
+- 任务只需已知文件中的局部信息时才用 `agent_team_read.py search`,需要连续段落再用一次 `slice`;任务需整体理解时直接读原文,不要循环检索。
+- 用户说“换会话 / 切换会话 / 换班”时,旧会话先交班,再创建同项目同部门新会话;新会话按四文档接班,只登记本部门的“会话 ID / 状态”后才归档旧会话,不要 fork 旧聊天历史。
+- `docs/progress.md` 只由统筹部维护;部门历史放各自日志。交班不等于 commit,上线、外发和正式收口仍由用户确认。
 """
     write_utf8_atomic(guide, text.rstrip() + addition + "\n")
+
 
 
 # ---- 最小业务地基 ------------------------------------------------------------
@@ -2786,9 +2498,6 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
         scripts_dir.mkdir(parents=True)
         read_router = scripts_dir / "agent_team_read.py"
         write_utf8_atomic(read_router, read_router_script(), mode=0o755)
-        research_router = scripts_dir / "agent_team_research.py"
-        write_utf8_atomic(research_router, read_research_script(), mode=0o755)
-
         depts_root = build_collab / "部门"
         depts_root.mkdir(parents=True)
         for key in roles:
