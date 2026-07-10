@@ -2,21 +2,22 @@
 
 面向互联网 AI 产品开发的多会话部门协作协议与脚手架,同时兼容内容、运营、调研等非软件团队。
 
-主要组织产品、设计、开发、AI 工程/评测、测试、安全和成本节点。每个会话都有职责边界、收件箱、交接班和审核闸;长文通过有硬输出预算的路由脚本先检索再切片,避免为了找一段内容把整篇文章塞进 Agent 上下文。
+主要组织产品、设计、开发、AI 工程/评测、测试、安全和成本节点。每个会话都有职责边界、收件箱、交接班和审核闸。已知文件用确定性搜索/切片;跨文档且遗漏代价高时,用“AI 加法式扩词 + 脚本高召回候选 + 有界证据包 + 覆盖报告”,避免整篇通读,也避免为了省 token 静默漏证据。
 
 ## 这个仓库是什么
 
 这是一个面向多 Agent / 多会话协作的项目脚手架仓库。它可以作为全局 Skill / 工具安装使用，也可以由任何支持本地文件读写和 Python 脚本执行的 AI Agent 直接调用。
 
-GitHub 页面里的 `README.md` 和 `LICENSE` 是展示说明与开源许可；真正参与协作层生成的是这 3 个文件：
+GitHub 页面里的 `README.md` 和 `LICENSE` 是展示说明与开源许可；真正参与协作层生成的是这 4 个文件：
 
 ```text
 SKILL.md
 agents/openai.yaml
 scripts/scaffold_team.py
+scripts/agent_team_research.py
 ```
 
-源码仓库保留验证脚本、压力场景和 CI,保证每次修改可回归;全局安装时仍只同步下面三项运行内容,不把开发材料载入 Skill 运行上下文。
+源码仓库保留验证脚本、压力场景和 CI,保证每次修改可回归;全局安装时仍只同步上面四项运行内容,不把开发材料载入 Skill 运行上下文。
 
 ## 它解决什么问题
 
@@ -37,7 +38,9 @@ scripts/scaffold_team.py
 
 - **三层架构**：管理层 / 执行层 / 审核层必须齐全。
 - **收件箱是真相源**：任务详情写文件，不靠聊天窗口口头传递。
-- **读取路由器**：`onboard/meta/find/search/slice` 均有默认 16 KiB 输出总预算。`find` 找报告元数据,`search` 找长文命中行,`slice` 只返回必要行。
+- **接班包**：`onboard` 直接返回岗位核心、交接摘要和最新待办,Agent 不再按文件路径全文通读。
+- **两级检索**：已知文件/关键词用 `find/search/slice`;跨文档、术语未知或高遗漏风险才用研究路由器。单次硬输出预算负责防失控,不冒充“证据已经完整”。
+- **召回不被 AI 静默裁掉**：原问题和精确命中永久保留;AI 只做加法式扩词、分组和重排,完整候选留在 manifest,并用 coverage 暴露未扫描范围与截断。
 - **短唤醒**：跨会话通知只说“有新任务 / 任务已完成 / 遇到阻断”。
 - **节点式推进**：一个功能或环节只推进一个验收节点。
 - **完成回报四件套**：产出路径、验证结果、日志收据、错题自检。
@@ -71,8 +74,9 @@ https://github.com/AidenXu-1/agent-team-skill
    - SKILL.md
    - agents/openai.yaml
    - scripts/scaffold_team.py
+   - scripts/agent_team_research.py
 3. 不要把 README.md、LICENSE、.git 或其他说明 / 开发材料放进运行目录。
-4. 安装后确认全局运行目录至少包含以上三项，并能读取 SKILL.md、执行 scripts/scaffold_team.py。
+4. 安装后确认全局运行目录至少包含以上四项，并能读取 SKILL.md、执行两个 Python 运行脚本。
 ```
 
 如果你的 Agent 使用 `~/.codex/skills/` 作为全局 Skill 目录，可以执行：
@@ -84,7 +88,7 @@ mkdir -p ~/.codex/skills/agent-team
 rsync -a --delete --delete-excluded \
   --include='/SKILL.md' \
   --include='/agents/' --include='/agents/openai.yaml' \
-  --include='/scripts/' --include='/scripts/scaffold_team.py' \
+  --include='/scripts/' --include='/scripts/scaffold_team.py' --include='/scripts/agent_team_research.py' \
   --exclude='*' \
   /tmp/agent-team-skill/ ~/.codex/skills/agent-team/
 ```
@@ -96,7 +100,7 @@ mkdir -p ~/.codex/skills/agent-team
 rsync -a --delete --delete-excluded \
   --include='/SKILL.md' \
   --include='/agents/' --include='/agents/openai.yaml' \
-  --include='/scripts/' --include='/scripts/scaffold_team.py' \
+  --include='/scripts/' --include='/scripts/scaffold_team.py' --include='/scripts/agent_team_research.py' \
   --exclude='*' \
   ./ ~/.codex/skills/agent-team/
 ```
@@ -179,8 +183,27 @@ python3 scripts/scaffold_team.py "/path/to/project" \
   --roles "lead,research,planning,do,review" \
   --session-mode "manual" \
   --allow-without-foundation \
-  --create-minimal-foundation
+  --create-minimal-foundation \
+  --foundation-goal "为新员工提供可复用的入职课程" \
+  --foundation-deliverable "课程大纲、讲义和练习题" \
+  --foundation-audience "入职 30 天内的运营人员" \
+  --foundation-acceptance "试学者完成练习且关键题正确率达到 80%" \
+  --foundation-resources "现有 SOP、访谈记录和两名业务专家" \
+  --foundation-risks "术语过时、案例失真;由业务专家复核"
 ```
+
+跨文档且不能漏证据的研究任务：
+
+```bash
+python3 docs/collaboration/scripts/agent_team_research.py candidates \
+  --task-id auth-risk --query "登录稳定性风险" \
+  --expand "鉴权失败" --expand "令牌过期" --expand "反例" --path docs
+python3 docs/collaboration/scripts/agent_team_research.py pack \
+  --task-id auth-risk --ids <候选ID1> <候选ID2> --target-tokens 6000
+python3 docs/collaboration/scripts/agent_team_research.py coverage --task-id auth-risk
+```
+
+每个 `--expand` 只放一个短词或短语,不要把多个概念拼成长句。`target-tokens` 是可调软目标,复杂任务可以调高或拆多个证据包;它不是完成条件。第一版刻意不引入向量数据库,先用中文安全的词法特征、逐查询配额和融合排序建立可复现基线。覆盖仍不足时最多补一轮限制条件/失败模式/反证词检索,再不足就列为未验证项或拆任务。
 
 ## 仓库结构
 
@@ -191,6 +214,7 @@ python3 scripts/scaffold_team.py "/path/to/project" \
 │   └── openai.yaml
 ├── scripts/
 │   ├── scaffold_team.py
+│   ├── agent_team_research.py
 │   └── verify_agent_team.py
 ├── tests/
 │   └── pressure_scenarios.md

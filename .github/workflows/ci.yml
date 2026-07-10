@@ -9,6 +9,10 @@ on:
 jobs:
   verify:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11"]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -16,11 +20,11 @@ jobs:
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Compile scripts
         run: |
-          python -m py_compile scripts/scaffold_team.py scripts/verify_agent_team.py
+          python -m py_compile scripts/scaffold_team.py scripts/agent_team_research.py scripts/verify_agent_team.py
 
       - name: Run verifier
         run: |

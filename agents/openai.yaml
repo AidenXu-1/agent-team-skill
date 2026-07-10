@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Team"
   short_description: "Build a multi-session team for internet AI product development"
-  default_prompt: "优先按互联网 AI 产品开发诊断我的项目，判断产品、设计、开发、AI 工程、测试、安全和成本部门是否需要，再搭建低上下文的多会话协作团队。"
+  default_prompt: "优先按互联网 AI 产品开发诊断我的项目，判断产品、设计、开发、AI 工程、测试、安全和成本部门是否需要，再搭建低上下文的多会话协作团队；已知文档用检索切片，高遗漏风险任务用召回优先的研究路由。"

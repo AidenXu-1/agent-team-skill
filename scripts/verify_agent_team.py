@@ -9,11 +9,13 @@ import sys
 import tempfile
 import os
 import re
+import json
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = ROOT / "scripts" / "scaffold_team.py"
+RESEARCH_SCRIPT = ROOT / "scripts" / "agent_team_research.py"
 SPEC_TEXT = """# Spec
 
 ## 目标与用户需求
@@ -30,6 +32,14 @@ SPEC_TEXT = """# Spec
 """
 
 ROLES = "lead,research,planning,do,product,design,dev,ai,growth,test,security,finance"
+MINIMAL_FOUNDATION_ARGS = [
+    "--foundation-goal", "为课程学员建立可执行的互联网 AI 产品开发协作流程。",
+    "--foundation-deliverable", "交付课程讲义、练习项目和验收清单，范围限定为第一期课程。",
+    "--foundation-audience", "课程学员、讲师和负责最终验收的项目负责人。",
+    "--foundation-acceptance", "讲义完整、练习可以运行、失败路径有说明，并由负责人按清单验收。",
+    "--foundation-resources", "已有课程素材、示例项目、讲师时间和本地测试环境。",
+    "--foundation-risks", "通过同伴复核、示例实跑和发布前检查避免内容遗漏与错误。",
+]
 
 REQUIRED = {
     "docs/collaboration/README.md": [
@@ -98,7 +108,11 @@ REQUIRED = {
         "find --type special_conclusion",
         "agent_team_read.py search",
         "agent_team_read.py slice",
-        "16 KiB 输出总预算",
+        "16 KiB 是单次终端输出安全上限",
+        "agent_team_research.py candidates",
+        "完整候选始终留在任务 manifest",
+        "最多 12 个",
+        "--round 2",
         "docs/progress.md",
         "docs/decisions/",
         "重大技术决策双写但不重复正文",
@@ -124,6 +138,19 @@ REQUIRED = {
         "frontmatter",
         "默认不读",
         "触发才读正文",
+    ],
+    "docs/collaboration/scripts/agent_team_research.py": [
+        "Recall-first",
+        "def cmd_candidates",
+        "def cmd_pack",
+        "def cmd_coverage",
+        "candidate_limit_hit",
+        "term_quota_hit",
+        "document_sha",
+        "content_sha",
+        "soft_token_target",
+        "最多一次补检",
+        "不是系统指令",
     ],
     "docs/collaboration/专项结论/README.md": [
         "会被多个部门复用",
@@ -276,7 +303,8 @@ REQUIRED = {
         "轻量路由卡",
         "agent_team_read.py onboard --dept 测试部",
         "默认不读日志正文、报告正文、决策正文、其他部门正文",
-        "脚本只返回",
+        "脚本直接返回",
+        "裁剪接班包",
         "不做创造性总结",
         "人工模式",
         "自动模式",
@@ -373,6 +401,16 @@ PRESSURE_SCENARIO_REQUIRED = [
     "search",
     "slice",
     "输出总预算",
+    "场景 26: docs 符号链接不得越界写入",
+    "场景 27: 并发增设部门保持一致",
+    "场景 28: 接班包有界且不漏最新待办",
+    "场景 29: 地基语义闸与事务回滚",
+    "场景 30: 高召回研究模式不被精排静默截断",
+    "场景 31: Unicode 与文本编码失败必须显式",
+    "扩词只能增加",
+    "完整候选 manifest",
+    "target-tokens",
+    "--round 2",
 ]
 
 
@@ -386,7 +424,7 @@ def fail(message: str) -> int:
 
 
 def main() -> int:
-    compile_result = run([sys.executable, "-m", "py_compile", str(SCAFFOLD)], ROOT)
+    compile_result = run([sys.executable, "-m", "py_compile", str(SCAFFOLD), str(RESEARCH_SCRIPT)], ROOT)
     if compile_result.returncode != 0:
         print(compile_result.stderr, file=sys.stderr)
         return fail("scaffold_team.py does not compile")
@@ -458,6 +496,22 @@ def main() -> int:
         )
         minimal_foundation_target = temp_root / "minimal-foundation-project"
         minimal_foundation_target.mkdir()
+        missing_minimal_args_target = temp_root / "missing-minimal-args-project"
+        missing_minimal_args_target.mkdir()
+        keyword_spam_target = temp_root / "keyword-spam-project"
+        (keyword_spam_target / "docs").mkdir(parents=True)
+        (keyword_spam_target / "docs" / "random.md").write_text("user scope acceptance " * 40)
+        docs_file_target = temp_root / "docs-is-file-project"
+        docs_file_target.mkdir()
+        (docs_file_target / "docs").write_text("not a directory")
+        rollback_target = temp_root / "rollback-project"
+        (rollback_target / "docs" / "agent-guide.md").mkdir(parents=True)
+        (rollback_target / "docs" / "spec.md").write_text(SPEC_TEXT)
+        symlink_target = temp_root / "docs-symlink-project"
+        symlink_target.mkdir()
+        symlink_outside = temp_root / "docs-symlink-outside"
+        symlink_outside.mkdir()
+        (symlink_target / "docs").symlink_to(symlink_outside, target_is_directory=True)
 
         duplicate_result = run(
             [
@@ -668,6 +722,39 @@ def main() -> int:
         if repair_result.returncode != 0 or repair_registry.count("`ai`") != 1 or not (repair_target / "docs" / "collaboration" / "部门" / "AI工程部").is_dir():
             return fail("add-roles duplicates registry state instead of repairing a missing department directory")
 
+        concurrent_target = temp_root / "concurrent-add-project"
+        (concurrent_target / "docs").mkdir(parents=True)
+        (concurrent_target / "docs" / "spec.md").write_text(SPEC_TEXT)
+        concurrent_scaffold = run(
+            [sys.executable, str(SCAFFOLD), str(concurrent_target), "--roles", "lead,do,review", "--session-mode", "manual"],
+            ROOT,
+        )
+        if concurrent_scaffold.returncode != 0:
+            return fail("could not create concurrent add-roles fixture")
+        processes = [
+            subprocess.Popen(
+                [sys.executable, str(SCAFFOLD), str(concurrent_target), "--add-roles", role],
+                cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            )
+            for role in ("research", "planning")
+        ]
+        concurrent_results = [process.communicate() + (process.returncode,) for process in processes]
+        for role, (stdout, stderr, returncode) in zip(("research", "planning"), concurrent_results):
+            if returncode not in {0, 7}:
+                return fail(f"concurrent add-roles returned unexpected status for {role}: {returncode} {stderr}")
+            if returncode == 7 and "另一个 agent-team" not in stderr:
+                return fail("concurrent add-roles lock failure is not explained cleanly")
+        for role, department in (("research", "研究部"), ("planning", "策划部")):
+            registry = (concurrent_target / "docs" / "collaboration" / "部门表.md").read_text()
+            if f"`{role}`" not in registry:
+                retry = run([sys.executable, str(SCAFFOLD), str(concurrent_target), "--add-roles", role], ROOT)
+                if retry.returncode != 0:
+                    return fail(f"could not retry lock-rejected add-role: {role}")
+            registry = (concurrent_target / "docs" / "collaboration" / "部门表.md").read_text()
+            directory_exists = (concurrent_target / "docs" / "collaboration" / "部门" / department).is_dir()
+            if directory_exists != (f"`{role}`" in registry):
+                return fail(f"concurrent add-roles leaves directory/registry mismatch: {role}")
+
         minimal_foundation_result = run(
             [
                 sys.executable,
@@ -681,6 +768,7 @@ def main() -> int:
                 "manual",
                 "--allow-without-foundation",
                 "--create-minimal-foundation",
+                *MINIMAL_FOUNDATION_ARGS,
             ],
             ROOT,
         )
@@ -699,6 +787,62 @@ def main() -> int:
         minimal_overview = (minimal_foundation_target / "docs" / "overview.md").read_text()
         if "通用最小业务地基" not in minimal_overview:
             return fail("minimal foundation overview does not identify the business foundation")
+
+        missing_minimal_args_result = run(
+            [
+                sys.executable, str(SCAFFOLD), str(missing_minimal_args_target),
+                "--roles", "lead,do,review", "--session-mode", "manual",
+                "--allow-without-foundation", "--create-minimal-foundation",
+            ],
+            ROOT,
+        )
+        if missing_minimal_args_result.returncode == 0 or "必须提供真实、非占位内容" not in missing_minimal_args_result.stderr:
+            return fail("minimal foundation creation accepts missing structured business inputs")
+        if (missing_minimal_args_target / "docs").exists():
+            return fail("missing minimal foundation inputs mutate the project")
+
+        keyword_spam_result = run(
+            [
+                sys.executable, str(SCAFFOLD), str(keyword_spam_target),
+                "--roles", "lead,do,review", "--session-mode", "manual", "--allow-without-foundation",
+            ],
+            ROOT,
+        )
+        if keyword_spam_result.returncode == 0 or (keyword_spam_target / "docs" / "collaboration").exists():
+            return fail("keyword spam is accepted as a usable project foundation")
+
+        docs_file_result = run(
+            [
+                sys.executable, str(SCAFFOLD), str(docs_file_target),
+                "--roles", "lead,do,review", "--session-mode", "manual",
+                "--allow-without-foundation", "--create-minimal-foundation", *MINIMAL_FOUNDATION_ARGS,
+            ],
+            ROOT,
+        )
+        if docs_file_result.returncode == 0 or "docs 必须是项目内普通目录" not in docs_file_result.stderr or "Traceback" in docs_file_result.stderr:
+            return fail("a file-shaped docs path is not rejected cleanly")
+
+        rollback_result = run(
+            [sys.executable, str(SCAFFOLD), str(rollback_target), "--roles", "lead,do,review", "--session-mode", "manual"],
+            ROOT,
+        )
+        if rollback_result.returncode == 0 or (rollback_target / "docs" / "collaboration").exists():
+            return fail("rollback fixture unexpectedly succeeds or leaves collaboration")
+        if (rollback_target / "docs" / "progress.md").exists():
+            return fail("failed scaffold leaves a newly-created progress foundation file")
+
+        symlink_result = run(
+            [
+                sys.executable, str(SCAFFOLD), str(symlink_target),
+                "--roles", "lead,do,review", "--session-mode", "manual",
+                "--allow-without-foundation", "--create-minimal-foundation", *MINIMAL_FOUNDATION_ARGS,
+            ],
+            ROOT,
+        )
+        if symlink_result.returncode == 0 or "docs 必须是项目内普通目录" not in symlink_result.stderr:
+            return fail("scaffold follows a docs symlink outside the project")
+        if any(symlink_outside.iterdir()):
+            return fail("docs symlink rejection still writes outside the project")
         for relative in (
             "docs/collaboration/部门/研究部/岗位说明.md",
             "docs/collaboration/部门/策划部/岗位说明.md",
@@ -757,15 +901,44 @@ def main() -> int:
             return fail("read router onboard failed")
         for needle in (
             "你是: 测试部",
-            "本次必读:",
+            "本次接班包",
+            "岗位核心:",
+            "交接摘要:",
+            "当前待办正文:",
             "默认不读:",
             "日志正文",
             "报告正文",
             "触发才读正文:",
-            "无结构化待办标题",
+            "无结构化待办",
         ):
             if needle not in onboard_result.stdout:
                 return fail(f"read router onboard output missing: {needle}")
+
+        role_path = target / "docs" / "collaboration" / "部门" / "测试部" / "岗位说明.md"
+        role_backup = role_path.read_text()
+        role_path.unlink()
+        role_path.symlink_to(temp_root / "outside-linked.md")
+        unsafe_onboard = run([sys.executable, str(read_router), "onboard", "--dept", "测试部"], target)
+        role_path.unlink()
+        role_path.write_text(role_backup)
+        if "缺失或路径非法，禁止直接读取" not in unsafe_onboard.stdout:
+            return fail("onboard presents a symlinked required file as safe to read")
+
+        long_dept = "A" * 12000
+        bounded_error = run(
+            [sys.executable, str(read_router), "onboard", "--dept", long_dept, "--max-output-bytes", "1024"],
+            target,
+        )
+        if len(bounded_error.stderr.encode("utf-8")) > 1024:
+            return fail("read router error output bypasses the configured byte budget")
+
+        inbox_path = target / "docs" / "collaboration" / "部门" / "测试部" / "收件箱.md"
+        inbox_backup = inbox_path.read_text()
+        inbox_path.write_text(("x" * 140000) + "\n## [紧急] LATEST_AFTER_128K\n- 任务详情:检查尾部最新任务。\n")
+        tail_onboard = run([sys.executable, str(read_router), "onboard", "--dept", "测试部"], target)
+        inbox_path.write_text(inbox_backup)
+        if "LATEST_AFTER_128K" not in tail_onboard.stdout or "检查尾部最新任务" not in tail_onboard.stdout:
+            return fail("onboard misses the newest structured task after the old 128 KiB prefix")
 
         conclusion = target / "docs" / "collaboration" / "专项结论" / "2026-07-02-用户可见出口-专项结论.md"
         conclusion.write_text("""---
@@ -992,12 +1165,127 @@ summary: 近似字段不能被 find 当成精确命中。
         )
         if long_line_result.returncode != 0 or "TARGET_AFTER_1200" not in long_line_result.stdout or "显示已截断" not in long_line_result.stdout:
             return fail("read router search misses or silently hides a match after display column 1200")
+        casefold_line = target / "docs" / "casefold-line.md"
+        casefold_line.write_text(("ß" * 700) + "TARGET_NEAR_END\n")
+        casefold_result = run(
+            [sys.executable, str(read_router), "search", str(casefold_line.relative_to(target)), "--query", "target_near_end", "--ignore-case", "--context", "0"],
+            target,
+        )
+        if casefold_result.returncode != 0 or "TARGET_NEAR_END" not in casefold_result.stdout:
+            return fail("ignore-case search reports a Unicode match but hides the actual excerpt")
+        utf16 = target / "docs" / "utf16.md"
+        utf16.write_bytes("相关标记 UTF16_MARKER\n".encode("utf-16"))
+        utf16_result = run(
+            [sys.executable, str(read_router), "search", str(utf16.relative_to(target)), "--query", "UTF16_MARKER"],
+            target,
+        )
+        if utf16_result.returncode == 0 or "请先转换为 UTF-8" not in utf16_result.stderr:
+            return fail("read router silently searches unsupported UTF-16 text")
         slice_result = run(
             [sys.executable, str(read_router), "slice", str(article.relative_to(target)), "--start-line", "2", "--end-line", "4"],
             target,
         )
         if slice_result.returncode != 0 or "L2: context-a" not in slice_result.stdout or "L4: context-b" not in slice_result.stdout:
             return fail("read router slice does not return the requested line range")
+
+        research_router = target / "docs" / "collaboration" / "scripts" / "agent_team_research.py"
+        research_a = target / "docs" / "research-a.md"
+        research_b = target / "docs" / "research-b.md"
+        research_a.write_text(
+            "# 高可用设计\n\n主节点不可用时自动切换到备用实例，确保服务持续可用。\n\n"
+            "## 限制与反例\n\n如果备用实例也不可用，系统会显示降级提示而不是声称无中断。\n"
+        )
+        research_b.write_text("# 其他内容\n\n本文只介绍界面颜色和按钮间距。\n")
+        candidate_result = run(
+            [
+                sys.executable, str(research_router), "candidates",
+                "--task-id", "recall-demo",
+                "--query", "系统故障如何保证服务不中断",
+                "--expand", "备用实例",
+                "--expand", "故障转移",
+                "--path", "docs/research-a.md",
+                "--path", "docs/research-b.md",
+            ],
+            target,
+        )
+        candidate_id_match = re.search(r"id=([0-9a-f]{16})", candidate_result.stdout)
+        if candidate_result.returncode != 0 or candidate_id_match is None or "research-a.md" not in candidate_result.stdout:
+            return fail("research retrieval does not create a recall-first candidate manifest")
+        candidate_id = candidate_id_match.group(1)
+        manifest_path = target / "docs" / "collaboration" / ".retrieval" / "recall-demo" / "manifest.json"
+        initial_manifest = json.loads(manifest_path.read_text())
+        initial_candidate_ids = {item["id"] for item in initial_manifest["candidates"]}
+        pack_result = run(
+            [
+                sys.executable, str(research_router), "pack",
+                "--task-id", "recall-demo", "--ids", candidate_id,
+                "--target-tokens", "1200", "--max-output-bytes", "8192",
+            ],
+            target,
+        )
+        if pack_result.returncode != 0 or "自动切换到备用实例" not in pack_result.stdout or "estimated_tokens" not in pack_result.stdout:
+            return fail("research retrieval cannot create a bounded evidence pack from candidate ids")
+        coverage_result = run(
+            [sys.executable, str(research_router), "coverage", "--task-id", "recall-demo"],
+            target,
+        )
+        for needle in ("files_scanned: 2", "term_hits:", "candidate_limit_hit:", "unsupported_files:"):
+            if coverage_result.returncode != 0 or needle not in coverage_result.stdout:
+                return fail(f"research coverage report missing: {needle}")
+        changed_query_result = run(
+            [
+                sys.executable, str(research_router), "candidates",
+                "--task-id", "recall-demo", "--round", "2",
+                "--query", "已被改写的问题", "--expand", "备用实例",
+                "--path", "docs/research-a.md",
+            ],
+            target,
+        )
+        if changed_query_result.returncode == 0 or "原始 query 不变" not in changed_query_result.stderr:
+            return fail("research supplement allows the original query to drift")
+        supplement_result = run(
+            [
+                sys.executable, str(research_router), "candidates",
+                "--task-id", "recall-demo", "--round", "2",
+                "--query", "系统故障如何保证服务不中断",
+                "--expand", "限制与反例",
+                "--max-candidates", "1",
+                "--path", "docs/research-a.md",
+                "--path", "docs/research-b.md",
+            ],
+            target,
+        )
+        if supplement_result.returncode != 0 or "第二轮已完成" not in supplement_result.stdout:
+            return fail("research retrieval does not support one controlled counter-evidence supplement")
+        supplemented_manifest = json.loads(manifest_path.read_text())
+        if not initial_candidate_ids.issubset({item["id"] for item in supplemented_manifest["candidates"]}):
+            return fail("research supplement permanently deletes first-round candidates under a lower cap")
+        if "限制与反例" not in supplemented_manifest["coverage"]["term_hits"]:
+            return fail("research coverage does not accumulate second-round query evidence")
+        repeated_supplement = run(
+            [
+                sys.executable, str(research_router), "candidates",
+                "--task-id", "recall-demo", "--round", "2",
+                "--query", "系统故障如何保证服务不中断", "--expand", "相反结论",
+                "--path", "docs/research-a.md",
+            ],
+            target,
+        )
+        if repeated_supplement.returncode == 0 or "最多一次补检" not in repeated_supplement.stderr:
+            return fail("research retrieval allows more than one supplement round")
+
+        research_locale_env = os.environ.copy()
+        research_locale_env.update({"LC_ALL": "C", "LANG": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0"})
+        research_locale_result = subprocess.run(
+            [
+                sys.executable, str(research_router), "candidates",
+                "--task-id", "locale-research", "--query", "备用实例",
+                "--path", "docs/research-a.md",
+            ],
+            cwd=target, text=True, capture_output=True, check=False, env=research_locale_env,
+        )
+        if research_locale_result.returncode != 0 or "research-a.md" not in research_locale_result.stdout:
+            return fail("generated research router is not stable under a non-UTF-8 process locale")
 
         outside_dept = target / "docs" / "outside-dept"
         outside_dept.mkdir()
