@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Team"
-  short_description: "Build a multi-session team for internet AI product development"
-  default_prompt: "优先按互联网 AI 产品开发诊断我的项目，判断产品、设计、开发、AI 工程、测试、安全和成本部门是否需要，再搭建可按四文档接班、支持同部门一键换班的多会话协作团队。"
+  short_description: "搭建低上下文、可倒查、按需换会话的多 Agent 团队"
+  default_prompt: "使用 $agent-team 为当前项目诊断最小必要团队，并搭建按四文档接班、用唯一任务 ID 原子流转、可用事实日志倒查、只在用户授权后更换会话的低上下文协作层。"
