@@ -18,7 +18,7 @@ description: Build and maintain low-context multi-agent or multi-session teams w
 
 ## 必守边界
 
-* 先有能说明目标、交付物和验收标准的项目地基，再创建 `docs/collaboration/`。已有协作层时先读现状，检查是否存在异常冲突，不直接覆盖，若有异常提醒用户并给出优化方案。
+* 先有能说明目标、交付物和验收标准的项目地基，再创建 `docs/collaboration/`。Agent 必须亲自阅读并复核地基的语义完整性，再用 `--foundation-file` 显式传入已复核文件；脚本只检查路径、编码、类型、大小和非空等机械安全性，不替 Agent 猜测文档是否真正说清业务。已有协作层时先读现状，检查是否存在异常冲突，不直接覆盖，若有异常提醒用户并给出优化方案。
 
 * 团队必须包含管理层、执行层、审核层；最小盘是 `lead,do,review`，不要为“多 Agent”硬拆部门。
 
@@ -113,7 +113,8 @@ AI 产品不单独创建 AI 部门：产品部负责完整产品规划和 AI 行
 python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
   --profile "互联网 AI 产品 + UI + 质量关" \
   --roles "lead,product,design,dev,test" \
-  --session-mode manual
+  --session-mode manual \
+  --foundation-file docs/spec.md
 ```
 
 没有适用地基且用户确认补最小地基时，再加：
@@ -125,7 +126,7 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 --foundation-resources "..." --foundation-risks "..."
 ```
 
-脚本生成协议版本、路由表、四文档、部门表、会话启动状态、稳定路径的任务 JSON、共享报告模板和按需创建的日志目录，以及确定性的 `agent_team_log.py`、`agent_team_task.py` 和 `agent_team_session.py`。脚本拒绝符号链接越界、并发覆盖、重复角色、缺三层和未确认会话模式。
+脚本生成协议版本、路由表、四文档、部门表、会话启动状态、稳定路径的任务 JSON、共享报告模板和按需创建的日志目录，以及确定性的 `agent_team_log.py`、`agent_team_task.py` 和 `agent_team_session.py`。脚本拒绝符号链接越界、并发覆盖、重复角色、缺三层和未确认会话模式；地基内容质量仍由调用脚本前的 Agent 负责。
 
 ## 任务事务
 

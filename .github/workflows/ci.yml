@@ -26,6 +26,27 @@ jobs:
         run: |
           python -m py_compile scripts/scaffold_team.py scripts/verify_agent_team.py
 
+      - name: Validate Skill metadata contract
+        run: |
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          text = Path("SKILL.md").read_text(encoding="utf-8")
+          match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+          assert match, "SKILL.md frontmatter missing or malformed"
+          fields = {}
+          for line in match.group(1).splitlines():
+              if ":" in line and not line.startswith((" ", "\t")):
+                  key, value = line.split(":", 1)
+                  fields[key.strip()] = value.strip()
+          allowed = {"name", "description", "license", "allowed-tools", "metadata"}
+          assert set(fields) <= allowed, f"unexpected frontmatter fields: {set(fields) - allowed}"
+          assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", fields.get("name", "")), "invalid skill name"
+          description = fields.get("description", "")
+          assert description and len(description) <= 1024 and "<" not in description and ">" not in description, "invalid description"
+          PY
+
       - name: Run verifier
         run: |
           python scripts/verify_agent_team.py

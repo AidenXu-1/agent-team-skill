@@ -17,6 +17,7 @@ import tempfile
 import uuid
 from contextlib import contextmanager
 from pathlib import Path
+from urllib.parse import urlparse
 
 if os.name == "nt":
     import msvcrt
@@ -25,7 +26,7 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.3.0"
+PROTOCOL_VERSION = "1.3.1"
 PROTOCOL_FILE = "协议版本.json"
 ADD_TRANSACTION_FILE = ".add-roles-transaction.json"
 
@@ -207,7 +208,16 @@ def current_runtime_complete(collab: Path) -> bool:
     directories = (
         "部门", ".locks", "tasks", "scripts",
     )
-    return all(plain_path_within(collab / name, collab, kind="file") for name in files) and all(
+    project = collab.parents[1]
+    guide = collab.parent / "agent-guide.md"
+    try:
+        guide_current = (
+            plain_path_within(guide, project, kind="file")
+            and f"受管协议版本:{PROTOCOL_VERSION}" in read_utf8(guide)
+        )
+    except (OSError, UnicodeError):
+        guide_current = False
+    return guide_current and all(plain_path_within(collab / name, collab, kind="file") for name in files) and all(
         plain_path_within(collab / name, collab, kind="dir") for name in directories
     )
 
@@ -793,6 +803,7 @@ LOCKS = COLLAB / ".locks"
 SESSION_STATE = COLLAB / "会话启动状态.json"
 INDEX_MARKER = "<!-- agent-team task index; use scripts/agent_team_task.py -->"
 SCHEMA_VERSION = 1
+PROTOCOL_VERSION = "1.3.1"
 STATES = ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged")
 BUSY_STATES = {"claimed"}
 VISIBLE_ACTIVE_STATES = {"claimed", "blocked", "waiting_input"}
@@ -805,6 +816,15 @@ STATE_CN = {
     "acknowledged": "已归档",
 }
 AUTH_STATES = {"none", "user_required", "user_confirmed", "user_rejected"}
+COMPLETION_CLASSES = {"standard", "audit"}
+TASK_FIELDS = {
+    "schema_version", "task_id", "department", "from_department", "title", "node", "details",
+    "acceptance_exit", "failure_paths", "confirmation", "domain_stage", "authorization_state",
+    "authorization_evidence", "authorization_history", "execution_state", "completion_class", "pointers",
+    "created_at", "updated_at", "revision", "claimed_by", "block_reason", "artifacts", "external_artifacts",
+    "verified", "unverified", "mistake_check", "report", "event_receipts",
+}
+OPTIONAL_TASK_FIELDS = {"acknowledged_by"}
 TRANSITIONS = {
     "claim": {"queued": "claimed"},
     "block": {"claimed": "blocked"},
@@ -814,6 +834,24 @@ TRANSITIONS = {
     "ack": {"completed": "acknowledged"},
 }
 TASK_ID_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
+ROLE_DEPARTMENT_NAMES = {
+    "lead": "统筹部",
+    "do": "执行部",
+    "research": "研究部",
+    "planning": "策划部",
+    "product": "产品部",
+    "design": "设计部",
+    "dev": "开发部",
+    "data": "数据部",
+    "auto": "自动化部",
+    "content": "内容部",
+    "growth": "增长运营部",
+    "review": "检验部",
+    "test": "测试部",
+    "security": "安全部",
+    "finance": "财务部",
+}
+AUDIT_ROLE_IDS = {"review", "test", "security", "finance"}
 
 
 def now_iso() -> str:
@@ -920,17 +958,178 @@ def task_path(task_id: str) -> Path:
     return TASKS / f"{task_id}.json"
 
 
+def require_task_text(payload: dict, field: str, *, allow_empty: bool = False, max_chars: int = 2000) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        raise ValueError(f"任务字段缺失或类型无效: {field}")
+    if (value and value != value.strip()) or len(value) > max_chars or any(ord(char) < 32 and char != "\t" for char in value):
+        raise ValueError(f"任务文本字段超长或含非法控制字符: {field}")
+    return value
+
+
+def require_task_text_list(
+    payload: dict,
+    field: str,
+    *,
+    min_items: int = 0,
+    max_items: int | None = None,
+    max_chars: int = 2000,
+) -> list[str]:
+    value = payload.get(field)
+    if not isinstance(value, list) or any(
+        not isinstance(item, str)
+        or not item.strip()
+        or item != item.strip()
+        or len(item) > max_chars
+        or any(ord(char) < 32 and char != "\t" for char in item)
+        for item in value
+    ):
+        raise ValueError(f"任务列表字段无效: {field}")
+    if len(value) < min_items or (max_items is not None and len(value) > max_items):
+        raise ValueError(f"任务列表字段数量无效: {field}")
+    return value
+
+
+def parse_task_timestamp(payload: dict, field: str) -> dt.datetime:
+    value = require_task_text(payload, field, max_chars=64)
+    try:
+        parsed = dt.datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError(f"任务时间戳无效: {field}") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"任务时间戳缺失时区: {field}")
+    return parsed
+
+
+def validate_task_payload(payload: object, path: Path) -> dict:
+    if not isinstance(payload, dict):
+        raise ValueError(f"任务根节点必须是 JSON 对象: {path.name}")
+    missing_fields = sorted(TASK_FIELDS - set(payload))
+    unknown_fields = sorted(set(payload) - TASK_FIELDS - OPTIONAL_TASK_FIELDS)
+    if missing_fields:
+        raise ValueError("任务字段缺失: " + ", ".join(missing_fields))
+    if unknown_fields:
+        raise ValueError("任务含当前 schema 未定义字段: " + ", ".join(unknown_fields))
+    schema_version = payload.get("schema_version")
+    if isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
+        raise ValueError(f"不支持的任务版本: {path.name}")
+
+    task_id = require_task_text(payload, "task_id")
+    if task_id != path.stem or not TASK_ID_RE.fullmatch(task_id):
+        raise ValueError(f"任务 ID 与文件名不一致或格式无效: {path.name}")
+
+    department = require_task_text(payload, "department")
+    from_department = require_task_text(payload, "from_department")
+    known_departments = set(department_names())
+    if department not in known_departments or from_department not in known_departments:
+        raise ValueError(f"任务部门不存在: {path.name}")
+
+    for field, max_chars in (
+        ("title", 200), ("node", 200), ("details", 2000), ("acceptance_exit", 2000),
+        ("confirmation", 2000), ("domain_stage", 200),
+    ):
+        require_task_text(payload, field, max_chars=max_chars)
+    for field, max_chars in (
+        ("authorization_evidence", 1000), ("claimed_by", 200), ("block_reason", 2000),
+        ("mistake_check", 2000), ("report", 500),
+    ):
+        require_task_text(payload, field, allow_empty=True, max_chars=max_chars)
+    if "acknowledged_by" in payload:
+        require_task_text(payload, "acknowledged_by", allow_empty=True)
+
+    require_task_text_list(payload, "failure_paths", min_items=1, max_items=3, max_chars=1000)
+    for field, max_chars in (
+        ("pointers", 500), ("artifacts", 500), ("external_artifacts", 1000),
+        ("verified", 2000), ("unverified", 2000), ("event_receipts", 1000),
+    ):
+        require_task_text_list(payload, field, max_chars=max_chars)
+    for raw in payload["artifacts"]:
+        artifact_path = Path(raw)
+        if artifact_path.is_absolute() or ".." in artifact_path.parts or raw in {"", "."}:
+            raise ValueError(f"任务本地产物路径无效: {path.name}")
+    for raw in payload["external_artifacts"]:
+        parsed_url = urlparse(raw)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc or parsed_url.username or parsed_url.password:
+            raise ValueError(f"任务外部产物 URL 无效: {path.name}")
+
+    authorization = payload["authorization_state"]
+    if not isinstance(authorization, str) or authorization not in AUTH_STATES:
+        raise ValueError(f"任务授权状态无效: {path.name}")
+    if authorization in {"user_confirmed", "user_rejected"} and not payload["authorization_evidence"].strip():
+        raise ValueError(f"任务授权证据缺失: {path.name}")
+    history = payload.get("authorization_history")
+    if not isinstance(history, list):
+        raise ValueError(f"任务授权历史无效: {path.name}")
+    history_times: list[dt.datetime] = []
+    for entry in history:
+        if not isinstance(entry, dict) or set(entry) != {"at", "state", "evidence"}:
+            raise ValueError(f"任务授权历史条目无效: {path.name}")
+        history_times.append(parse_task_timestamp(entry, "at"))
+        if not isinstance(entry["state"], str) or entry["state"] not in AUTH_STATES:
+            raise ValueError(f"任务授权历史状态无效: {path.name}")
+        require_task_text(entry, "evidence", max_chars=1000)
+    has_evidence = bool(payload["authorization_evidence"].strip())
+    if bool(history) != has_evidence:
+        raise ValueError(f"任务当前授权证据与历史有无不一致: {path.name}")
+    if history and (history[-1]["state"] != authorization or history[-1]["evidence"] != payload["authorization_evidence"]):
+        raise ValueError(f"任务当前授权与历史最新记录不一致: {path.name}")
+
+    state = payload.get("execution_state")
+    if not isinstance(state, str) or state not in STATES:
+        raise ValueError(f"任务执行状态无效: {path.name}")
+    completion_class = payload.get("completion_class")
+    if not isinstance(completion_class, str) or completion_class not in COMPLETION_CLASSES:
+        raise ValueError(f"任务完成类型无效: {path.name}")
+    expected_completion_class = "audit" if audit_department(department) else "standard"
+    if completion_class != expected_completion_class:
+        raise ValueError(f"任务完成类型与部门层级不一致: {path.name}")
+    revision = payload.get("revision")
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise ValueError(f"任务 revision 无效: {path.name}")
+    created_at = parse_task_timestamp(payload, "created_at")
+    updated_at = parse_task_timestamp(payload, "updated_at")
+    if updated_at < created_at:
+        raise ValueError(f"任务 updated_at 早于 created_at: {path.name}")
+    if history_times != sorted(history_times) or any(timestamp < created_at or timestamp > updated_at for timestamp in history_times):
+        raise ValueError(f"任务授权历史时间顺序或边界无效: {path.name}")
+    if state == "queued" and payload["claimed_by"].strip():
+        raise ValueError(f"待领取任务不得预填 claimed_by: {path.name}")
+    if state not in {"blocked", "waiting_input"} and payload["block_reason"].strip():
+        raise ValueError(f"任务当前状态不得预填 block_reason: {path.name}")
+    if state in {"blocked", "waiting_input"} and not payload["block_reason"].strip():
+        raise ValueError(f"阻断或等待输入任务缺失 block_reason: {path.name}")
+    if state in {"queued", "claimed", "blocked", "waiting_input"} and any((
+        payload["artifacts"], payload["external_artifacts"], payload["verified"], payload["unverified"],
+        payload["mistake_check"].strip(), payload["report"].strip(), payload["event_receipts"],
+    )):
+        raise ValueError(f"未完成任务不得预填交付结果: {path.name}")
+    if state in {"claimed", "blocked", "waiting_input", "completed", "acknowledged"} and not payload["claimed_by"].strip():
+        raise ValueError(f"任务已进入执行生命周期但 claimed_by 缺失: {path.name}")
+    if state in {"claimed", "completed", "acknowledged"} and authorization not in {"none", "user_confirmed"}:
+        raise ValueError(f"任务当前执行状态与授权状态冲突: {path.name}")
+    if state in {"blocked", "waiting_input"} and authorization in {"user_required", "user_rejected"} and not has_evidence:
+        raise ValueError(f"阻断或等待输入任务的授权变更缺失证据: {path.name}")
+    if state == "acknowledged" and not payload.get("acknowledged_by", "").strip():
+        raise ValueError(f"已核收任务缺失 acknowledged_by: {path.name}")
+    if state != "acknowledged" and payload.get("acknowledged_by", "").strip():
+        raise ValueError(f"未核收任务不得预填 acknowledged_by: {path.name}")
+    if state in {"completed", "acknowledged"}:
+        if not payload["artifacts"] and not payload["external_artifacts"]:
+            raise ValueError(f"已完成任务缺失产物: {path.name}")
+        if not payload["verified"] or not payload["unverified"] or not payload["mistake_check"].strip():
+            raise ValueError(f"已完成任务缺失验证或自检记录: {path.name}")
+        if not payload["report"].strip():
+            raise ValueError(f"已完成任务缺失 report 记录: {path.name}")
+        if completion_class == "audit" and payload["report"] not in payload["artifacts"]:
+            raise ValueError(f"审核任务 report 未同时列入本地产物: {path.name}")
+    return payload
+
+
 def load_task_at(path: Path) -> dict:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"任务文件不安全: {path}")
     payload = json.loads(path.read_text(encoding="utf-8"))
-    if payload.get("schema_version") != SCHEMA_VERSION:
-        raise ValueError(f"不支持的任务版本: {path.name}")
-    if payload.get("execution_state") not in STATES:
-        raise ValueError(f"任务执行状态无效: {path.name}")
-    if payload.get("task_id") != path.stem:
-        raise ValueError(f"任务 ID 与文件名不一致: {path.name}")
-    return payload
+    return validate_task_payload(payload, path)
 
 
 def locate(task_id: str) -> tuple[str, Path, dict]:
@@ -947,13 +1146,30 @@ def all_tasks() -> list[tuple[str, Path, dict]]:
     return [locate(path.stem) for path in sorted(TASKS.glob("TASK-*.json"))]
 
 
+def configured_departments() -> dict[str, str]:
+    if SESSION_STATE.is_symlink() or not SESSION_STATE.is_file():
+        raise ValueError("会话启动状态缺失或不安全")
+    payload = json.loads(SESSION_STATE.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict) or payload.get("schema_version") != 1 or payload.get("protocol_version") != PROTOCOL_VERSION:
+        raise ValueError("会话启动状态版本无效")
+    departments = payload.get("departments")
+    if not isinstance(departments, dict) or not departments:
+        raise ValueError("会话启动状态未登记部门")
+    result: dict[str, str] = {}
+    for name, item in departments.items():
+        if not isinstance(name, str) or not isinstance(item, dict):
+            raise ValueError("会话启动状态部门条目无效")
+        role_id = item.get("role_id")
+        if not isinstance(role_id, str) or ROLE_DEPARTMENT_NAMES.get(role_id) != name:
+            raise ValueError(f"会话启动状态的部门与固定角色不一致: {name}")
+        department_path = DEPARTMENTS / name
+        ensure_plain_dir(department_path, DEPARTMENTS)
+        result[name] = role_id
+    return result
+
+
 def department_names() -> list[str]:
-    result = []
-    for path in DEPARTMENTS.iterdir():
-        if path.is_symlink() or not path.is_dir():
-            raise ValueError(f"部门路径不安全: {path}")
-        result.append(path.name)
-    return sorted(result)
+    return sorted(configured_departments())
 
 
 def require_department(name: str) -> None:
@@ -962,11 +1178,10 @@ def require_department(name: str) -> None:
 
 
 def audit_department(name: str) -> bool:
-    role_file = DEPARTMENTS / name / "岗位说明.md"
-    if role_file.is_symlink() or not role_file.is_file():
-        raise ValueError(f"岗位说明缺失或不安全: {name}")
-    header = "\n".join(role_file.read_text(encoding="utf-8-sig").splitlines()[:5])
-    return "所在层:审核层" in header
+    role_id = configured_departments().get(name)
+    if role_id is None:
+        raise ValueError(f"未登记部门: {name}")
+    return role_id in AUDIT_ROLE_IDS
 
 
 def local_artifact(raw: str) -> str:
@@ -1050,12 +1265,12 @@ def render_inboxes(*, force: bool = False) -> None:
         queued = [
             (s, p, t) for s, p, t in tasks
             if t["department"] == department and s == "queued"
-            and t.get("authorization_state", "none") in {"none", "user_confirmed"}
+            and t["authorization_state"] in {"none", "user_confirmed"}
         ]
         gated = [
             (s, p, t) for s, p, t in tasks
             if t["department"] == department and s == "queued"
-            and t.get("authorization_state") in {"user_required", "user_rejected"}
+            and t["authorization_state"] in {"user_required", "user_rejected"}
         ]
         active = [(s, p, t) for s, p, t in tasks if t["department"] == department and s in VISIBLE_ACTIVE_STATES]
         review = [(s, p, t) for s, p, t in tasks if department == "统筹部" and s == "completed"]
@@ -1107,6 +1322,7 @@ def save_new(task: dict) -> Path:
     path = task_path(task["task_id"])
     if path.exists():
         raise ValueError(f"任务已存在: {task['task_id']}")
+    validate_task_payload(task, path)
     data = json.dumps(task, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     write_atomic(path, data, 0o600)
     return path
@@ -1123,6 +1339,7 @@ def transition(task_id: str, action: str, mutate) -> tuple[dict, Path]:
     task["execution_state"] = target_state
     task["updated_at"] = now_iso()
     task["revision"] = int(task.get("revision", 0)) + 1
+    validate_task_payload(task, source)
     data = json.dumps(task, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     write_atomic(source, data, 0o600)
     return task, source
@@ -1136,6 +1353,7 @@ def update_task(task_id: str, mutate, *, allowed_states: set[str]) -> tuple[dict
     mutate(task)
     task["updated_at"] = now_iso()
     task["revision"] = int(task.get("revision", 0)) + 1
+    validate_task_payload(task, path)
     data = json.dumps(task, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     write_atomic(path, data, 0o600)
     return task, path
@@ -1205,7 +1423,7 @@ def cmd_enqueue(args) -> int:
 
 def cmd_claim(args) -> int:
     _, _, current = locate(args.task_id)
-    authorization = current.get("authorization_state", "none")
+    authorization = current["authorization_state"]
     if authorization in {"user_required", "user_rejected"}:
         raise ValueError(f"当前授权状态禁止领取: {authorization}")
     if authorization == "user_confirmed" and not current.get("authorization_evidence"):
@@ -1235,7 +1453,7 @@ def cmd_wait(args) -> int:
 
 def cmd_resume(args) -> int:
     _, _, current = locate(args.task_id)
-    authorization = current.get("authorization_state", "none")
+    authorization = current["authorization_state"]
     if authorization in {"user_required", "user_rejected"}:
         raise ValueError(f"当前授权状态禁止恢复: {authorization}")
     other = busy_for(current["department"], excluding=args.task_id)
@@ -1272,7 +1490,7 @@ def cmd_authorize(args) -> int:
 
 def cmd_complete(args) -> int:
     _, _, current = locate(args.task_id)
-    authorization = current.get("authorization_state", "none")
+    authorization = current["authorization_state"]
     if authorization in {"user_required", "user_rejected"}:
         raise ValueError(f"当前授权状态禁止完成: {authorization}")
     local_paths = [local_artifact(value) for value in args.artifact]
@@ -2353,9 +2571,7 @@ docs/collaboration/
 
 def append_agent_guide(target: Path) -> None:
     guide = target / "docs" / "agent-guide.md"
-    if not guide.exists():
-        return
-    text = read_utf8(guide)
+    text = read_utf8(guide) if guide.exists() else "# Agent 协作入口\n"
     start = "<!-- agent-team-guide:start -->"
     end = "<!-- agent-team-guide:end -->"
     block = f"""{start}
@@ -2383,87 +2599,41 @@ def append_agent_guide(target: Path) -> None:
 
 # ---- 最小业务地基 ------------------------------------------------------------
 
-FOUNDATION_SECTION_GROUPS = {
-    "goal": ("目标", "需求", "用户", "goal", "objective", "requirement", "user need"),
-    "delivery": ("交付", "范围", "mvp", "功能", "deliverable", "scope", "feature"),
-    "acceptance": ("验收", "完成标准", "成功标准", "acceptance", "success criteria", "done criteria", "completion criteria"),
-}
 MAX_FOUNDATION_BYTES = 256 * 1024
-MAX_FOUNDATION_FILES = 500
-PLACEHOLDER_MARKERS = ("待补", "todo", "tbd", "placeholder", "待确认", "yyyy", "xxx")
+MAX_FOUNDATION_FIELD_CHARS = 2000
 
 
-def meaningful_section_body(text: str) -> bool:
-    cleaned_lines = []
-    for raw in text.splitlines():
-        line = re.sub(r"^[\s>*+\-\d.)]+", "", raw).strip()
-        if line:
-            cleaned_lines.append(line)
-    cleaned = " ".join(cleaned_lines).strip()
-    lowered = cleaned.lower()
-    cjk_count = sum(1 for char in cleaned if "\u3400" <= char <= "\u9fff")
-    if (cjk_count < 6 and len(cleaned) < 12) or any(marker in lowered for marker in PLACEHOLDER_MARKERS):
-        return False
-    normalized = re.sub(r"[^\w\u4e00-\u9fff]+", "", lowered)
-    return len(set(normalized)) >= 6
-
-
-def markdown_sections(text: str) -> list[tuple[str, str]]:
-    sections: list[tuple[str, str]] = []
-    heading = ""
-    body: list[str] = []
-    for line in text.splitlines():
-        match = re.match(r"^\s{0,3}#{1,6}\s+(.+?)\s*$", line)
-        if match:
-            if heading:
-                sections.append((heading, "\n".join(body)))
-            heading = match.group(1).strip().lower()
-            body = []
-        elif heading:
-            body.append(line)
-    if heading:
-        sections.append((heading, "\n".join(body)))
-    return sections
-
-
-def foundation_file_usable(path: Path) -> bool:
+def validate_foundation_file(target: Path, raw_path: str) -> Path:
+    """Mechanically validate the foundation file explicitly reviewed by the Agent."""
+    value = raw_path.strip()
+    if not value:
+        raise ValueError("未指定已由 Agent 复核的地基文件; 请传 --foundation-file")
+    relative = Path(value)
+    if relative.is_absolute() or ".." in relative.parts:
+        raise ValueError("foundation-file 必须是项目内的相对路径")
+    if relative.suffix.lower() != ".md" or "collaboration" in relative.parts:
+        raise ValueError("foundation-file 必须是 docs/collaboration 之外的 Markdown 文件")
+    candidate = target / relative
     try:
-        if not path.is_file() or path.is_symlink():
-            return False
-        with path.open("rb") as handle:
-            data = handle.read(MAX_FOUNDATION_BYTES + 1)[:MAX_FOUNDATION_BYTES]
-        text = data.decode("utf-8-sig").strip()
-    except (OSError, UnicodeError):
-        return False
-    if not text:
-        return False
-    sections = markdown_sections(text)
-    if not sections:
-        return False
-    for aliases in FOUNDATION_SECTION_GROUPS.values():
-        matching_bodies = [body for heading, body in sections if any(alias in heading for alias in aliases)]
-        if not matching_bodies or not any(meaningful_section_body(body) for body in matching_bodies):
-            return False
-    return True
-
-
-def has_usable_foundation(target: Path) -> bool:
-    docs = target / "docs"
-    if not docs.is_dir():
-        return False
-
-    if any(foundation_file_usable(docs / name) for name in ("spec.md", "overview.md")):
-        return True
-    checked = 0
-    for path in docs.rglob("*.md"):
-        if "collaboration" in path.parts:
-            continue
-        checked += 1
-        if checked > MAX_FOUNDATION_FILES:
-            return False
-        if foundation_file_usable(path):
-            return True
-    return False
+        target_resolved = target.resolve(strict=True)
+        current = target
+        for part in relative.parts:
+            current = current / part
+            if current.is_symlink():
+                raise ValueError
+        resolved = candidate.resolve(strict=True)
+        resolved.relative_to(target_resolved)
+        if not resolved.is_file():
+            raise ValueError
+        with resolved.open("rb") as handle:
+            data = handle.read(MAX_FOUNDATION_BYTES + 1)
+        if len(data) > MAX_FOUNDATION_BYTES:
+            raise ValueError
+        if not data.decode("utf-8-sig").strip():
+            raise ValueError
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise ValueError("foundation-file 不存在、越界、经过符号链接、非 UTF-8、为空或超过 256 KiB") from exc
+    return resolved
 
 
 def ensure_core_docs(target: Path, date: str) -> list[Path]:
@@ -2638,7 +2808,8 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="将已有协作层升级到当前协议;保留交接、日志和报告,有旧待办时安全停止",
     )
-    parser.add_argument("--allow-without-foundation", action="store_true", help="允许缺少 docs/spec.md,用于非软件/自定义业务地基")
+    parser.add_argument("--foundation-file", default="", help="已由 Agent 阅读复核的项目内 Markdown 地基文件")
+    parser.add_argument("--allow-without-foundation", action="store_true", help="允许使用 docs/spec.md 之外的已复核地基,或创建通用最小地基")
     parser.add_argument(
         "--create-minimal-foundation",
         action="store_true",
@@ -2662,9 +2833,17 @@ def validate_minimal_foundation_args(args: argparse.Namespace) -> tuple[bool, st
         "--foundation-resources": args.foundation_resources,
         "--foundation-risks": args.foundation_risks,
     }
-    missing = [name for name, value in required.items() if not meaningful_section_body(value)]
-    if missing:
-        return False, "创建最小地基前必须提供真实、非占位内容: " + ", ".join(missing)
+    invalid = []
+    for name, value in required.items():
+        stripped = value.strip()
+        if (
+            not stripped
+            or len(stripped) > MAX_FOUNDATION_FIELD_CHARS
+            or any(ord(char) < 32 and char not in "\t\n\r" for char in stripped)
+        ):
+            invalid.append(name)
+    if invalid:
+        return False, "创建最小地基前六项参数必须非空、不含控制字符且每项不超过 2000 字: " + ", ".join(invalid)
     return True, ""
 
 
@@ -2825,14 +3004,221 @@ def recover_add_roles_transaction(collab: Path, *, announce: bool = True) -> boo
     return True
 
 
+UPGRADE_TASK_STATES = {"queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged"}
+UPGRADE_TASK_AUTH_STATES = {"none", "user_required", "user_confirmed", "user_rejected"}
+UPGRADE_TASK_REQUIRED_FIELDS = {
+    "schema_version", "task_id", "department", "from_department", "title", "node", "details",
+    "acceptance_exit", "failure_paths", "confirmation", "domain_stage", "authorization_state",
+    "authorization_evidence", "authorization_history", "execution_state", "completion_class", "pointers",
+    "created_at", "updated_at", "revision", "claimed_by", "block_reason", "artifacts", "external_artifacts",
+    "verified", "unverified", "mistake_check", "report", "event_receipts",
+}
+UPGRADE_TASK_OPTIONAL_FIELDS = {"acknowledged_by"}
+UPGRADE_TASK_ID_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
+
+
+def validate_upgrade_task_text(value: object, field: str, *, allow_empty: bool = False, max_chars: int = 2000) -> str:
+    if not isinstance(value, str) or (not allow_empty and not value.strip()):
+        raise ValueError(f"任务字段缺失或类型无效: {field}")
+    if (value and value != value.strip()) or len(value) > max_chars or any(ord(char) < 32 and char != "\t" for char in value):
+        raise ValueError(f"任务文本字段超长或含非法控制字符: {field}")
+    return value
+
+
+def validate_upgrade_task_list(
+    value: object,
+    field: str,
+    *,
+    min_items: int = 0,
+    max_items: int | None = None,
+    max_chars: int = 2000,
+) -> list[str]:
+    if not isinstance(value, list) or any(
+        not isinstance(item, str) or not item.strip() or item != item.strip() or len(item) > max_chars
+        or any(ord(char) < 32 and char != "\t" for char in item)
+        for item in value
+    ):
+        raise ValueError(f"任务列表字段无效: {field}")
+    if len(value) < min_items or (max_items is not None and len(value) > max_items):
+        raise ValueError(f"任务列表字段数量无效: {field}")
+    return value
+
+
+def validate_upgrade_task_timestamp(value: object, field: str) -> dt.datetime:
+    text = validate_upgrade_task_text(value, field)
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise ValueError(f"任务时间戳无效: {field}") from exc
+    if parsed.tzinfo is None:
+        raise ValueError(f"任务时间戳缺失时区: {field}")
+    return parsed
+
+
+def validate_upgrade_task_payload(payload: object, source: Path, departments: set[str], expected_state: str | None) -> None:
+    if not isinstance(payload, dict):
+        raise ValueError(f"任务根节点必须是 JSON 对象: {source}")
+    missing = sorted(UPGRADE_TASK_REQUIRED_FIELDS - set(payload))
+    unknown = sorted(set(payload) - UPGRADE_TASK_REQUIRED_FIELDS - UPGRADE_TASK_OPTIONAL_FIELDS)
+    if missing:
+        raise ValueError("任务字段缺失: " + ", ".join(missing))
+    if unknown:
+        raise ValueError("任务含当前 schema 未定义字段: " + ", ".join(unknown))
+    schema_version = payload["schema_version"]
+    if isinstance(schema_version, bool) or schema_version != 1:
+        raise ValueError(f"不支持的任务版本: {source}")
+    task_id = validate_upgrade_task_text(payload["task_id"], "task_id")
+    if task_id != source.stem or not UPGRADE_TASK_ID_RE.fullmatch(task_id):
+        raise ValueError(f"任务 ID 与文件名不一致或格式无效: {source}")
+    department = validate_upgrade_task_text(payload["department"], "department")
+    from_department = validate_upgrade_task_text(payload["from_department"], "from_department")
+    if department not in departments or from_department not in departments:
+        raise ValueError(f"任务部门不存在: {source}")
+    for field, max_chars in (
+        ("title", 200), ("node", 200), ("details", 2000), ("acceptance_exit", 2000),
+        ("confirmation", 2000), ("domain_stage", 200),
+    ):
+        validate_upgrade_task_text(payload[field], field, max_chars=max_chars)
+    for field, max_chars in (
+        ("authorization_evidence", 1000), ("claimed_by", 200), ("block_reason", 2000),
+        ("mistake_check", 2000), ("report", 500),
+    ):
+        validate_upgrade_task_text(payload[field], field, allow_empty=True, max_chars=max_chars)
+    if "acknowledged_by" in payload:
+        validate_upgrade_task_text(payload["acknowledged_by"], "acknowledged_by", allow_empty=True)
+    validate_upgrade_task_list(payload["failure_paths"], "failure_paths", min_items=1, max_items=3, max_chars=1000)
+    for field, max_chars in (
+        ("pointers", 500), ("artifacts", 500), ("external_artifacts", 1000),
+        ("verified", 2000), ("unverified", 2000), ("event_receipts", 1000),
+    ):
+        validate_upgrade_task_list(payload[field], field, max_chars=max_chars)
+    for raw in payload["artifacts"]:
+        path = Path(raw)
+        if path.is_absolute() or ".." in path.parts or raw in {"", "."}:
+            raise ValueError(f"任务本地产物路径无效: {source}")
+    for raw in payload["external_artifacts"]:
+        parsed_url = urlparse(raw)
+        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc or parsed_url.username or parsed_url.password:
+            raise ValueError(f"任务外部产物 URL 无效: {source}")
+    authorization = payload["authorization_state"]
+    if not isinstance(authorization, str) or authorization not in UPGRADE_TASK_AUTH_STATES:
+        raise ValueError(f"任务授权状态无效: {source}")
+    if authorization in {"user_confirmed", "user_rejected"} and not payload["authorization_evidence"].strip():
+        raise ValueError(f"任务授权证据缺失: {source}")
+    history = payload["authorization_history"]
+    if not isinstance(history, list):
+        raise ValueError(f"任务授权历史无效: {source}")
+    history_times: list[dt.datetime] = []
+    for entry in history:
+        if not isinstance(entry, dict) or set(entry) != {"at", "state", "evidence"}:
+            raise ValueError(f"任务授权历史条目无效: {source}")
+        history_times.append(validate_upgrade_task_timestamp(entry["at"], "authorization_history.at"))
+        if not isinstance(entry["state"], str) or entry["state"] not in UPGRADE_TASK_AUTH_STATES:
+            raise ValueError(f"任务授权历史状态无效: {source}")
+        validate_upgrade_task_text(entry["evidence"], "authorization_history.evidence", max_chars=1000)
+    has_evidence = bool(payload["authorization_evidence"].strip())
+    if bool(history) != has_evidence:
+        raise ValueError(f"任务当前授权证据与历史有无不一致: {source}")
+    if history and (history[-1]["state"] != authorization or history[-1]["evidence"] != payload["authorization_evidence"]):
+        raise ValueError(f"任务当前授权与历史最新记录不一致: {source}")
+    state = payload["execution_state"]
+    if not isinstance(state, str) or state not in UPGRADE_TASK_STATES or (expected_state is not None and state != expected_state):
+        raise ValueError(f"任务执行状态无效或与目录不一致: {source}")
+    if not isinstance(payload["completion_class"], str) or payload["completion_class"] not in {"standard", "audit"}:
+        raise ValueError(f"任务完成类型无效: {source}")
+    expected_completion_class = "audit" if any(
+        role["name"] == department and role["layer"] == "audit" for role in ROLE_DEFS.values()
+    ) else "standard"
+    if payload["completion_class"] != expected_completion_class:
+        raise ValueError(f"任务完成类型与部门层级不一致: {source}")
+    revision = payload["revision"]
+    if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
+        raise ValueError(f"任务 revision 无效: {source}")
+    created_at = validate_upgrade_task_timestamp(payload["created_at"], "created_at")
+    updated_at = validate_upgrade_task_timestamp(payload["updated_at"], "updated_at")
+    if updated_at < created_at:
+        raise ValueError(f"任务 updated_at 早于 created_at: {source}")
+    if history_times != sorted(history_times) or any(timestamp < created_at or timestamp > updated_at for timestamp in history_times):
+        raise ValueError(f"任务授权历史时间顺序或边界无效: {source}")
+    if state == "queued" and payload["claimed_by"].strip():
+        raise ValueError(f"待领取任务不得预填 claimed_by: {source}")
+    if state not in {"blocked", "waiting_input"} and payload["block_reason"].strip():
+        raise ValueError(f"任务当前状态不得预填 block_reason: {source}")
+    if state in {"blocked", "waiting_input"} and not payload["block_reason"].strip():
+        raise ValueError(f"阻断或等待输入任务缺失 block_reason: {source}")
+    if state in {"queued", "claimed", "blocked", "waiting_input"} and any((
+        payload["artifacts"], payload["external_artifacts"], payload["verified"], payload["unverified"],
+        payload["mistake_check"].strip(), payload["report"].strip(), payload["event_receipts"],
+    )):
+        raise ValueError(f"未完成任务不得预填交付结果: {source}")
+    if state in UPGRADE_TASK_STATES - {"queued"} and not payload["claimed_by"].strip():
+        raise ValueError(f"任务已进入执行生命周期但 claimed_by 缺失: {source}")
+    if state in {"claimed", "completed", "acknowledged"} and authorization not in {"none", "user_confirmed"}:
+        raise ValueError(f"任务当前执行状态与授权状态冲突: {source}")
+    if state in {"blocked", "waiting_input"} and authorization in {"user_required", "user_rejected"} and not has_evidence:
+        raise ValueError(f"阻断或等待输入任务的授权变更缺失证据: {source}")
+    if state in {"completed", "acknowledged"}:
+        if not payload["artifacts"] and not payload["external_artifacts"]:
+            raise ValueError(f"已完成任务缺失产物: {source}")
+        if not payload["verified"] or not payload["unverified"] or not payload["mistake_check"].strip():
+            raise ValueError(f"已完成任务缺失验证或自检记录: {source}")
+        if not payload["report"].strip():
+            raise ValueError(f"已完成任务缺失 report 记录: {source}")
+        if payload["completion_class"] == "audit" and payload["report"] not in payload["artifacts"]:
+            raise ValueError(f"审核任务 report 未同时列入本地产物: {source}")
+    if state == "acknowledged" and not payload.get("acknowledged_by", "").strip():
+        raise ValueError(f"已核收任务缺失 acknowledged_by: {source}")
+    if state != "acknowledged" and payload.get("acknowledged_by", "").strip():
+        raise ValueError(f"未核收任务不得预填 acknowledged_by: {source}")
+
+
+def preflight_upgrade_tasks(collab: Path, roles: list[str]) -> None:
+    tasks = collab / "tasks"
+    if not tasks.exists():
+        return
+    if not plain_path_within(tasks, collab, kind="dir"):
+        raise ValueError("tasks 路径不安全")
+    departments = {ROLE_DEFS[role]["name"] for role in roles}
+    seen_destinations: set[str] = set()
+    for entry in tasks.iterdir():
+        if entry.is_symlink():
+            raise ValueError(f"任务路径不安全: {entry}")
+        if entry.is_dir():
+            if entry.name not in UPGRADE_TASK_STATES or not plain_path_within(entry, collab, kind="dir"):
+                raise ValueError(f"任务目录无效: {entry}")
+            candidates = list(entry.iterdir())
+            expected_state = entry.name
+        elif entry.is_file() and entry.name.startswith("TASK-") and entry.suffix == ".json":
+            candidates = [entry]
+            expected_state = None
+        else:
+            raise ValueError(f"tasks 中含非标准项: {entry}")
+        for source in candidates:
+            if source.is_symlink() or not source.is_file() or not source.name.startswith("TASK-") or source.suffix != ".json":
+                raise ValueError(f"任务目录含非标准文件: {source}")
+            if source.name in seen_destinations:
+                raise ValueError(f"任务迁移目标重复: {source.name}")
+            seen_destinations.add(source.name)
+            try:
+                payload = json.loads(read_utf8(source))
+            except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+                raise ValueError(f"任务 JSON 损坏: {source}: {exc}") from exc
+            validate_upgrade_task_payload(payload, source, departments, expected_state)
+
+
 def run_upgrade(collab: Path) -> int:
     existing_state = validate_existing_collaboration(collab, require_current=False)
     if existing_state is None:
         return 3
+    registry_text, roles = existing_state
+    try:
+        preflight_upgrade_tasks(collab, roles)
+    except ValueError as exc:
+        print(f"升级已停止:任务真值未通过完整性预检: {exc}", file=sys.stderr)
+        return 9
     if read_protocol_version(collab) == PROTOCOL_VERSION and current_runtime_complete(collab):
         print(f"UPGRADE_NOT_NEEDED | protocol:{PROTOCOL_VERSION}")
         return 0
-    registry_text, roles = existing_state
     date = dt.date.today().isoformat()
     session_data = registry_session_data(registry_text)
     pending_legacy = []
@@ -2906,6 +3292,11 @@ def run_upgrade(collab: Path) -> int:
 
     operation_id = "UPGRADE-" + dt.datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8].upper()
     backup_root = backup_parent / operation_id
+    project = collab.parents[1]
+    project_guide = collab.parent / "agent-guide.md"
+    if project_guide.is_symlink() or (project_guide.exists() and not plain_path_within(project_guide, project, kind="file")):
+        print("项目 agent-guide.md 越界、经过符号链接或不是普通文件,已拒绝升级。", file=sys.stderr)
+        return 3
     try:
         backup_parent.mkdir(parents=False, exist_ok=True)
         if not plain_path_within(backup_parent, collab, kind="dir"):
@@ -2943,6 +3334,12 @@ def run_upgrade(collab: Path) -> int:
                     if destination.exists() or any(existing == destination for _, existing in legacy_tasks):
                         raise ValueError(f"旧任务迁移目标冲突: {destination}")
                     legacy_tasks.append((source, destination))
+        if project_guide.exists():
+            guide_backup = backup_root / "project-docs-agent-guide.md"
+            shutil.copy2(project_guide, guide_backup)
+            originals[project_guide] = guide_backup
+        else:
+            originals[project_guide] = None
         for path in [*managed, *obsolete]:
             if path.exists():
                 if path.is_symlink() or not path.is_file():
@@ -2986,6 +3383,7 @@ def run_upgrade(collab: Path) -> int:
                 if path.is_symlink() or not path.is_file():
                     raise ValueError(f"废弃读取工具路径不安全: {path}")
                 path.unlink()
+        append_agent_guide(project)
         protocol_content, protocol_mode = managed[collab / PROTOCOL_FILE]
         write_utf8_atomic(collab / PROTOCOL_FILE, protocol_content, mode=protocol_mode)
     except Exception as exc:
@@ -3189,30 +3587,31 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
     if args.session_mode is None:
         print("未确认会话创建模式。请先确认 auto(工具自动创建会话) 或 manual(用户手动创建窗口),再传 --session-mode。", file=sys.stderr)
         return 5
-    missing_spec = not foundation_file_usable(target / "docs" / "spec.md")
-    if missing_spec and not args.allow_without_foundation:
-        print(
-            "未找到可用的 docs/spec.md。可用地基需要分别写清目标/用户需求、交付范围和验收标准,不要求凑固定字数。若项目没有适用地基,可在用户确认后用 --allow-without-foundation --create-minimal-foundation 创建通用最小业务地基。",
-            file=sys.stderr,
-        )
-        return 2
-    if missing_spec and args.allow_without_foundation and not args.create_minimal_foundation and not has_usable_foundation(target):
-        print(
-            "当前项目没有可用地基。请先使用适用的业务地基,或在用户确认后加 --create-minimal-foundation 创建通用最小业务地基;不能只创建无地基协作层。",
-            file=sys.stderr,
-        )
-        return 2
-    if missing_spec and args.create_minimal_foundation:
+    foundation_path: Path | None = None
+    if args.create_minimal_foundation:
+        if not args.allow_without_foundation:
+            print("创建通用最小地基需要用户确认后同时传 --allow-without-foundation。", file=sys.stderr)
+            return 2
+        if args.foundation_file:
+            print("--create-minimal-foundation 不能与 --foundation-file 同时使用。", file=sys.stderr)
+            return 2
         valid_foundation_args, foundation_error = validate_minimal_foundation_args(args)
         if not valid_foundation_args:
             print(foundation_error, file=sys.stderr)
             return 2
         overview = target / "docs" / "overview.md"
-        if overview.exists() and not foundation_file_usable(overview):
-            print(
-                "docs/overview.md 已存在但不是可用地基。为避免覆盖用户文件或带着垃圾地基继续,请先人工修复、移动或删除该文件。",
-                file=sys.stderr,
-            )
+        if overview.exists():
+            print("docs/overview.md 已存在;为避免覆盖用户文件,请改用 --foundation-file 或先由用户决定如何处理。", file=sys.stderr)
+            return 2
+    else:
+        try:
+            foundation_path = validate_foundation_file(target, args.foundation_file)
+        except ValueError as exc:
+            print(str(exc), file=sys.stderr)
+            return 2
+        relative_foundation = foundation_path.relative_to(target.resolve(strict=True)).as_posix()
+        if relative_foundation != "docs/spec.md" and not args.allow_without_foundation:
+            print("非软件或自定义地基需要用户确认后同时传 --allow-without-foundation。", file=sys.stderr)
             return 2
     if collab.exists():
         print("docs/collaboration/ 已存在,为避免覆盖已中止。要追加部门请用 --add-roles,要小步更新请读取现有文件后手动改。", file=sys.stderr)
@@ -3232,7 +3631,7 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
     build_collab: Path | None = None
     collab_published = False
     try:
-        if missing_spec and args.create_minimal_foundation:
+        if args.create_minimal_foundation:
             create_minimal_foundation(
                 target, args.profile, date,
                 goal=args.foundation_goal,
@@ -3242,8 +3641,7 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
                 resources=args.foundation_resources,
                 risks=args.foundation_risks,
             )
-            if not foundation_file_usable(target / "docs" / "overview.md"):
-                raise ValueError("生成后的 docs/overview.md 未通过地基复验")
+            validate_foundation_file(target, "docs/overview.md")
         else:
             ensure_core_docs(target, date)
 

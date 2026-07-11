@@ -22,7 +22,7 @@ TASK 文件固定为 `tasks/TASK-*.json`，状态只在 `execution_state`。领�
 
 ## 5. 损坏真值
 
-任一 TASK JSON 格式损坏、ID 与文件名冲突或状态非法时，所有任务写操作在突变前停止。不得把损坏任务忽略成“索引暂时过期”。
+任一 TASK JSON 格式损坏、ID 与文件名冲突、状态非法、字段缺失或类型错误时，所有任务写操作在突变前停止。删除 `authorization_state` 后不得把任务当成 `none`；删除 `department` 后再派单不得新增任务。不得把损坏任务忽略成“索引暂时过期”。
 
 ## 6. 收件箱损坏
 
@@ -60,7 +60,7 @@ Skill 只负责把 Agent 路由到部门入口、TASK JSON 和相关项目文件
 
 ## 14. 旧协议升级
 
-升级先备份受管文件。旧版状态目录中的任务迁移到平铺稳定路径；旧读取器和读取规则被移除。旧任务损坏、目标冲突或目录不安全时，升级停止并恢复。
+升级在任何写入和备份目录创建前，先对已平铺任务和旧状态目录任务做完整结构预检。通过后才备份受管文件，把旧版状态目录任务迁移到平铺稳定路径，移除旧读取器与规则，并刷新项目 `docs/agent-guide.md` 的受管协议版本。任务损坏、目标冲突或目录不安全时，升级保持协议、运行脚本和任务真值不变。
 
 ## 15. 同版本运行时缺失
 
@@ -78,11 +78,16 @@ Skill 只负责把 Agent 路由到部门入口、TASK JSON 和相关项目文件
 
 新建 AI 产品团队时，`ai` 角色必须被拒绝，不生成独立 AI 工程部。产品部负责完整规划和 AI 行为验收目标；开发部负责模型接入、Prompt、RAG、Agent、评测、成本、延迟和降级等全部技术实现。旧协作层若仍有 AI 工程部，升级必须停止并要求用户先授权合并，不能静默删除历史。
 
+## 19. 地基语义与机械检查分层
+
+新建协作层前，Agent 亲自阅读并复核地基是否真正说清目标、交付范围和验收标准，再显式传入 `--foundation-file`。脚本只检查相对路径、项目边界、符号链接、UTF-8、文件类型、非空和大小上限，不扫描整个 `docs/`，不用关键词、字数或字符种类冒充语义判断。未传地基文件、越界、符号链接或非 `docs/spec.md` 且未经用户确认时，必须在创建协作层前停止。
+
 ## 自动复验
 
 ```bash
 python3 -m py_compile scripts/scaffold_team.py scripts/verify_agent_team.py
 python3 scripts/verify_agent_team.py
+python3 /Users/aiden/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
 ```
 
 修改运行时后，还必须用全局安装副本覆盖 `AGENT_TEAM_SCAFFOLD` 再跑验证器。

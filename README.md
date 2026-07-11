@@ -56,10 +56,11 @@ rsync -a --delete --delete-excluded \
 python3 scripts/scaffold_team.py "/path/to/project" \
   --profile "通用项目协作" \
   --roles "lead,do,review" \
-  --session-mode manual
+  --session-mode manual \
+  --foundation-file docs/spec.md
 ```
 
-用户确认缺少适用地基且允许创建通用最小地基时，才追加 `--allow-without-foundation --create-minimal-foundation` 及六项地基参数。
+Agent 必须先阅读地基并确认它已说清目标、交付范围和验收标准，再通过 `--foundation-file` 显式声明已复核的项目内文件。脚本只负责机械路径和文件安全检查，不评判文本语义。使用 `docs/spec.md` 之外的地基时需另加 `--allow-without-foundation`。用户确认缺少适用地基且允许创建通用最小地基时，才改用 `--allow-without-foundation --create-minimal-foundation` 及六项地基参数。
 
 ## 生成结构
 
@@ -105,6 +106,7 @@ docs/collaboration/
 ```bash
 python3 -m py_compile scripts/scaffold_team.py scripts/verify_agent_team.py
 python3 scripts/verify_agent_team.py
+python3 /Users/aiden/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
 ```
 
 协议升级：
