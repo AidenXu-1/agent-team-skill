@@ -26,7 +26,7 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.3.1"
+PROTOCOL_VERSION = "1.4.1"
 PROTOCOL_FILE = "协议版本.json"
 ADD_TRANSACTION_FILE = ".add-roles-transaction.json"
 
@@ -203,7 +203,8 @@ def current_runtime_complete(collab: Path) -> bool:
     files = (
         "README.md", "部门表.md", "路由表.md", "会话启动清单.md", "会话启动状态.json",
         "任务交接模板.md", "scripts/agent_team_log.py", "scripts/agent_team_task.py",
-        "scripts/agent_team_session.py", "模板/工作报告.md", "模板/审核报告.md", "模板/专项结论.md",
+        "scripts/agent_team_session.py", "scripts/agent_team_temporary.py",
+        "模板/工作报告.md", "模板/审核报告.md", "模板/专项结论.md",
     )
     directories = (
         "部门", ".locks", "tasks", "scripts",
@@ -458,9 +459,11 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import json
 import os
 import re
 import stat
+import subprocess
 import sys
 import uuid
 from contextlib import contextmanager
@@ -483,6 +486,10 @@ PREFIXES = {
     "INCIDENT": "INC",
 }
 MAX_FIELD_CHARS = 500
+FORMAL_START = "<!-- agent-team:formal-log:start -->"
+FORMAL_END = "<!-- agent-team:formal-log:end -->"
+TEMP_START = "<!-- agent-team:temporary-log:start -->"
+TEMP_END = "<!-- agent-team:temporary-log:end -->"
 
 
 def ensure_utf8_filesystem_runtime() -> None:
@@ -504,9 +511,31 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-COLLAB = Path(__file__).resolve().parents[1]
+def discover_control_root() -> Path:
+    local = Path(__file__).resolve().parents[1]
+    project = local.parents[1]
+    inside = subprocess.run(
+        ["git", "-C", str(project), "rev-parse", "--is-inside-work-tree"],
+        text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    result = subprocess.run(
+        ["git", "-C", str(project), "worktree", "list", "--porcelain"],
+        text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode == 0:
+        first = next((line[9:] for line in result.stdout.splitlines() if line.startswith("worktree ")), "")
+        candidate = Path(first) / "docs" / "collaboration" if first else None
+        if candidate is not None and candidate.is_dir() and not candidate.is_symlink():
+            return candidate.resolve(strict=True)
+    if (project / ".git").exists() or (inside.returncode == 0 and inside.stdout.strip() == "true"):
+        raise SystemExit("CONTROL_ROOT_ERROR | Git worktree 中无法验证主 docs/collaboration，拒绝写本地副本")
+    return local
+
+
+COLLAB = discover_control_root()
 PROJECT = COLLAB.parents[1]
 DEPARTMENTS = COLLAB / "部门"
+TASKS = COLLAB / "tasks"
 LOCKS = COLLAB / ".locks"
 
 
@@ -653,7 +682,12 @@ def create_week_file(path: Path, department: str, week: str, start: str, end: st
     header = (
         f"---\n部门: {department}\n覆盖: {start} ~ {end}\n---\n\n"
         f"# {department} · 日志 · {week}\n\n"
-        "> 冷历史，默认不读。只在事件发生时向文件末尾追加事实；不记录经验总结或完整聊天。\n\n"
+        "> 冷历史，默认不读。正式部门与临时外包物理分区；只记录改变项目轨迹的事实。\n\n"
+        "## 正式部门日志\n\n"
+        f"{FORMAL_START}\n{FORMAL_END}\n\n"
+        "## 临时外包日志\n\n"
+        "> 临时任务局部判断不代表父部门或项目正式结论。\n\n"
+        f"{TEMP_START}\n{TEMP_END}\n"
     ).encode("utf-8")
     try:
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
@@ -667,6 +701,84 @@ def create_week_file(path: Path, department: str, week: str, start: str, end: st
         os.close(fd)
 
 
+def section_layout(text: str) -> str:
+    markers = (FORMAL_START, FORMAL_END, TEMP_START, TEMP_END)
+    counts = [text.count(marker) for marker in markers]
+    if counts == [1, 1, 1, 1]:
+        if not (
+            text.index(FORMAL_START) < text.index(FORMAL_END)
+            < text.index(TEMP_START) < text.index(TEMP_END)
+        ):
+            raise ValueError("周日志分区标记顺序损坏")
+        return text
+    if any(counts):
+        raise ValueError("周日志分区标记不完整，拒绝猜测修复")
+
+    # 兼容旧平铺日志：保留头部，把既有事实事件原样迁入正式板块。
+    lines = text.splitlines(keepends=True)
+    first_event = next((index for index, line in enumerate(lines) if line.startswith("- ") and " | " in line), len(lines))
+    prefix = "".join(lines[:first_event]).rstrip() + "\n\n"
+    events = "".join(lines[first_event:]).strip()
+    formal_body = (events + "\n") if events else ""
+    return (
+        prefix
+        + "## 正式部门日志\n\n"
+        + FORMAL_START + "\n" + formal_body + FORMAL_END + "\n\n"
+        + "## 临时外包日志\n\n"
+        + "> 临时任务局部判断不代表父部门或项目正式结论。\n\n"
+        + TEMP_START + "\n" + TEMP_END + "\n"
+    )
+
+
+def replace_file(path: Path, data: bytes, logs_fd: int | None) -> None:
+    temp_name = f".{path.name}.{uuid.uuid4().hex}.tmp"
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(temp_name, flags, 0o600, dir_fd=logs_fd) if logs_fd is not None else os.open(path.parent / temp_name, flags, 0o600)
+    try:
+        write_all(fd, data)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        if logs_fd is not None:
+            os.replace(temp_name, path.name, src_dir_fd=logs_fd, dst_dir_fd=logs_fd)
+            os.fsync(logs_fd)
+        else:
+            os.replace(path.parent / temp_name, path)
+    finally:
+        if logs_fd is not None:
+            try:
+                os.unlink(temp_name, dir_fd=logs_fd)
+            except FileNotFoundError:
+                pass
+        else:
+            (path.parent / temp_name).unlink(missing_ok=True)
+
+
+def insert_event(text: str, *, event_line: str, task_id: str, executor_type: str, executor_id: str) -> str:
+    text = section_layout(text)
+    if executor_type == "formal":
+        position = text.index(FORMAL_END)
+        return text[:position] + event_line + text[position:]
+
+    position = text.index(TEMP_END)
+    section_start = text.index(TEMP_START) + len(TEMP_START)
+    temporary_body = text[section_start:position]
+    task_marker = f"<!-- agent-team:temporary-task:{task_id} -->"
+    if task_marker in temporary_body:
+        group_start = text.index(task_marker, section_start)
+        next_group = text.find("\n### TASK-", group_start)
+        insert_at = position if next_group < 0 or next_group > position else next_group
+        return text[:insert_at].rstrip() + "\n" + event_line + "\n" + text[insert_at:].lstrip("\n")
+    group = (
+        f"\n### {task_id}\n\n"
+        f"{task_marker}\n"
+        f"> executor_type:temporary · executor_id:{executor_id}\n\n"
+        f"{event_line}"
+    )
+    return text[:position] + group + text[position:]
+
+
 def append_event(args: argparse.Namespace) -> int:
     event_type = args.type.upper()
     if event_type not in EVENT_TYPES:
@@ -678,6 +790,32 @@ def append_event(args: argparse.Namespace) -> int:
     task_id = clean_field("task-id", args.task_id)
     if task_id != "PROJECT" and not re.fullmatch(r"TASK-[0-9]{8}-[A-Z0-9]{6}", task_id):
         raise ValueError("task-id 必须是 TASK-YYYYMMDD-XXXXXX 或 PROJECT")
+    executor_type = args.executor_type
+    if executor_type not in {"formal", "temporary"}:
+        raise ValueError("executor-type 只允许 formal 或 temporary")
+    executor_id = clean_field("executor-id", args.executor_id or "", required=executor_type == "temporary")
+    parent_department = clean_field(
+        "parent-department", args.parent_department or department, required=executor_type == "temporary"
+    )
+    if executor_type == "temporary":
+        if task_id == "PROJECT":
+            raise ValueError("临时外包日志必须绑定具体 TASK")
+        if parent_department != department:
+            raise ValueError("临时外包日志必须写入父部门周日志")
+        task_path = TASKS / f"{task_id}.json"
+        if task_path.is_symlink() or not task_path.is_file():
+            raise ValueError("临时外包日志绑定的权威 TASK 不存在或不安全")
+        task_payload = json.loads(task_path.read_text(encoding="utf-8"))
+        temporary = task_payload.get("temporary_executor")
+        if not isinstance(temporary, dict):
+            raise ValueError("TASK 未绑定临时执行者，拒绝写临时日志")
+        if task_payload.get("department") != department or temporary.get("parent_department") != department:
+            raise ValueError("日志父部门与 TASK 真值不一致")
+        if temporary.get("executor_type") != "temporary" or temporary.get("executor_id") != executor_id:
+            raise ValueError("日志执行者与 TASK 真值不一致")
+    else:
+        executor_id = "-"
+        parent_department = department
     fact = clean_field("fact", args.fact)
     result = clean_field("result", args.result)
     pointer = safe_pointer(clean_field("pointer", args.pointer))
@@ -695,22 +833,28 @@ def append_event(args: argparse.Namespace) -> int:
             event_id = f"{PREFIXES[event_type]}-{now:%Y%m%dT%H%M%S}-{uuid.uuid4().hex[:6].upper()}"
             line = (
                 f"- {timestamp} | {event_id} | {event_type} | task:{task_id} | initiator:{args.initiator} | "
+                f"executor_type:{executor_type} | executor_id:{executor_id} | parent_department:{parent_department} | "
                 f"fact:{fact} | trigger:{trigger} | impact:{impact} | result:{result} | -> {pointer}\n"
-            ).encode("utf-8")
-            flags = os.O_WRONLY | os.O_APPEND | getattr(os, "O_NOFOLLOW", 0)
+            )
+            flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
             fd = os.open(log_path.name, flags, dir_fd=logs_fd) if logs_fd is not None else os.open(log_path, flags)
             try:
                 file_stat = os.fstat(fd)
                 if not stat.S_ISREG(file_stat.st_mode):
                     raise ValueError("周日志不是普通文件")
                 if file_stat.st_nlink != 1:
-                    raise ValueError("周日志存在硬链接，拒绝追加")
-                write_all(fd, line)
-                os.fsync(fd)
+                    raise ValueError("周日志存在硬链接，拒绝更新")
+                with os.fdopen(fd, "r", encoding="utf-8", newline="") as handle:
+                    fd = -1
+                    current = handle.read()
             finally:
-                os.close(fd)
-            if logs_fd is not None:
-                os.fsync(logs_fd)
+                if fd >= 0:
+                    os.close(fd)
+            updated = insert_event(
+                current, event_line=line, task_id=task_id,
+                executor_type=executor_type, executor_id=executor_id,
+            )
+            replace_file(log_path, updated.encode("utf-8"), logs_fd)
 
     relative = log_path.relative_to(PROJECT)
     print(f"LOG_OK | {timestamp} | {task_id} | {event_id} | {relative}")
@@ -730,6 +874,9 @@ def main() -> int:
     append.add_argument("--impact", default="")
     append.add_argument("--result", required=True)
     append.add_argument("--pointer", required=True)
+    append.add_argument("--executor-type", choices=("formal", "temporary"), default="formal")
+    append.add_argument("--executor-id", default="")
+    append.add_argument("--parent-department", default="")
     append.set_defaults(func=append_event)
     args = parser.parse_args()
     try:
@@ -742,6 +889,13 @@ def main() -> int:
 if __name__ == "__main__":
     raise SystemExit(main())
 '''
+
+
+def temporary_executor_script() -> str:
+    source = Path(__file__).with_name("temporary_executor_runtime.py")
+    if source.is_symlink() or not source.is_file():
+        raise ValueError("临时外包运行时模板缺失或不安全")
+    return source.read_text(encoding="utf-8")
 
 
 def task_writer_script() -> str:
@@ -761,6 +915,7 @@ import hashlib
 import json
 import os
 import re
+import subprocess
 import sys
 import uuid
 from contextlib import contextmanager
@@ -795,7 +950,28 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-COLLAB = Path(__file__).resolve().parents[1]
+def discover_control_root() -> Path:
+    local = Path(__file__).resolve().parents[1]
+    project = local.parents[1]
+    inside = subprocess.run(
+        ["git", "-C", str(project), "rev-parse", "--is-inside-work-tree"],
+        text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    result = subprocess.run(
+        ["git", "-C", str(project), "worktree", "list", "--porcelain"],
+        text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode == 0:
+        first = next((line[9:] for line in result.stdout.splitlines() if line.startswith("worktree ")), "")
+        candidate = Path(first) / "docs" / "collaboration" if first else None
+        if candidate is not None and candidate.is_dir() and not candidate.is_symlink():
+            return candidate.resolve(strict=True)
+    if (project / ".git").exists() or (inside.returncode == 0 and inside.stdout.strip() == "true"):
+        raise SystemExit("CONTROL_ROOT_ERROR | Git worktree 中无法验证主 docs/collaboration，拒绝写本地副本")
+    return local
+
+
+COLLAB = discover_control_root()
 PROJECT = COLLAB.parents[1]
 DEPARTMENTS = COLLAB / "部门"
 TASKS = COLLAB / "tasks"
@@ -803,7 +979,7 @@ LOCKS = COLLAB / ".locks"
 SESSION_STATE = COLLAB / "会话启动状态.json"
 INDEX_MARKER = "<!-- agent-team task index; use scripts/agent_team_task.py -->"
 SCHEMA_VERSION = 1
-PROTOCOL_VERSION = "1.3.1"
+PROTOCOL_VERSION = "1.4.1"
 STATES = ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged")
 BUSY_STATES = {"claimed"}
 VISIBLE_ACTIVE_STATES = {"claimed", "blocked", "waiting_input"}
@@ -824,7 +1000,7 @@ TASK_FIELDS = {
     "created_at", "updated_at", "revision", "claimed_by", "block_reason", "artifacts", "external_artifacts",
     "verified", "unverified", "mistake_check", "report", "event_receipts",
 }
-OPTIONAL_TASK_FIELDS = {"acknowledged_by"}
+OPTIONAL_TASK_FIELDS = {"acknowledged_by", "impact_declaration", "temporary_executor", "temporary_operation_history"}
 TRANSITIONS = {
     "claim": {"queued": "claimed"},
     "block": {"claimed": "blocked"},
@@ -1010,6 +1186,26 @@ def validate_task_payload(payload: object, path: Path) -> dict:
         raise ValueError("任务字段缺失: " + ", ".join(missing_fields))
     if unknown_fields:
         raise ValueError("任务含当前 schema 未定义字段: " + ", ".join(unknown_fields))
+    impact = payload.get("impact_declaration")
+    if impact is not None:
+        required_impact = {"write_paths", "shared_contracts", "external_effects", "base_revision", "owner_task", "admission"}
+        if not isinstance(impact, dict) or set(impact) != required_impact:
+            raise ValueError(f"任务影响声明结构无效: {path.name}")
+        if impact.get("admission") not in {"safe", "manual", "unsafe", "waiting_base"}:
+            raise ValueError(f"任务影响声明 admission 无效: {path.name}")
+        if any(not isinstance(impact.get(field), list) for field in ("write_paths", "shared_contracts", "external_effects")):
+            raise ValueError(f"任务影响声明列表无效: {path.name}")
+    temporary = payload.get("temporary_executor")
+    if temporary is not None:
+        if not isinstance(temporary, dict) or temporary.get("executor_type") != "temporary":
+            raise ValueError(f"temporary_executor 结构无效: {path.name}")
+        if temporary.get("parent_department") != payload.get("department"):
+            raise ValueError(f"temporary_executor 父部门不匹配: {path.name}")
+        if temporary.get("promotion_state") not in {
+            "not_submitted", "submitted", "reviewing", "waiting_base", "ready", "integrated",
+            "archived", "cancelled", "abandoned",
+        }:
+            raise ValueError(f"temporary_executor 晋升状态无效: {path.name}")
     schema_version = payload.get("schema_version")
     if isinstance(schema_version, bool) or schema_version != SCHEMA_VERSION:
         raise ValueError(f"不支持的任务版本: {path.name}")
@@ -1362,7 +1558,8 @@ def update_task(task_id: str, mutate, *, allowed_states: set[str]) -> tuple[dict
 def busy_for(department: str, *, excluding: str | None = None) -> list[str]:
     result = []
     for state, _, task in all_tasks():
-        if state in BUSY_STATES and task["department"] == department and task["task_id"] != excluding:
+        if (state in BUSY_STATES and task["department"] == department and task["task_id"] != excluding
+                and not task.get("temporary_executor")):
             result.append(task["task_id"])
     return result
 
@@ -1423,6 +1620,8 @@ def cmd_enqueue(args) -> int:
 
 def cmd_claim(args) -> int:
     _, _, current = locate(args.task_id)
+    if current.get("temporary_executor"):
+        raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
     authorization = current["authorization_state"]
     if authorization in {"user_required", "user_rejected"}:
         raise ValueError(f"当前授权状态禁止领取: {authorization}")
@@ -1438,6 +1637,9 @@ def cmd_claim(args) -> int:
 
 
 def cmd_block(args) -> int:
+    _, _, current = locate(args.task_id)
+    if current.get("temporary_executor"):
+        raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
     task, path = transition(args.task_id, "block", lambda item: item.update(block_reason=clean("reason", args.reason)))
     refresh_inboxes()
     print(f"TASK_BLOCKED | {task['task_id']} | {path.relative_to(PROJECT)}")
@@ -1445,6 +1647,9 @@ def cmd_block(args) -> int:
 
 
 def cmd_wait(args) -> int:
+    _, _, current = locate(args.task_id)
+    if current.get("temporary_executor"):
+        raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
     task, path = transition(args.task_id, "wait", lambda item: item.update(block_reason=clean("reason", args.reason)))
     refresh_inboxes()
     print(f"TASK_WAITING_INPUT | {task['task_id']} | {path.relative_to(PROJECT)}")
@@ -1453,6 +1658,8 @@ def cmd_wait(args) -> int:
 
 def cmd_resume(args) -> int:
     _, _, current = locate(args.task_id)
+    if current.get("temporary_executor"):
+        raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
     authorization = current["authorization_state"]
     if authorization in {"user_required", "user_rejected"}:
         raise ValueError(f"当前授权状态禁止恢复: {authorization}")
@@ -1466,6 +1673,9 @@ def cmd_resume(args) -> int:
 
 
 def cmd_authorize(args) -> int:
+    _, _, current = locate(args.task_id)
+    if current.get("temporary_executor"):
+        raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
     evidence = clean("evidence", args.evidence, max_chars=1000)
     state = args.state
     if state not in {"user_required", "user_confirmed", "user_rejected"}:
@@ -1490,6 +1700,8 @@ def cmd_authorize(args) -> int:
 
 def cmd_complete(args) -> int:
     _, _, current = locate(args.task_id)
+    if current.get("temporary_executor"):
+        raise ValueError("临时外包必须通过 agent_team_temporary.py 固定候选并 submit")
     authorization = current["authorization_state"]
     if authorization in {"user_required", "user_rejected"}:
         raise ValueError(f"当前授权状态禁止完成: {authorization}")
@@ -1526,6 +1738,9 @@ def cmd_complete(args) -> int:
 
 
 def cmd_ack(args) -> int:
+    _, _, current = locate(args.task_id)
+    if current.get("temporary_executor"):
+        raise ValueError("临时外包必须通过 agent_team_temporary.py acknowledge")
     actor = clean("acknowledged-by", args.acknowledged_by, max_chars=200)
     expected = registered_lead_actor()
     if actor != expected:
@@ -1639,6 +1854,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
 import uuid
 from contextlib import contextmanager
@@ -1672,7 +1888,28 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
-COLLAB = Path(__file__).resolve().parents[1]
+def discover_control_root() -> Path:
+    local = Path(__file__).resolve().parents[1]
+    project = local.parents[1]
+    inside = subprocess.run(
+        ["git", "-C", str(project), "rev-parse", "--is-inside-work-tree"],
+        text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    result = subprocess.run(
+        ["git", "-C", str(project), "worktree", "list", "--porcelain"],
+        text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    if result.returncode == 0:
+        first = next((line[9:] for line in result.stdout.splitlines() if line.startswith("worktree ")), "")
+        candidate = Path(first) / "docs" / "collaboration" if first else None
+        if candidate is not None and candidate.is_dir() and not candidate.is_symlink():
+            return candidate.resolve(strict=True)
+    if (project / ".git").exists() or (inside.returncode == 0 and inside.stdout.strip() == "true"):
+        raise SystemExit("CONTROL_ROOT_ERROR | Git worktree 中无法验证主 docs/collaboration，拒绝写本地副本")
+    return local
+
+
+COLLAB = discover_control_root()
 STATE_FILE = COLLAB / "会话启动状态.json"
 REGISTRY_FILE = COLLAB / "部门表.md"
 LOCKS = COLLAB / ".locks"
@@ -3013,7 +3250,7 @@ UPGRADE_TASK_REQUIRED_FIELDS = {
     "created_at", "updated_at", "revision", "claimed_by", "block_reason", "artifacts", "external_artifacts",
     "verified", "unverified", "mistake_check", "report", "event_receipts",
 }
-UPGRADE_TASK_OPTIONAL_FIELDS = {"acknowledged_by"}
+UPGRADE_TASK_OPTIONAL_FIELDS = {"acknowledged_by", "impact_declaration", "temporary_executor", "temporary_operation_history"}
 UPGRADE_TASK_ID_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
 
 
@@ -3055,6 +3292,163 @@ def validate_upgrade_task_timestamp(value: object, field: str) -> dt.datetime:
     return parsed
 
 
+def validate_upgrade_impact(value: object, source: Path) -> None:
+    required = {"write_paths", "shared_contracts", "external_effects", "base_revision", "owner_task", "admission"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError(f"任务影响声明结构无效: {source}")
+    for field in ("write_paths", "shared_contracts", "external_effects"):
+        validate_upgrade_task_list(value[field], f"impact.{field}", min_items=1 if field != "shared_contracts" else 0, max_chars=500)
+    validate_upgrade_task_text(value["base_revision"], "impact.base_revision", max_chars=300)
+    validate_upgrade_task_text(value["owner_task"], "impact.owner_task", max_chars=100)
+    if value["admission"] not in {"safe", "manual", "unsafe", "waiting_base"}:
+        raise ValueError(f"任务影响声明 admission 无效: {source}")
+
+
+def validate_upgrade_operation_history(history: object, current_state: str, source: Path, label: str) -> None:
+    allowed_states = {"planned", "started", "succeeded", "verified", "failed"}
+    if not isinstance(history, list) or not history:
+        raise ValueError(f"temporary_executor {label} history 无效: {source}")
+    for event in history:
+        if not isinstance(event, dict) or set(event) - {"state", "at", "reason", "via"} or not {"state", "at"}.issubset(event):
+            raise ValueError(f"temporary_executor {label} history 事件结构无效: {source}")
+        if event["state"] not in allowed_states or not isinstance(event["at"], str) or not event["at"]:
+            raise ValueError(f"temporary_executor {label} history 事件内容无效: {source}")
+        for key in ("reason", "via"):
+            if key in event and (not isinstance(event[key], str) or not event[key]):
+                raise ValueError(f"temporary_executor {label} history {key} 无效: {source}")
+    if history[-1]["state"] != current_state:
+        raise ValueError(f"temporary_executor {label} 当前状态与 history 末项不一致: {source}")
+
+
+def validate_upgrade_temporary(value: object, source: Path, department: str) -> None:
+    required = {
+        "schema_version", "executor_type", "executor_id", "display_name", "parent_department",
+        "current_brief", "brief_revision", "impact", "workspace", "rule", "user_acceptance",
+        "promotion_state", "temporary_session", "attempt", "candidate_revision", "candidate",
+        "review", "delivery", "integration", "absorption", "operation",
+    }
+    optional = {"promotion_operation", "cleanup_operation"}
+    if not isinstance(value, dict) or required - set(value) or set(value) - required - optional:
+        raise ValueError(f"temporary_executor 结构无效: {source}")
+    if value["schema_version"] != 1 or value["executor_type"] != "temporary":
+        raise ValueError(f"temporary_executor 版本或类型无效: {source}")
+    if value["parent_department"] != department:
+        raise ValueError(f"temporary_executor 父部门与 TASK 不一致: {source}")
+    for field, limit in (("executor_id", 200), ("display_name", 100), ("current_brief", 2000)):
+        validate_upgrade_task_text(value[field], f"temporary_executor.{field}", max_chars=limit)
+    for field in ("brief_revision", "attempt", "candidate_revision"):
+        item = value[field]
+        if isinstance(item, bool) or not isinstance(item, int) or item < (0 if field == "candidate_revision" else 1):
+            raise ValueError(f"temporary_executor {field} 无效: {source}")
+    validate_upgrade_impact(value["impact"], source)
+    if value["promotion_state"] not in {
+        "not_submitted", "submitted", "reviewing", "waiting_base", "ready", "integrated",
+        "archived", "cancelled", "abandoned",
+    }:
+        raise ValueError(f"temporary_executor 晋升状态无效: {source}")
+    session = value["temporary_session"]
+    if not isinstance(session, dict) or session.get("state") not in {
+        "provisioning", "awaiting_rule_confirmation", "active", "standby", "archived", "failed", "cancelled",
+    }:
+        raise ValueError(f"temporary_executor 会话状态无效: {source}")
+    workspace = value["workspace"]
+    if not isinstance(workspace, dict) or not all(isinstance(workspace.get(key), str) for key in ("path", "branch", "base_revision", "state")):
+        raise ValueError(f"temporary_executor workspace 无效: {source}")
+    rule = value["rule"]
+    if not isinstance(rule, dict) or not all(isinstance(rule.get(key), str) for key in ("version", "digest", "source_protocol", "confirmed_at")):
+        raise ValueError(f"temporary_executor rule 无效: {source}")
+    acceptance = value["user_acceptance"]
+    if not isinstance(acceptance, dict) or acceptance.get("state") not in {
+        "pending", "confirmed", "rejected", "delegated", "not_applicable",
+    } or not isinstance(acceptance.get("candidate_revision"), int) or set(acceptance) - {
+        "state", "evidence", "candidate_revision", "candidate_digest",
+    } or not {"state", "evidence", "candidate_revision"}.issubset(acceptance):
+        raise ValueError(f"temporary_executor 用户验收无效: {source}")
+    if "candidate_digest" in acceptance and not isinstance(acceptance["candidate_digest"], str):
+        raise ValueError(f"temporary_executor 用户验收 digest 无效: {source}")
+    absorption = value["absorption"]
+    if not isinstance(absorption, dict) or any(
+        absorption.get(key) not in {"pending", "completed", "not_applicable"}
+        for key in ("preflight", "parent_department", "project_global", "final")
+    ) or not isinstance(absorption.get("receipts"), list):
+        raise ValueError(f"temporary_executor 知识吸收状态无效: {source}")
+    operation = value["operation"]
+    if not isinstance(operation, dict) or not all(isinstance(operation.get(key), str) and operation.get(key) for key in ("id", "client_key", "state")):
+        raise ValueError(f"temporary_executor operation 无效: {source}")
+    if operation["state"] not in {"planned", "started", "succeeded", "verified", "failed"}:
+        raise ValueError(f"temporary_executor operation state 无效: {source}")
+    if not isinstance(operation.get("resources"), list) or any(not isinstance(item, str) or not item for item in operation["resources"]):
+        raise ValueError(f"temporary_executor operation resources 无效: {source}")
+    for field in ("request_digest", "scan_boundary_evidence", "cleanup_evidence"):
+        if field in operation and (not isinstance(operation[field], str) or not operation[field]):
+            raise ValueError(f"temporary_executor operation {field} 无效: {source}")
+    if "history" in operation:
+        validate_upgrade_operation_history(operation["history"], operation["state"], source, "operation")
+    candidate = value["candidate"]
+    if candidate is not None:
+        required_candidate = {"revision", "kind", "locator", "digest", "brief_revision", "created_at"}
+        if not isinstance(candidate, dict) or set(candidate) != required_candidate:
+            raise ValueError(f"temporary_executor candidate 结构无效: {source}")
+        if not isinstance(candidate["revision"], int) or candidate["revision"] != value["candidate_revision"]:
+            raise ValueError(f"temporary_executor candidate revision 无效: {source}")
+        if not isinstance(candidate["brief_revision"], int) or candidate["brief_revision"] < 1:
+            raise ValueError(f"temporary_executor candidate brief_revision 无效: {source}")
+        for field in ("kind", "locator", "digest", "created_at"):
+            validate_upgrade_task_text(candidate[field], f"candidate.{field}", max_chars=500)
+    review = value["review"]
+    if review is not None:
+        if not isinstance(review, dict) or set(review) != {"candidate_revision", "decision", "evidence", "reviewed_at"}:
+            raise ValueError(f"temporary_executor review 结构无效: {source}")
+        if not isinstance(review["candidate_revision"], int) or review["decision"] not in {"pass", "fail"}:
+            raise ValueError(f"temporary_executor review 内容无效: {source}")
+    delivery = value["delivery"]
+    if delivery is not None:
+        required_delivery = {"candidate_revision", "locator", "digest", "protected_ref", "evidence", "submitted_at"}
+        if not isinstance(delivery, dict) or set(delivery) != required_delivery or not isinstance(delivery["candidate_revision"], int):
+            raise ValueError(f"temporary_executor delivery 结构无效: {source}")
+        for field in required_delivery - {"candidate_revision"}:
+            validate_upgrade_task_text(delivery[field], f"delivery.{field}", max_chars=1000)
+        if candidate is not None and (
+            delivery["candidate_revision"] != candidate["revision"]
+            or delivery["locator"] != candidate["locator"] or delivery["digest"] != candidate["digest"]
+        ):
+            raise ValueError(f"temporary_executor delivery 与 candidate 不一致: {source}")
+    if review is not None and candidate is not None and review["candidate_revision"] != candidate["revision"]:
+        raise ValueError(f"temporary_executor review 与 candidate revision 不一致: {source}")
+    if candidate is not None and acceptance.get("candidate_digest") and acceptance["state"] in {"confirmed", "delegated", "not_applicable"}:
+        if acceptance["candidate_revision"] != candidate["revision"] or acceptance["candidate_digest"] != candidate["digest"]:
+            raise ValueError(f"temporary_executor 用户验收与 candidate 不一致: {source}")
+    integration = value["integration"]
+    if integration is not None:
+        legacy_required = {
+            "candidate_commit", "tested_base", "tested_commit", "tree_oid", "test_definition",
+            "environment", "evidence", "unverified", "result", "tested_at",
+        }
+        current_extra = {"test_task_id", "report"}
+        optional_integration = {"promoted_at", "main_branch"}
+        if not isinstance(integration, dict) or legacy_required - set(integration) or set(integration) - legacy_required - current_extra - optional_integration:
+            raise ValueError(f"temporary_executor integration 结构无效: {source}")
+        if integration["result"] not in {"pass", "fail"}:
+            raise ValueError(f"temporary_executor integration result 无效: {source}")
+        for field in legacy_required - {"result"}:
+            validate_upgrade_task_text(integration[field], f"integration.{field}", max_chars=2000)
+        for field in current_extra & set(integration):
+            validate_upgrade_task_text(integration[field], f"integration.{field}", max_chars=1000)
+    for field, required_record in (
+        ("promotion_operation", {"id", "state", "main_branch", "expected_old", "candidate_commit", "tree_oid", "history"}),
+        ("cleanup_operation", {"id", "state", "workspace", "branch", "workspace_head", "evidence", "history"}),
+    ):
+        record = value.get(field)
+        if record is not None:
+            if not isinstance(record, dict) or set(record) != required_record or not isinstance(record["history"], list):
+                raise ValueError(f"temporary_executor {field} 结构无效: {source}")
+            for key in required_record - {"history"}:
+                validate_upgrade_task_text(record[key], f"{field}.{key}", max_chars=1000)
+            if record["state"] not in {"planned", "started", "succeeded", "verified", "failed"}:
+                raise ValueError(f"temporary_executor {field} state 无效: {source}")
+            validate_upgrade_operation_history(record["history"], record["state"], source, field)
+
+
 def validate_upgrade_task_payload(payload: object, source: Path, departments: set[str], expected_state: str | None) -> None:
     if not isinstance(payload, dict):
         raise ValueError(f"任务根节点必须是 JSON 对象: {source}")
@@ -3064,6 +3458,10 @@ def validate_upgrade_task_payload(payload: object, source: Path, departments: se
         raise ValueError("任务字段缺失: " + ", ".join(missing))
     if unknown:
         raise ValueError("任务含当前 schema 未定义字段: " + ", ".join(unknown))
+    if "impact_declaration" in payload:
+        validate_upgrade_impact(payload["impact_declaration"], source)
+    if "temporary_executor" in payload:
+        validate_upgrade_temporary(payload["temporary_executor"], source, payload.get("department", ""))
     schema_version = payload["schema_version"]
     if isinstance(schema_version, bool) or schema_version != 1:
         raise ValueError(f"不支持的任务版本: {source}")
@@ -3276,6 +3674,7 @@ def run_upgrade(collab: Path) -> int:
         collab / "scripts" / "agent_team_log.py": (log_writer_script(), 0o755),
         collab / "scripts" / "agent_team_task.py": (task_writer_script(), 0o755),
         collab / "scripts" / "agent_team_session.py": (session_state_script(), 0o755),
+        collab / "scripts" / "agent_team_temporary.py": (temporary_executor_script(), 0o755),
     }
     obsolete = [collab / "读取路由规则.md", collab / "scripts" / "agent_team_read.py"]
     for key in roles:
@@ -3670,6 +4069,8 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
         write_utf8_atomic(task_writer, task_writer_script(), mode=0o755)
         session_writer = scripts_dir / "agent_team_session.py"
         write_utf8_atomic(session_writer, session_state_script(), mode=0o755)
+        temporary_writer = scripts_dir / "agent_team_temporary.py"
+        write_utf8_atomic(temporary_writer, temporary_executor_script(), mode=0o755)
         locks_dir = build_collab / ".locks"
         locks_dir.mkdir(mode=0o700)
         tasks_dir = build_collab / "tasks"

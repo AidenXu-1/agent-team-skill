@@ -106,18 +106,18 @@ def verify_generated(project: Path) -> None:
         "协议版本.json", "README.md", "路由表.md", "部门表.md", "会话启动清单.md",
         "会话启动状态.json", "任务交接模板.md", "模板/工作报告.md", "模板/审核报告.md",
         "模板/专项结论.md", "scripts/agent_team_log.py", "scripts/agent_team_task.py",
-        "scripts/agent_team_session.py",
+        "scripts/agent_team_session.py", "scripts/agent_team_temporary.py",
     ]
     for relative in required:
         check((collab / relative).is_file(), f"missing generated file: {relative}")
     check(not (collab / "读取路由规则.md").exists(), "obsolete reading rules generated")
     check(not (collab / "scripts" / "agent_team_read.py").exists(), "obsolete reader generated")
     protocol = json.loads((collab / "协议版本.json").read_text(encoding="utf-8"))
-    check(protocol["protocol_version"] == "1.3.1", "unexpected protocol version")
+    check(protocol["protocol_version"] == "1.4.1", "unexpected protocol version")
     for script in (collab / "scripts").glob("*.py"):
         py_compile.compile(str(script), doraise=True)
     guide = (project / "docs" / "agent-guide.md").read_text(encoding="utf-8")
-    check("受管协议版本:1.3.1" in guide and "任务真值" in guide, "project guide not refreshed")
+    check("受管协议版本:1.4.1" in guide and "任务真值" in guide, "project guide not refreshed")
     for department in ("统筹部", "执行部", "检验部"):
         root = collab / "部门" / department
         check((root / "报告").is_dir() and (root / "日志").is_dir(), "department output directories missing")
@@ -443,6 +443,11 @@ def verify_log_and_session(project: Path, root: Path) -> None:
         ], ok=False)
         check("硬链接" in denied.stderr, "hard-linked log was writable")
         log_path.unlink()
+    log_path.write_text(
+        f"---\n部门: 执行部\n覆盖: legacy\n---\n\n# 执行部 · 旧平铺日志\n\n"
+        "- 2026-01-01T00:00+08:00 | DEC-LEGACY | DECISION | task:PROJECT | legacy-event\n",
+        encoding="utf-8",
+    )
     receipt = run([
         sys.executable, str(log_tool), "append", "--department", "执行部", "--task-id", "PROJECT",
         "--type", "DECISION", "--initiator", "user", "--fact", "选择稳定任务路径",
@@ -450,6 +455,31 @@ def verify_log_and_session(project: Path, root: Path) -> None:
         "--pointer", "docs/collaboration/任务交接模板.md",
     ])
     check(receipt.stdout.startswith("LOG_OK |"), "log receipt malformed")
+    first_task = next((project / "docs" / "collaboration" / "tasks").glob("TASK-*.json")).stem
+    spoofed_temporary = run([
+        sys.executable, str(log_tool), "append", "--department", "执行部", "--task-id", first_task,
+        "--type", "CHANGE", "--initiator", "user", "--fact", "临时外包任务内目标调整",
+        "--trigger", "用户直接沟通", "--impact", "当前 TASK", "--result", "已同步当前 brief",
+        "--pointer", f"docs/collaboration/tasks/{first_task}.json",
+        "--executor-type", "temporary", "--executor-id", "temp-executor-1",
+        "--parent-department", "执行部",
+    ], ok=False)
+    check("未绑定临时执行者" in spoofed_temporary.stderr, "ordinary TASK spoofed a temporary log identity")
+    log_text = log_path.read_text(encoding="utf-8")
+    check(log_text.count("<!-- agent-team:formal-log:start -->") == 1, "formal log section marker missing")
+    check(log_text.count("<!-- agent-team:temporary-log:start -->") == 1, "temporary log section marker missing")
+    check(log_text.count("DEC-LEGACY") == 1 and log_text.index("DEC-LEGACY") < log_text.index("executor_type:formal"),
+          "legacy flat log event was not preserved in the formal section")
+    formal_position = log_text.index("executor_type:formal")
+    check(formal_position < log_text.index("<!-- agent-team:formal-log:end -->"), "formal event escaped formal section")
+    wrong_parent = run([
+        sys.executable, str(log_tool), "append", "--department", "执行部", "--task-id", first_task,
+        "--type", "MILESTONE", "--initiator", "agent", "--fact", "错误父部门",
+        "--result", "应拒绝", "--pointer", f"docs/collaboration/tasks/{first_task}.json",
+        "--executor-type", "temporary", "--executor-id", "temp-executor-1",
+        "--parent-department", "统筹部",
+    ], ok=False)
+    check("必须写入父部门周日志" in wrong_parent.stderr, "temporary log crossed parent department")
 
     session = collab / "scripts" / "agent_team_session.py"
     run([sys.executable, str(session), "mark", "--department", "执行部", "--step", "created",
@@ -484,6 +514,542 @@ def verify_log_and_session(project: Path, root: Path) -> None:
     check(state["departments"]["执行部"]["notification_mode"] == "auto", "notification mode did not persist")
     registry = (collab / "部门表.md").read_text(encoding="utf-8")
     check("thread-2" in registry and "auto" in registry, "session index was not refreshed")
+
+
+def verify_temporary_executor(root: Path) -> None:
+    project = make_project(root, "temporary-executor")
+    (project / ".gitignore").write_text("/.agent-team/\n", encoding="utf-8")
+    (project / "app").mkdir()
+    (project / "app" / "base.py").write_text("VALUE = 'base'\n", encoding="utf-8")
+    run(["git", "init", "-b", "main"], cwd=project)
+    run(["git", "config", "user.name", "Agent Team Verify"], cwd=project)
+    run(["git", "config", "user.email", "verify@example.invalid"], cwd=project)
+    run(["git", "add", "."], cwd=project)
+    run(["git", "commit", "-m", "foundation"], cwd=project)
+    scaffold(project, "lead,design,dev,test")
+    run(["git", "add", "."], cwd=project)
+    run(["git", "commit", "-m", "agent team collaboration"], cwd=project)
+
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    temporary_tool = collab / "scripts" / "agent_team_temporary.py"
+    session_tool = collab / "scripts" / "agent_team_session.py"
+    for step, evidence in (("created", "lead-create"), ("onboarded", "lead-onboard"), ("registered", "lead-register")):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", "统筹部", "--step", step,
+            "--thread-id", "lead-thread", "--evidence", evidence,
+        ])
+
+    def enqueue_dev(title: str, auth: str, evidence: str = "") -> str:
+        args = [
+            sys.executable, str(task_tool), "enqueue", "--department", "开发部",
+            "--from-department", "统筹部", "--title", title, "--node", "开发节点",
+            "--details", title, "--acceptance-exit", "可复验交付", "--failure-path", "越界时拒绝",
+            "--authorization-state", auth,
+        ]
+        if evidence:
+            args += ["--authorization-evidence", evidence]
+        return task_id_from(run(args))
+
+    formal = enqueue_dev("正式任务 A", "none")
+    run([sys.executable, str(task_tool), "claim", "--task-id", formal, "--claimed-by", "dev-session"])
+    temporary = enqueue_dev("临时任务 B", "user_confirmed", "user-requested-temporary-outsourcing")
+
+    manual = run([
+        sys.executable, str(temporary_tool), "preflight", "--task-id", temporary,
+        "--parent-department", "开发部", "--write-path", "app/b.py",
+    ], ok=False)
+    check("TEMP_ADMISSION_MANUAL" in manual.stdout, "missing formal impact declaration claimed safe admission")
+    run([sys.executable, str(task_tool), "block", "--task-id", formal, "--reason", "等待正式依赖"])
+    blocked_manual = run([
+        sys.executable, str(temporary_tool), "preflight", "--task-id", temporary,
+        "--parent-department", "开发部", "--write-path", "app/b.py",
+    ], ok=False)
+    check("TEMP_ADMISSION_MANUAL" in blocked_manual.stdout,
+          "blocked formal task without impact declaration disappeared from admission")
+
+    formal_path = collab / "tasks" / f"{formal}.json"
+    formal_revision = json.loads(formal_path.read_text(encoding="utf-8"))["revision"]
+    run([
+        sys.executable, str(temporary_tool), "declare-impact", "--task-id", formal,
+        "--expected-revision", str(formal_revision), "--base-revision", "HEAD",
+        "--write-path", "app/a.py", "--shared-contract", "auth-v1",
+    ])
+    run([sys.executable, str(task_tool), "resume", "--task-id", formal])
+    unsafe = run([
+        sys.executable, str(temporary_tool), "preflight", "--task-id", temporary,
+        "--parent-department", "开发部", "--write-path", "app/b.py",
+        "--shared-contract", "auth-v1",
+    ], ok=False)
+    check("TEMP_ADMISSION_UNSAFE" in unsafe.stdout, "shared contract overlap was not rejected")
+    exclude_file = project / ".git" / "info" / "exclude"
+    original_exclude = exclude_file.read_text(encoding="utf-8")
+    exclude_file.write_text(original_exclude + "\napp/b.py\n", encoding="utf-8")
+    (project / "app" / "b.py").write_text("IGNORED = True\n", encoding="utf-8")
+    ignored_manual = run([
+        sys.executable, str(temporary_tool), "preflight", "--task-id", temporary,
+        "--parent-department", "开发部", "--write-path", "app/b.py",
+    ], ok=False)
+    check("TEMP_ADMISSION_MANUAL" in ignored_manual.stdout and "ignored" in ignored_manual.stdout,
+          "ignored content inside write scope claimed safe admission")
+    (project / "app" / "b.py").unlink()
+    exclude_file.write_text(original_exclude, encoding="utf-8")
+
+    design_task = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--department", "设计部", "--from-department", "统筹部",
+        "--title", "临时设计任务", "--node", "设计节点", "--details", "验证通用父部门模型",
+        "--acceptance-exit", "设计产物可复验", "--failure-path", "父部门写死时拒绝",
+        "--authorization-state", "user_confirmed", "--authorization-evidence", "user-requested-design-outsourcing",
+    ]))
+    design_preflight = run([
+        sys.executable, str(temporary_tool), "preflight", "--task-id", design_task,
+        "--parent-department", "设计部", "--write-path", "design/card.svg",
+    ])
+    check("TEMP_ADMISSION_SAFE" in design_preflight.stdout, "temporary executor model was hard-coded to development")
+    design_execution_denied = run([
+        sys.executable, str(temporary_tool), "provision", "--task-id", design_task,
+        "--parent-department", "设计部", "--executor-id", "temp-design-1",
+        "--display-name", "临时设计外包", "--current-brief", "设计卡片",
+        "--client-key", "client-temp-design", "--scan-boundary-evidence", "已检查扫描边界",
+        "--base-revision", "HEAD", "--write-path", "design/card.svg",
+    ], ok=False)
+    check("只支持临时开发外包" in design_execution_denied.stderr,
+          "non-development parent entered an unimplemented professional delivery chain")
+
+    provisioned = run([
+        sys.executable, str(temporary_tool), "provision", "--task-id", temporary,
+        "--parent-department", "开发部", "--executor-id", "temp-dev-1",
+        "--display-name", "临时开发外包", "--current-brief", "新增独立模块 B",
+        "--client-key", "client-temp-b", "--scan-boundary-evidence", "已检查 watcher 与构建扫描不包含 /.agent-team/",
+        "--base-revision", "HEAD", "--write-path", "app/b.py",
+    ])
+    check(provisioned.stdout.startswith("TEMP_PROVISION_OK |"), "temporary workspace was not provisioned")
+    idempotent = run([
+        sys.executable, str(temporary_tool), "provision", "--task-id", temporary,
+        "--parent-department", "开发部", "--executor-id", "temp-dev-1",
+        "--display-name", "临时开发外包", "--current-brief", "新增独立模块 B",
+        "--client-key", "client-temp-b", "--scan-boundary-evidence", "已检查 watcher 与构建扫描不包含 /.agent-team/",
+        "--base-revision", "HEAD", "--write-path", "app/b.py",
+    ])
+    check(idempotent.stdout.startswith("TEMP_PROVISION_IDEMPOTENT |"), "provision retry was not idempotent")
+    idempotency_conflict = run([
+        sys.executable, str(temporary_tool), "provision", "--task-id", temporary,
+        "--parent-department", "开发部", "--executor-id", "different-executor",
+        "--display-name", "伪造重试", "--current-brief", "不同请求",
+        "--client-key", "client-temp-b", "--scan-boundary-evidence", "不同扫描声明",
+        "--base-revision", "HEAD", "--write-path", "app/other.py",
+    ], ok=False)
+    check("IDEMPOTENCY_CONFLICT" in idempotency_conflict.stderr,
+          "same client key accepted a different provision request")
+
+    task_path = collab / "tasks" / f"{temporary}.json"
+    legacy_payload = json.loads(task_path.read_text(encoding="utf-8"))
+    legacy_temp = legacy_payload["temporary_executor"]
+    legacy_temp.pop("promotion_operation")
+    legacy_temp.pop("cleanup_operation")
+    legacy_temp["operation"].pop("request_digest")
+    legacy_temp["operation"].pop("history")
+    task_path.write_text(json.dumps(legacy_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    payload = json.loads(task_path.read_text(encoding="utf-8"))
+    temp = payload["temporary_executor"]
+    workspace = project / temp["workspace"]["path"]
+    rule = workspace / ".agent-team" / "临时执行规则.md"
+    check(rule.is_file() and "专业质量标准" in rule.read_text(encoding="utf-8"), "temporary rule missing")
+    no_rule_candidate = run([
+        sys.executable, str(temporary_tool), "candidate", "--task-id", temporary, "--commit", "HEAD",
+    ], ok=False)
+    check("尚未 active" in no_rule_candidate.stderr,
+          f"candidate bypassed temporary rule confirmation: {no_rule_candidate.stderr.strip()}")
+    normalized_temp = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]
+    check("promotion_operation" in normalized_temp and "cleanup_operation" in normalized_temp
+          and normalized_temp["operation"]["request_digest"] == "legacy-unknown",
+          "1.4.0 temporary TASK did not normalize safely for 1.4.1")
+    copied_scripts = workspace / "docs" / "collaboration" / "scripts"
+    copied_task_list = run([sys.executable, str(copied_scripts / "agent_team_task.py"), "list"])
+    check(temporary in copied_task_list.stdout, "worktree task tool read the non-authoritative TASK copy")
+    copied_session_show = run([sys.executable, str(copied_scripts / "agent_team_session.py"), "show"])
+    check("开发部" in copied_session_show.stdout, "worktree session tool missed the main control root")
+    copied_log = run([
+        sys.executable, str(copied_scripts / "agent_team_log.py"), "append",
+        "--department", "开发部", "--task-id", temporary, "--type", "MILESTONE",
+        "--initiator", "agent", "--fact", "临时 workspace 已验证", "--result", "主控制根保持唯一",
+        "--pointer", f"docs/collaboration/tasks/{temporary}.json", "--executor-type", "temporary",
+        "--executor-id", "temp-dev-1", "--parent-department", "开发部",
+    ])
+    check(copied_log.stdout.startswith("LOG_OK |"), "worktree log tool failed to route to main control root")
+    spoofed_parent = run([
+        sys.executable, str(copied_scripts / "agent_team_log.py"), "append",
+        "--department", "设计部", "--task-id", temporary, "--type", "MILESTONE",
+        "--initiator", "agent", "--fact", "伪造父部门", "--result", "必须拒绝",
+        "--pointer", f"docs/collaboration/tasks/{temporary}.json", "--executor-type", "temporary",
+        "--executor-id", "temp-dev-1", "--parent-department", "设计部",
+    ], ok=False)
+    check("TASK 真值不一致" in spoofed_parent.stderr, "temporary log spoofed a different parent department")
+    main_logs = collab / "部门" / "开发部" / "日志"
+    check(any("临时 workspace 已验证" in path.read_text(encoding="utf-8") for path in main_logs.glob("*.md")),
+          "worktree log tool wrote into the non-authoritative collaboration copy")
+    copied_logs = workspace / "docs" / "collaboration" / "部门" / "开发部" / "日志"
+    check(not list(copied_logs.glob("*.md")), "non-authoritative worktree log copy was mutated")
+    hidden_control = project / "docs" / "collaboration-hidden"
+    collab.rename(hidden_control)
+    try:
+        control_root_failure = run([
+            sys.executable, str(copied_scripts / "agent_team_log.py"), "append",
+            "--department", "开发部", "--task-id", temporary, "--type", "MILESTONE",
+            "--initiator", "agent", "--fact", "主控制根缺失", "--result", "必须停止",
+            "--pointer", "docs/spec.md", "--executor-type", "temporary",
+            "--executor-id", "temp-dev-1", "--parent-department", "开发部",
+        ], ok=False)
+        check("CONTROL_ROOT_ERROR" in control_root_failure.stderr,
+              "worktree tool silently fell back to the non-authoritative control copy")
+        check(not list(copied_logs.glob("*.md")), "control-root failure mutated the worktree copy")
+    finally:
+        hidden_control.rename(collab)
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "active", "--thread-id", "temporary-thread-1",
+        "--rule-digest", temp["rule"]["digest"], "--evidence", "rule-read-confirmed",
+    ])
+    ordinary_block = run([
+        sys.executable, str(task_tool), "block", "--task-id", temporary, "--reason", "普通工具越权",
+    ], ok=False)
+    check("只能通过 agent_team_temporary.py" in ordinary_block.stderr,
+          "ordinary task tool mutated temporary lifecycle axes")
+    run([
+        sys.executable, str(temporary_tool), "pause", "--task-id", temporary,
+        "--state", "blocked", "--reason", "等待独立依赖",
+    ])
+    resumed = run([
+        sys.executable, str(temporary_tool), "resume", "--task-id", temporary,
+        "--evidence", "dependency-ready",
+    ])
+    check("active" in resumed.stdout, "temporary pause/resume lost confirmed rule state")
+    amended = run([
+        sys.executable, str(temporary_tool), "amend", "--task-id", temporary,
+        "--expected-brief-revision", "1", "--current-brief", "新增独立模块 B 并保留现有接口",
+        "--write-path", "app/b.py",
+    ])
+    check("brief_revision:2" in amended.stdout and "admission:safe" in amended.stdout,
+          "brief amend did not re-run admission atomically")
+    amended_payload = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]
+    check(amended_payload["attempt"] == 2 and amended_payload["integration"] is None
+          and amended_payload["rule"]["confirmed_at"] == ""
+          and amended_payload["temporary_session"]["state"] == "awaiting_rule_confirmation",
+          "brief amend retained stale attempt, integration, or rule confirmation")
+    amended_rule_text = rule.read_text(encoding="utf-8")
+    check("新增独立模块 B 并保留现有接口" in amended_rule_text,
+          "brief amend did not regenerate the temporary rule")
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "active", "--thread-id", "temporary-thread-1",
+        "--rule-digest", amended_payload["rule"]["digest"], "--evidence", "amended-rule-read-confirmed",
+    ])
+    before_stale_amend = task_path.read_bytes()
+    stale_amend = run([
+        sys.executable, str(temporary_tool), "amend", "--task-id", temporary,
+        "--expected-brief-revision", "1", "--current-brief", "过期修改",
+        "--write-path", "app/b.py",
+    ], ok=False)
+    check("已过期" in stale_amend.stderr and task_path.read_bytes() == before_stale_amend,
+          "stale brief amend mutated TASK truth")
+
+    (workspace / "app" / "b.py").write_text("VALUE = 'temporary-b'\n", encoding="utf-8")
+    run(["git", "add", "app/b.py"], cwd=workspace)
+    run(["git", "commit", "-m", "add temporary module b"], cwd=workspace)
+    candidate = run([sys.executable, str(temporary_tool), "candidate", "--task-id", temporary, "--commit", "HEAD"])
+    check(candidate.stdout.startswith("TEMP_CANDIDATE_OK |"), "candidate was not frozen")
+    run([
+        sys.executable, str(temporary_tool), "accept", "--task-id", temporary,
+        "--state", "confirmed", "--evidence", "user-approved-first-candidate",
+    ])
+    (workspace / "app" / "b.py").write_text("VALUE = 'temporary-b-v2'\n", encoding="utf-8")
+    run(["git", "add", "app/b.py"], cwd=workspace)
+    run(["git", "commit", "-m", "revise temporary module b"], cwd=workspace)
+    run([sys.executable, str(temporary_tool), "candidate", "--task-id", temporary, "--commit", "HEAD"])
+    stale_acceptance_submit = run([
+        sys.executable, str(temporary_tool), "submit", "--task-id", temporary,
+        "--candidate-revision", "3", "--evidence", "must-not-reuse-old-user-approval",
+    ], ok=False)
+    check("当前候选尚未获得用户确认" in stale_acceptance_submit.stderr,
+          "old user acceptance was automatically attached to a different candidate")
+    run([
+        sys.executable, str(temporary_tool), "accept", "--task-id", temporary,
+        "--state", "confirmed", "--evidence", "user-approved-second-candidate",
+    ])
+    run([
+        sys.executable, str(temporary_tool), "review", "--task-id", temporary,
+        "--candidate-revision", "3", "--decision", "pass", "--evidence", "blind-review-pass",
+    ])
+    rule.write_text(rule.read_text(encoding="utf-8") + "\n未登记篡改\n", encoding="utf-8")
+    tampered_rule_submit = run([
+        sys.executable, str(temporary_tool), "submit", "--task-id", temporary,
+        "--candidate-revision", "3", "--evidence", "must-not-submit-tampered-rule",
+    ], ok=False)
+    check("旧确认失效" in tampered_rule_submit.stderr, "submit accepted a rule changed after confirmation")
+    reconciled_rule = run([
+        sys.executable, str(temporary_tool), "reconcile-rule", "--task-id", temporary,
+        "--evidence", "restored-rule-from-task-truth",
+    ])
+    check(reconciled_rule.stdout.startswith("TEMP_RULE_RECONCILE_OK |"), "rule mismatch could not reconcile")
+    reconciled_rule_digest = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]["rule"]["digest"]
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "active", "--thread-id", "temporary-thread-1",
+        "--rule-digest", reconciled_rule_digest, "--evidence", "reconciled-rule-confirmed",
+    ])
+    submitted = run([
+        sys.executable, str(temporary_tool), "submit", "--task-id", temporary,
+        "--candidate-revision", "3", "--evidence", "delivery-submitted",
+    ])
+    check(submitted.stdout.startswith("TEMP_SUBMIT_OK |"), "delivery was not submitted")
+    run([
+        sys.executable, str(temporary_tool), "acknowledge", "--task-id", temporary,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(temporary_tool), "absorb", "--task-id", temporary,
+        "--scope", "preflight", "--state", "completed", "--evidence", "first-delivery-inventory-complete",
+    ])
+    reworked = run([
+        sys.executable, str(temporary_tool), "rework", "--task-id", temporary,
+        "--evidence", "formal-review-requested-rework",
+    ])
+    check("attempt:3" in reworked.stdout, "formal rework did not advance attempt")
+    reworked_temp = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]
+    check(reworked_temp["delivery"] is None and reworked_temp["integration"] is None
+          and reworked_temp["temporary_session"]["state"] == "awaiting_rule_confirmation",
+          "rework retained stale delivery, integration, or rule confirmation")
+    check(reworked_temp["absorption"]["preflight"] == "pending"
+          and reworked_temp["absorption"]["receipts"] == []
+          and reworked_temp["absorption"]["history"][-1]["attempt"] == 2
+          and reworked_temp["absorption"]["history"][-1]["snapshot"]["preflight"] == "completed",
+          "rework retained active absorption evidence or lost its invalidation history")
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "active", "--thread-id", "temporary-thread-1",
+        "--rule-digest", reworked_temp["rule"]["digest"], "--evidence", "rework-rule-confirmed",
+    ])
+    run([sys.executable, str(temporary_tool), "candidate", "--task-id", temporary, "--commit", "HEAD"])
+    run([
+        sys.executable, str(temporary_tool), "accept", "--task-id", temporary,
+        "--state", "confirmed", "--evidence", "user-approved-rework",
+    ])
+    run([
+        sys.executable, str(temporary_tool), "review", "--task-id", temporary,
+        "--candidate-revision", "5", "--decision", "pass", "--evidence", "rework-review-pass",
+    ])
+    run([
+        sys.executable, str(temporary_tool), "submit", "--task-id", temporary,
+        "--candidate-revision", "5", "--evidence", "rework-delivery-submitted",
+    ])
+    premature_absorption = run([
+        sys.executable, str(temporary_tool), "absorb", "--task-id", temporary,
+        "--scope", "preflight", "--state", "completed", "--evidence", "too-early",
+    ], ok=False)
+    check("统筹接管" in premature_absorption.stderr, "knowledge absorption started before lead takeover")
+    run([
+        sys.executable, str(temporary_tool), "acknowledge", "--task-id", temporary,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    early_cleanup = run([
+        sys.executable, str(temporary_tool), "cleanup", "--task-id", temporary,
+        "--evidence", "must-not-clean-before-integration",
+    ], ok=False)
+    check("integrated" in early_cleanup.stderr and workspace.exists(), "unintegrated delivery was cleaned")
+    run([
+        sys.executable, str(temporary_tool), "absorb", "--task-id", temporary,
+        "--scope", "preflight", "--state", "completed", "--evidence", "acceptance-contract-checked",
+    ])
+    premature_final = run([
+        sys.executable, str(temporary_tool), "absorb", "--task-id", temporary,
+        "--scope", "parent-department", "--state", "completed", "--evidence", "too-early",
+    ], ok=False)
+    check("integrated" in premature_final.stderr, "final knowledge absorption closed before formal integration")
+
+    delivery = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]["delivery"]["locator"]
+    tested_base = run(["git", "rev-parse", "main"], cwd=project).stdout.strip()
+    delivery_tree = run(["git", "rev-parse", f"{delivery}^{{tree}}"], cwd=project).stdout.strip()
+    run([sys.executable, "-m", "py_compile", str(workspace / "app" / "b.py")])
+    test_task = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--department", "测试部", "--from-department", "统筹部",
+        "--title", "验证临时交付合并候选", "--node", "正式测试", "--details", "运行真实候选测试并绑定 commit/tree",
+        "--acceptance-exit", "正式报告绑定已测试 tree", "--failure-path", "测试证据与候选不一致",
+        "--authorization-state", "none", "--pointer", f"docs/collaboration/tasks/{temporary}.json",
+    ]))
+    run([sys.executable, str(task_tool), "claim", "--task-id", test_task, "--claimed-by", "test-session"])
+    report = collab / "部门" / "测试部" / "报告" / "temporary-integration-test.md"
+    report.write_text(f"""---
+type: audit_report
+department: 测试部
+target: {temporary}
+status: final
+date: {dt.date.today().isoformat()}
+related_task: {test_task}
+decision: pass
+tags: [temporary-executor, integration]
+summary: 已运行候选编译与定向回归
+tested_commit: {delivery}
+tested_tree: {delivery_tree}
+result: pass
+---
+
+# 正式测试
+
+实际运行 Python 编译检查，候选通过。
+""", encoding="utf-8")
+    report_relative = report.relative_to(project).as_posix()
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", test_task,
+        "--artifact", report_relative, "--report", report_relative,
+        "--verified", "实际运行候选 Python 编译检查并核对 commit/tree",
+        "--unverified", "无", "--mistake-check", "未使用自填字符串代替正式报告",
+    ])
+    run([sys.executable, str(task_tool), "ack", "--task-id", test_task, "--acknowledged-by", "统筹部/lead-thread"])
+    fake_test_evidence = run([
+        sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
+        "--tested-base", tested_base, "--commit", delivery, "--test-definition", "fake",
+        "--environment", "fake", "--evidence", "plain-text-pass", "--result", "pass",
+        "--test-task-id", temporary, "--report", report_relative,
+    ], ok=False)
+    check("审核层 TASK" in fake_test_evidence.stderr, "plain caller text impersonated formal test evidence")
+    run([
+        sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
+        "--tested-base", tested_base, "--commit", delivery, "--test-definition", "compile and targeted regression",
+        "--environment", "temporary verifier", "--evidence", report_relative, "--result", "pass",
+        "--test-task-id", test_task, "--report", report_relative,
+    ])
+    before_post_test_amend = task_path.read_bytes()
+    post_test_amend = run([
+        sys.executable, str(temporary_tool), "amend", "--task-id", temporary,
+        "--expected-brief-revision", "2", "--current-brief", "测试后实质新需求",
+        "--write-path", "app/b.py",
+    ], ok=False)
+    check("必须先 rework" in post_test_amend.stderr and task_path.read_bytes() == before_post_test_amend,
+          "post-test amend retained or reused stale integration evidence")
+    drift_tree = run(["git", "rev-parse", f"{tested_base}^{{tree}}"], cwd=project).stdout.strip()
+    drift_commit = run(
+        ["git", "commit-tree", drift_tree, "-p", tested_base, "-m", "simulated main drift"], cwd=project,
+    ).stdout.strip()
+    run(["git", "branch", "drift-main", drift_commit], cwd=project)
+    drift_denied = run([
+        sys.executable, str(temporary_tool), "promote", "--task-id", temporary, "--main-branch", "drift-main",
+    ], ok=False)
+    check("main 已漂移" in drift_denied.stderr, "main drift reused stale test evidence")
+    promoted = run([
+        sys.executable, str(temporary_tool), "promote", "--task-id", temporary, "--main-branch", "main",
+    ])
+    check(promoted.stdout.startswith("TEMP_PROMOTE_OK |"), "tested tree was not promoted")
+    check((project / "app" / "b.py").is_file(), "promoted product tree missing temporary delivery")
+    promotion_crash = json.loads(task_path.read_text(encoding="utf-8"))
+    promotion_crash_temp = promotion_crash["temporary_executor"]
+    promotion_crash_temp["promotion_state"] = "ready"
+    promotion_crash_temp["promotion_operation"]["state"] = "started"
+    promotion_crash_temp["promotion_operation"]["history"].append({
+        "state": "started", "at": dt.datetime.now(dt.timezone.utc).isoformat(), "via": "simulated-crash",
+    })
+    promotion_crash_temp["integration"].pop("promoted_at", None)
+    promotion_crash_temp["integration"].pop("main_branch", None)
+    task_path.write_text(json.dumps(promotion_crash, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    reconciled_promotion = run([
+        sys.executable, str(temporary_tool), "reconcile-promotion", "--task-id", temporary,
+    ])
+    check("integrated" in reconciled_promotion.stdout,
+          "promotion crash after Git update could not reconcile TASK truth")
+
+    for scope, state, evidence in (
+        ("parent-department", "completed", "development-knowledge-absorbed"),
+        ("project-global", "not_applicable", "no-global-contract-change"),
+        ("final", "completed", "absorption-gate-closed"),
+    ):
+        run([
+            sys.executable, str(temporary_tool), "absorb", "--task-id", temporary,
+            "--scope", scope, "--state", state, "--evidence", evidence,
+        ])
+    delivery_record = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]["delivery"]
+    run(["git", "update-ref", "-d", delivery_record["protected_ref"]], cwd=project)
+    missing_protection_cleanup = run([
+        sys.executable, str(temporary_tool), "cleanup", "--task-id", temporary,
+        "--evidence", "must-not-clean-without-protected-delivery",
+    ], ok=False)
+    check("保护 ref 缺失" in missing_protection_cleanup.stderr and workspace.exists(),
+          "cleanup removed the only delivery evidence")
+    run(["git", "update-ref", delivery_record["protected_ref"], delivery], cwd=project)
+    cleaned = run([
+        sys.executable, str(temporary_tool), "cleanup", "--task-id", temporary,
+        "--evidence", "user-approved-lifecycle-complete",
+    ])
+    check(cleaned.stdout.startswith("TEMP_CLEANUP_OK |"), "temporary resources were not cleaned")
+    check(not workspace.exists(), "temporary workspace survived verified cleanup")
+    cleanup_crash = json.loads(task_path.read_text(encoding="utf-8"))
+    cleanup_crash_temp = cleanup_crash["temporary_executor"]
+    cleanup_crash_temp["promotion_state"] = "integrated"
+    cleanup_crash_temp["workspace"]["state"] = "ready"
+    cleanup_crash_temp["temporary_session"]["state"] = "standby"
+    cleanup_crash_temp["cleanup_operation"]["state"] = "started"
+    cleanup_crash_temp["cleanup_operation"]["history"].append({
+        "state": "started", "at": dt.datetime.now(dt.timezone.utc).isoformat(), "via": "simulated-crash",
+    })
+    task_path.write_text(json.dumps(cleanup_crash, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    reconciled_cleanup = run([
+        sys.executable, str(temporary_tool), "reconcile-cleanup", "--task-id", temporary,
+    ])
+    check("archived" in reconciled_cleanup.stdout,
+          "cleanup crash after resource removal could not reconcile TASK truth")
+    protected = run(["git", "rev-parse", delivery_record["protected_ref"]], cwd=project)
+    check(protected.stdout.strip() == delivery, "protected delivery evidence was lost during cleanup")
+    run(["git", "reflog", "expire", "--expire=now", "--all"], cwd=project)
+    run(["git", "gc", "--prune=now"], cwd=project)
+    run(["git", "cat-file", "-e", f"{delivery}^{{commit}}"], cwd=project)
+    legacy_protocol = collab / "协议版本.json"
+    legacy_protocol_payload = json.loads(legacy_protocol.read_text(encoding="utf-8"))
+    legacy_protocol_payload["protocol_version"] = "1.4.0"
+    legacy_protocol.write_text(json.dumps(legacy_protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    project_guide = project / "docs" / "agent-guide.md"
+    project_guide.write_text(
+        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.1", "受管协议版本:1.4.0"),
+        encoding="utf-8",
+    )
+    corrupt_legacy = json.loads(task_path.read_text(encoding="utf-8"))
+    corrupt_legacy["temporary_executor"]["executor_type"] = "corrupted"
+    task_path.write_text(json.dumps(corrupt_legacy, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    corrupt_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"], ok=False)
+    check("temporary_executor 版本或类型无效" in corrupt_upgrade.stderr,
+          "1.4.0 upgrade accepted a corrupt temporary executor truth")
+    check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.0",
+          "failed temporary TASK preflight advanced protocol")
+    corrupt_legacy["temporary_executor"]["executor_type"] = "temporary"
+    valid_legacy = json.loads(json.dumps(corrupt_legacy))
+    corruptions = (
+        ("candidate", {}, "candidate 结构无效"),
+        ("review", {"decision": "pass"}, "review 结构无效"),
+        ("delivery", {}, "delivery 结构无效"),
+        ("integration", {"result": "pass"}, "integration 结构无效"),
+    )
+    for field, malformed, expected_error in corruptions:
+        damaged = json.loads(json.dumps(valid_legacy))
+        damaged["temporary_executor"][field] = malformed
+        task_path.write_text(json.dumps(damaged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        rejected = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"], ok=False)
+        check(expected_error in rejected.stderr, f"1.4.0 upgrade accepted malformed nested {field}")
+        check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.0",
+              f"failed nested {field} preflight advanced protocol")
+    for operation_mutation, expected_error in (
+        ({"state": "not-a-real-operation-state"}, "operation state 无效"),
+        ({"resources": [42]}, "operation resources 无效"),
+        ({"history": [{"state": "verified", "at": ""}]}, "history 事件内容无效"),
+        ({"history": [{"state": "started", "at": "2026-01-01T00:00:00+00:00"}]}, "history 末项不一致"),
+    ):
+        damaged = json.loads(json.dumps(valid_legacy))
+        damaged["temporary_executor"]["operation"].update(operation_mutation)
+        task_path.write_text(json.dumps(damaged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        rejected = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"], ok=False)
+        check(expected_error in rejected.stderr, "1.4.0 upgrade accepted malformed operation")
+        check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.0",
+              "failed operation preflight advanced protocol")
+    corrupt_legacy = valid_legacy
+    task_path.write_text(json.dumps(corrupt_legacy, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    repaired_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    check(repaired_upgrade.stdout.startswith("UPGRADE_OK |"), "valid 1.4.0 temporary TASK did not upgrade to 1.4.1")
 
 
 def verify_upgrade_and_guards(root: Path) -> None:
@@ -528,7 +1094,7 @@ def verify_upgrade_and_guards(root: Path) -> None:
     protocol_payload["protocol_version"] = "1.3.0"
     flat_protocol.write_text(json.dumps(protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     flat_guide = flat_project / "docs" / "agent-guide.md"
-    flat_guide.write_text(flat_guide.read_text(encoding="utf-8").replace("受管协议版本:1.3.1", "受管协议版本:1.3.0"), encoding="utf-8")
+    flat_guide.write_text(flat_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.1", "受管协议版本:1.3.0"), encoding="utf-8")
     task_tool_before = flat_tool.read_bytes()
     denied_flat = run([sys.executable, str(SCAFFOLD), str(flat_project), "--upgrade-collaboration"], ok=False)
     check("任务真值未通过完整性预检" in denied_flat.stderr, "corrupt flat TASK did not block upgrade")
@@ -540,7 +1106,7 @@ def verify_upgrade_and_guards(root: Path) -> None:
     clean_flat_upgrade = run([sys.executable, str(SCAFFOLD), str(flat_project), "--upgrade-collaboration"])
     check(clean_flat_upgrade.stdout.startswith("UPGRADE_OK |"), "clean flat 1.3.0 upgrade failed")
     check(flat_task.read_bytes() == flat_original, "clean flat upgrade rewrote TASK truth")
-    check("受管协议版本:1.3.1" in flat_guide.read_text(encoding="utf-8"),
+    check("受管协议版本:1.4.1" in flat_guide.read_text(encoding="utf-8"),
           "upgrade did not refresh project agent-guide")
     current_corrupt = json.loads(flat_original)
     current_corrupt["title"] = "bad\x00title"
@@ -604,8 +1170,9 @@ def main() -> int:
         verify_product_development_boundary(root)
         verify_tasks(project)
         verify_log_and_session(project, root)
+        verify_temporary_executor(root)
         verify_upgrade_and_guards(root)
-    print("VERIFY_OK | scaffold, task, index, log, session, upgrade, migration, and path guards passed")
+    print("VERIFY_OK | scaffold, task, temporary executor, tested-tree promotion, absorption, log, session, upgrade, migration, and path guards passed")
     return 0
 
 

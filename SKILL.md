@@ -15,6 +15,7 @@ description: Build and maintain low-context multi-agent or multi-session teams w
 4. 手上只做一件；任务用唯一 ID 和原子状态工具流转，收件箱只是自动索引信息，跨会话消息只发“任务 ID + 短状态”。
 5. 节点完成后提交产出、已验证/未验证项和错题自检，以 `TASK_STATE_OK` 作为完成收据；只在真实轨迹事件发生时追加事实日志。
 6. 会话变重时说明原因并主动询问用户是否换班；只有用户明确同意或主动提出“换会话 / 换班”要求后，才创建全新会话接班。
+7. 正式部门在办时，只有用户主动提出独立需求，统筹部才判断是否创建只绑定一个 TASK 的临时外包；未启用时不增加正式部门热路径。
 
 ## 必守边界
 
@@ -56,7 +57,7 @@ description: Build and maintain low-context multi-agent or multi-session teams w
 
 ## 事实日志
 
-日志默认不读，只在事件发生时追加到部门 ISO 周日志末尾。日志只保存可核验事实，不写“经验、启示、方法论”或完整聊天；项目复盘时再根据事实总结。
+日志默认不读，只在事件发生时写入部门 ISO 周日志的身份分区。正式部门和临时外包共用一份周文件，但物理分为“正式部门日志”和“临时外包日志”；临时外包再按 TASK 分组。日志只保存可核验事实，不写“经验、启示、方法论”或完整聊天；项目复盘时再根据事实总结。
 
 必须记录五类改变项目轨迹的事件：
 
@@ -85,6 +86,8 @@ python3 docs/collaboration/scripts/agent_team_log.py append \
 ```
 
 脚本负责带时区时间、唯一事件 ID、周文件创建、末尾原子追加和短收据；不得输出日志正文。一个事件只登记一次：项目级变化和决策由统筹部记录，部门局部事件由发生部门记录，其他部门只引用事件 ID。可复发的 `CORRECTION` 另外在共享错题集写“错误/正确做法”，并引用事件 ID；不要复制事件全文。
+
+临时外包写日志时还要传 `--executor-type temporary --executor-id ... --parent-department ...`。工具只允许它写入父部门的临时板块。正式吸收后，父部门只在正式板块增加一条引用 TASK、delivery 和正式证据的 MILESTONE，不复制外包原始日志。
 
 ## 团队诊断
 
@@ -126,7 +129,7 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 --foundation-resources "..." --foundation-risks "..."
 ```
 
-脚本生成协议版本、路由表、四文档、部门表、会话启动状态、稳定路径的任务 JSON、共享报告模板和按需创建的日志目录，以及确定性的 `agent_team_log.py`、`agent_team_task.py` 和 `agent_team_session.py`。脚本拒绝符号链接越界、并发覆盖、重复角色、缺三层和未确认会话模式；地基内容质量仍由调用脚本前的 Agent 负责。
+脚本生成协议版本、路由表、四文档、部门表、会话启动状态、稳定路径的任务 JSON、共享报告模板和按需创建的日志目录，以及确定性的 `agent_team_log.py`、`agent_team_task.py`、`agent_team_session.py` 和 `agent_team_temporary.py`。脚本拒绝符号链接越界、并发覆盖、重复角色、缺三层和未确认会话模式；地基内容质量仍由调用脚本前的 Agent 负责。
 
 ## 任务事务
 
@@ -143,6 +146,28 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 * 统筹部只能核收 `completed` 任务；`acknowledged-by` 必须精确匹配会话状态中当前已登记的 `统筹部/会话ID`，用于防止普通部门误操作，核收后状态为 `acknowledged`。
 
 * `TASK_STATE_OK` 只证明状态已持久化和本地产物路径已校验，不证明业务质量。脚本参数中的领取人、核收人和授权证据只作审计记录，不冒充身份认证。
+
+## 单 TASK 临时外包
+
+* 内部统一模型为 `temporary_executor`，必须绑定一个 TASK 和一个 `parent_department`。用户侧按父部门称“临时开发外包”“临时设计外包”等；数据模型和 preflight 不写死开发部。当前首轮完整运行适配只开放临时开发外包，其他父部门尚未完成专业成果版本与吸收适配时只能讨论和预检，不能声称已可执行。
+
+* 只有用户主动发起后，统筹部才能判断和创建。统筹部不能主动扩容、拆需求、自动重派或让临时执行者从共享任务池自行领取。
+
+* 正式在办、阻断、等待输入和尚未吸收完成的临时任务都用 `write_paths / shared_contracts / external_effects / base_revision / owner_task` 声明影响。声明不足只报 `manual`，写路径、共享契约或 ignored 生成物无法证明独立时必须阻断或转人工；工具不能自动 stash、reset 或 checkpoint 正式部门工作。
+
+* 临时 workspace 位于项目内 `.agent-team/workspaces/TASK-ID/`，项目根必须忽略 `/.agent-team/`。Git ignore 不能证明 watcher、构建器或同步工具也会忽略该目录；创建前由 Agent 检查这些项目配置并把证据写入创建请求。worktree 只提供协作隔离，不冒充 OS 沙箱；首轮禁止密钥、生产、付费和真实外部副作用。
+
+* workspace 内只生成一份 `.agent-team/临时执行规则.md`，作为临时会话的身份、权限、日志和收口入口。它按 TASK 指针读 Spec、相关 ADR、conventions、代码和测试，默认不读父部门完整岗位说明、收件箱、交接、progress 和长期报告。专业标准可以继承，组织身份和正式权限必须重写。
+
+* 需求实质变化使用带 expected brief revision 的 `amend`，同一事务重新判断并行条件、增加 attempt、清空旧候选 / delivery / integration，并重生成临时规则。临时会话重新确认新 digest 前不能固定候选或 submit。已 submit 或被统筹接管时先走显式 `rework`，不能直接 amend。
+
+* 先固定可复查候选，再把用户确认、明确委托或不适用记录绑定到该候选 revision 和 tree digest。workspace 产生新 commit 后必须固定新候选并重新确认，工具不能把旧确认自动套到新版本。独立子 Agent 审查只在用户要求时调用，只给结论和证据；修复形成新候选。delivery submit 后使用受保护 ref 留证，临时会话进入 standby，不能自称已集成。
+
+* 正式体系只验证一次“准备成为正式结果的完整候选”。delivery 与未来正式 tree 相同时直接验证 delivery；main 前进、存在冲突或有集成修改时才按需形成候选集成态。正式通过必须绑定已完成并由统筹核收的审核层 TASK、本地正式报告、tested commit/tree 和未覆盖项，不能只填一段“测试通过”文字。进入 main 的 tree 必须等于已测试 tree，main 漂移或测试后修改都要求重测。
+
+* 清理前同时通过成果吸收和知识吸收，并验证 delivery 保护 ref 仍指向正确 commit/tree。知识默认只回到所属正式部门与项目全局 Spec、ADR、conventions、progress 或错题集；其他部门只有明确受影响时才介入。未集成或用户未明确放弃时不得清理，长期无回复只进入 standby。创建、晋升和清理的半失败必须先运行对应 reconcile，不能根据名称猜测重做或删除。
+
+* 所有临时生命周期机械操作使用 `agent_team_temporary.py`。普通任务继续走原有三个工具；临时功能未启用时，正式部门不增加必读文件或状态步骤。
 
 ## 会话模式与换班
 
@@ -178,4 +203,4 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 通知能力只在上岗/接班时登记一次；后续按部门表的自动/人工模式执行。
 
-* 修改本 Skill 后运行项目验证器、`quick_validate.py` 和 Python 编译检查；再同步并验证全局安装目录只包含 `SKILL.md`、`agents/openai.yaml`、`scripts/scaffold_team.py`。
+* 修改本 Skill 后运行项目验证器、`quick_validate.py` 和 Python 编译检查；再同步并验证全局安装目录只包含 `SKILL.md`、`agents/openai.yaml`、`scripts/scaffold_team.py` 和 `scripts/temporary_executor_runtime.py`。

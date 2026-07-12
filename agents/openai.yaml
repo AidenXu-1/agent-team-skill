@@ -1,4 +1,4 @@
 interface:
   display_name: "Agent Team"
-  short_description: "搭建低上下文、可倒查、按需换会话的多 Agent 团队"
-  default_prompt: "使用 $agent-team 为当前项目诊断最小必要团队，并搭建按四文档接班、用唯一任务 ID 原子流转、可用事实日志倒查、只在用户授权后更换会话的低上下文协作层。"
+  short_description: "搭建低上下文团队与单 TASK 临时开发外包"
+  default_prompt: "使用 $agent-team 为当前项目诊断最小必要团队，搭建按四文档接班、唯一任务 ID 原子流转和事实日志倒查的协作层；用户主动提出独立开发需求时，再判断是否创建只绑定一个 TASK 和开发部的临时外包。其他父部门当前只做通用 preflight。"

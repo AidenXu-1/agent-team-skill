@@ -82,10 +82,74 @@ Skill 只负责把 Agent 路由到部门入口、TASK JSON 和相关项目文件
 
 新建协作层前，Agent 亲自阅读并复核地基是否真正说清目标、交付范围和验收标准，再显式传入 `--foundation-file`。脚本只检查相对路径、项目边界、符号链接、UTF-8、文件类型、非空和大小上限，不扫描整个 `docs/`，不用关键词、字数或字符种类冒充语义判断。未传地基文件、越界、符号链接或非 `docs/spec.md` 且未经用户确认时，必须在创建协作层前停止。
 
+## 20. 临时外包必须由用户发起
+
+缺少 `user_confirmed` 和授权证据时，不能创建临时执行者。重复 client key 必须返回原资源，不能重复创建 workspace 或会话；不同 client key 不能接管已有临时执行者。
+
+## 21. 通用父部门
+
+临时执行者必须使用 TASK 已登记的父部门，日志也只能进入该父部门临时板块。数据模型和用户文案不能把开发部写成永久默认值；开发只作为首轮 Git 交付样板。
+
+## 22. 并行影响声明
+
+正式在办任务缺少影响声明时只能返回 `manual`。写路径父子重叠、共享契约重叠或真实外部副作用必须拒绝。主工作区脏但与临时写路径独立时可以开发，不能因此提前进入 main；工具不得自动 stash、reset 或 checkpoint。
+
+## 23. 临时规则与唯一控制根
+
+workspace 只能位于 `.agent-team/workspaces/TASK-ID/`，必须有 ownership marker 和唯一临时规则。临时分支修改 `docs/collaboration/`、越出 write paths、包含未提交文件或规则 digest 未确认时，候选、submit 或清理必须停止。
+
+## 24. 候选证据失效
+
+brief 实质 amend 必须带 expected revision 并重新进行并行判断。新候选产生后，旧用户确认、独立审查和测试证据不得自动沿用。审查失败的候选不能 submit。
+
+## 25. 合并后只做一次正式验证
+
+外包自测和可选独立审查后，正式部门只验证准备成为正式结果的完整 tree。main 漂移、候选修改、tested tree 不一致、主工作区存在未解释产品改动时，晋升必须停止。进入 main 的 tree 必须等于测试证据记录的 tree。
+
+## 26. 吸收与清理
+
+成果 integrated 后仍不能立即清理。所属正式部门和项目全局知识必须完成或明确不适用，最终吸收关关闭后才能删除普通 workspace 和分支；delivery 保护 ref 继续保留。长期无回复只 standby，用户未明确 abandoned 时不得清理。
+
+## 27. Amend 与规则确认
+
+实质 amend 和正式返工必须增加 attempt，清空 candidate、review、delivery、integration 和旧测试证据，重生成临时规则并清空确认时间。新 digest 未由临时会话确认时，candidate 和 submit 都必须拒绝。已 submit 或统筹接管后不能绕过 rework 直接 amend。若上一 attempt 已完成前置清点，rework 必须将当前吸收状态和收据归零，只保留标记旧 attempt 的失效历史快照。
+
+## 28. Delivery 留证
+
+清理前必须读取并核对 delivery 保护 ref、commit 和 tree。删除或漂移保护 ref 后，integrated 与 abandoned 两条清理路径都必须拒绝；Git GC 后仍要能通过保护 ref 读取交付证据。
+
+## 29. 日志身份真值
+
+临时日志参数必须与权威 TASK 中的 executor ID、parent department 和 temporary executor 绑定完全一致。普通 TASK、伪造 executor 或伪造父部门都不能写入临时板块。
+
+## 30. 正式测试证据
+
+`record-integration-test` 不能接受纯文字 pass。它必须引用已完成并由统筹核收的审核层 TASK、本部门正式报告和当前临时 TASK 指针；报告必须绑定 tested commit/tree 和结论。自动验证应实际运行候选测试后再生成报告。
+
+## 31. 半失败恢复
+
+provision、promotion 和 cleanup 都记录 planned、started、succeeded、verified 轨迹。Git ref 已改变但 TASK 未更新，或资源已删除但 TASK 未归档时，reconcile 必须根据真实 ref、worktree 注册、完整 ownership marker 和保护证据恢复；存在一半资源时保留现场并转人工。
+
+## 32. 首轮适配诚实边界
+
+数据模型与 preflight 支持任意父部门，但当前完整 workspace、candidate、delivery、tested-tree 和 main 晋升链只开放临时开发外包。设计、研究等专业候选和权威吸收适配完成前，不得声称可完整执行。
+
+## 33. 用户确认绑定候选
+
+用户验收必须记录当前 candidate revision 和 tree digest。workspace 新增 commit 并固定新候选后，验收状态退回 pending；旧证据不能由 candidate 命令自动改写 revision 后继续 submit。
+
+## 34. 吸收顺序
+
+前置清点只能在统筹接管 delivery 后完成。所属部门、项目全局和最终吸收只能在正式验证通过并 integrated 后完成；submitted、reviewing 或 ready 状态不能提前关闭最终吸收关。
+
+## 35. 旧 TASK 深度升级预检
+
+1.4.0 TASK 的 temporary executor、impact、workspace、rule、session、acceptance、candidate、review、delivery、integration、operation 和 absorption 必须在备份与写入前深度验证。operation 还要校验状态枚举、资源元素、历史事件结构，以及当前状态与历史末项一致性。允许安全补齐 1.4.1 新字段，但 executor type、父部门、状态、候选绑定或嵌套结构损坏时升级保持原协议和真值不变。
+
 ## 自动复验
 
 ```bash
-python3 -m py_compile scripts/scaffold_team.py scripts/verify_agent_team.py
+python3 -m py_compile scripts/scaffold_team.py scripts/temporary_executor_runtime.py scripts/verify_agent_team.py
 python3 scripts/verify_agent_team.py
 python3 /Users/aiden/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
 ```
