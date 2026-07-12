@@ -87,7 +87,7 @@ Skill 只负责把 Agent 路由到部门入口、TASK JSON 和相关项目文件
 ```bash
 python3 -m py_compile scripts/scaffold_team.py scripts/verify_agent_team.py
 python3 scripts/verify_agent_team.py
-python3 /Users/aiden/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
+python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" .
 ```
 
 修改运行时后，还必须用全局安装副本覆盖 `AGENT_TEAM_SCAFFOLD` 再跑验证器。
