@@ -114,7 +114,7 @@ docs/collaboration/
 ```bash
 python3 -m py_compile scripts/scaffold_team.py scripts/temporary_executor_runtime.py scripts/verify_agent_team.py
 python3 scripts/verify_agent_team.py
-python3 /Users/aiden/.codex/skills/.system/skill-creator/scripts/quick_validate.py .
+python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" .
 ```
 
 协议升级：
