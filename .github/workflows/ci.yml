@@ -2,9 +2,15 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
+      - codex/agent-team-2.0
+    tags:
+      - "v*"
   pull_request:
-    branches: [main]
+    branches:
+      - main
+      - codex/agent-team-2.0
 
 jobs:
   verify:

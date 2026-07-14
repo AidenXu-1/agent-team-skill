@@ -37,16 +37,28 @@ scripts/temporary_executor_runtime.py
 
 ## 安装
 
+下面的安装命令始终下载 GitHub 标记的最新正式 Release，不需要在新版本发布后手动修改版本号。
+
+- [查看最新正式版本](https://github.com/AidenXu-1/agent-team-skill/releases/latest)
+- [直接下载最新纯净包](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip)
+
 ```bash
-git clone --branch v2.0.1 --depth 1 https://github.com/AidenXu-1/agent-team-skill.git /tmp/agent-team-skill
+tmp_dir="$(mktemp -d)"
+curl -fsSL \
+  https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip \
+  -o "$tmp_dir/agent-team-2.0-pure.zip"
+curl -fsSL \
+  https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip.sha256 \
+  -o "$tmp_dir/agent-team-2.0-pure.zip.sha256"
+if command -v sha256sum >/dev/null 2>&1; then
+  (cd "$tmp_dir" && sha256sum -c agent-team-2.0-pure.zip.sha256)
+else
+  (cd "$tmp_dir" && shasum -a 256 -c agent-team-2.0-pure.zip.sha256)
+fi
+unzip -q "$tmp_dir/agent-team-2.0-pure.zip" -d "$tmp_dir/agent-team"
 mkdir -p ~/.codex/skills/agent-team
-rsync -a --delete --delete-excluded \
-  --include='/SKILL.md' \
-  --include='/agents/' --include='/agents/openai.yaml' \
-  --include='/scripts/' --include='/scripts/scaffold_team.py' \
-  --include='/scripts/temporary_executor_runtime.py' \
-  --exclude='*' \
-  /tmp/agent-team-skill/ ~/.codex/skills/agent-team/
+rsync -a --delete "$tmp_dir/agent-team/" ~/.codex/skills/agent-team/
+rm -rf "$tmp_dir"
 ```
 
 ## 使用
