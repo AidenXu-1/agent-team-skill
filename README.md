@@ -1,6 +1,8 @@
 # Agent Team 2.0 Skill
 
-当前版本为 `2.0.0`。第一版继续保留在仓库的 `main` 分支；2.0 通过独立的 `v2.0.0` 标签发布，不覆盖第一版。
+当前版本为 `2.0.1`。第一版继续保留在仓库的 `main` 分支；2.0 通过独立的 `v2.0.1` 标签发布，不覆盖第一版。
+
+`2.0.1` 修复了用户明确放弃临时任务后的状态收口：正常清理或崩溃恢复完成后，普通 TASK 会进入待统筹核收，同时保留“未交付、未集成、未发布”的事实边界。
 
 面向多 Agent / 多会话项目的轻量协作协议。它用项目文件保存长期真值，让会话可以安全接班，同时把管理、执行和独立审核分开。
 
@@ -36,7 +38,7 @@ scripts/temporary_executor_runtime.py
 ## 安装
 
 ```bash
-git clone --branch v2.0.0 --depth 1 https://github.com/AidenXu-1/agent-team-skill.git /tmp/agent-team-skill
+git clone --branch v2.0.1 --depth 1 https://github.com/AidenXu-1/agent-team-skill.git /tmp/agent-team-skill
 mkdir -p ~/.codex/skills/agent-team
 rsync -a --delete --delete-excluded \
   --include='/SKILL.md' \
