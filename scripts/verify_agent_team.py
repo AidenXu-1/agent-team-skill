@@ -997,6 +997,71 @@ result: pass
           "cleanup crash after resource removal could not reconcile TASK truth")
     protected = run(["git", "rev-parse", delivery_record["protected_ref"]], cwd=project)
     check(protected.stdout.strip() == delivery, "protected delivery evidence was lost during cleanup")
+
+    abandoned = enqueue_dev("用户放弃的临时任务", "user_confirmed", "user-requested-temporary-outsourcing")
+    abandoned_provision = run([
+        sys.executable, str(temporary_tool), "provision", "--task-id", abandoned,
+        "--parent-department", "开发部", "--executor-id", "temp-dev-abandoned",
+        "--display-name", "待放弃临时开发外包", "--current-brief", "验证放弃任务清理收口",
+        "--client-key", "client-temp-abandoned", "--scan-boundary-evidence", "已检查扫描边界",
+        "--base-revision", "HEAD", "--write-path", "app/abandoned.py",
+    ])
+    check(abandoned_provision.stdout.startswith("TEMP_PROVISION_OK |"),
+          "abandoned cleanup regression workspace was not provisioned")
+    abandoned_path = collab / "tasks" / f"{abandoned}.json"
+    abandoned_payload = json.loads(abandoned_path.read_text(encoding="utf-8"))
+    abandoned_workspace = project / abandoned_payload["temporary_executor"]["workspace"]["path"]
+    run([
+        sys.executable, str(temporary_tool), "abandon", "--task-id", abandoned,
+        "--evidence", "user-explicitly-replaced-the-scope",
+    ])
+    abandoned_cleanup = run([
+        sys.executable, str(temporary_tool), "cleanup", "--task-id", abandoned,
+        "--evidence", "user-approved-abandoned-workspace-cleanup",
+    ])
+    check(abandoned_cleanup.stdout.startswith("TEMP_CLEANUP_OK |") and not abandoned_workspace.exists(),
+          "abandoned temporary resources were not cleaned")
+    abandoned_closed = json.loads(abandoned_path.read_text(encoding="utf-8"))
+    check(abandoned_closed["execution_state"] == "completed"
+          and abandoned_closed["temporary_executor"]["promotion_state"] == "archived"
+          and abandoned_closed["artifacts"] == [f"docs/collaboration/tasks/{abandoned}.json"],
+          "abandoned cleanup left the ordinary TASK axis active")
+    run([sys.executable, str(task_tool), "list"])
+
+    abandoned_crash = abandoned_closed
+    abandoned_crash["execution_state"] = "claimed"
+    abandoned_crash["artifacts"] = []
+    abandoned_crash["external_artifacts"] = []
+    abandoned_crash["verified"] = []
+    abandoned_crash["unverified"] = []
+    abandoned_crash["mistake_check"] = ""
+    abandoned_crash["report"] = ""
+    abandoned_crash["event_receipts"] = []
+    abandoned_crash_temp = abandoned_crash["temporary_executor"]
+    abandoned_crash_temp["workspace"]["state"] = "ready"
+    abandoned_crash_temp["temporary_session"]["state"] = "standby"
+    abandoned_crash_temp["cleanup_operation"]["state"] = "started"
+    abandoned_crash_temp["cleanup_operation"]["history"].append({
+        "state": "started", "at": dt.datetime.now(dt.timezone.utc).isoformat(), "via": "simulated-crash",
+    })
+    abandoned_path.write_text(json.dumps(abandoned_crash, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    abandoned_reconciled = run([
+        sys.executable, str(temporary_tool), "reconcile-cleanup", "--task-id", abandoned,
+    ])
+    abandoned_recovered = json.loads(abandoned_path.read_text(encoding="utf-8"))
+    check("archived" in abandoned_reconciled.stdout and abandoned_recovered["execution_state"] == "completed",
+          "abandoned cleanup reconcile left the ordinary TASK axis active")
+    abandoned_ack = run([
+        sys.executable, str(temporary_tool), "acknowledge", "--task-id", abandoned,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    abandoned_archived = json.loads(abandoned_path.read_text(encoding="utf-8"))
+    check(abandoned_ack.stdout.startswith("TEMP_ACK_ABANDONED_OK |")
+          and abandoned_archived["execution_state"] == "acknowledged"
+          and abandoned_archived["temporary_executor"]["promotion_state"] == "archived",
+          "lead could not acknowledge a verified abandoned cleanup")
+    run([sys.executable, str(task_tool), "list"])
+
     run(["git", "reflog", "expire", "--expire=now", "--all"], cwd=project)
     run(["git", "gc", "--prune=now"], cwd=project)
     run(["git", "cat-file", "-e", f"{delivery}^{{commit}}"], cwd=project)

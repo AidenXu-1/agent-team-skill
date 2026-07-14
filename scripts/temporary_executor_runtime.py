@@ -1107,12 +1107,23 @@ def cmd_rework(args: argparse.Namespace) -> int:
 
 def cmd_acknowledge(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
-    if task["execution_state"] != "completed" or temp["promotion_state"] != "submitted":
-        raise ValueError("只有已 submit 的临时交付可以接管")
     actor = clean("acknowledged-by", args.acknowledged_by, max_chars=300)
     expected = registered_lead_actor()
     if actor != expected:
         raise ValueError(f"acknowledged-by 必须匹配当前登记统筹会话: {expected}")
+    abandoned_archived = (
+        task["execution_state"] == "completed"
+        and temp["promotion_state"] == "archived"
+        and bool(temp.get("operation", {}).get("abandon_evidence"))
+    )
+    if abandoned_archived:
+        task["execution_state"] = "acknowledged"
+        task["acknowledged_by"] = actor
+        write_task(task, expected_revision=task["revision"])
+        print(f"TEMP_ACK_ABANDONED_OK | {args.task_id} | {task['acknowledged_by']}")
+        return 0
+    if task["execution_state"] != "completed" or temp["promotion_state"] != "submitted":
+        raise ValueError("只有已 submit 的临时交付或已清理的 abandoned 任务可以核收")
     task["execution_state"] = "acknowledged"
     task["acknowledged_by"] = actor
     temp["promotion_state"] = "reviewing"
@@ -1288,6 +1299,27 @@ def cmd_abandon(args: argparse.Namespace) -> int:
     return 0
 
 
+def finalize_abandoned_task(task: dict, temp: dict) -> None:
+    """Close the ordinary TASK axis after an abandoned workspace is gone."""
+    abandon_evidence = temp.get("operation", {}).get("abandon_evidence", "")
+    if not abandon_evidence or task.get("execution_state") in {"completed", "acknowledged"}:
+        return
+    task["execution_state"] = "completed"
+    task.pop("acknowledged_by", None)
+    task["block_reason"] = ""
+    task["artifacts"] = [f"docs/collaboration/tasks/{task['task_id']}.json"]
+    task["external_artifacts"] = []
+    task["verified"] = [
+        "用户已明确放弃当前临时候选；专属 workspace 与 branch 均已清理，TASK 真值已归档"
+    ]
+    task["unverified"] = [
+        "放弃任务未形成可集成 delivery，未执行正式测试、晋升、打包、发布或外发"
+    ]
+    task["mistake_check"] = "abandoned 只表示用户明确终止本次临时执行，未冒充正式交付或集成完成"
+    task["report"] = "不适用"
+    task["event_receipts"] = []
+
+
 def cmd_cleanup(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
     if temp["promotion_state"] == "integrated":
@@ -1355,6 +1387,7 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     final_temp["cleanup_operation"]["history"].extend([
         {"state": "succeeded", "at": now_iso()}, {"state": "verified", "at": now_iso()},
     ])
+    finalize_abandoned_task(final_task, final_temp)
     write_task(final_task, expected_revision=final_task["revision"])
     print(f"TEMP_CLEANUP_OK | {args.task_id} | protected_delivery_retained")
     return 0
@@ -1378,6 +1411,7 @@ def cmd_reconcile_cleanup(args: argparse.Namespace) -> int:
         temp["promotion_state"] = "archived"
         operation["state"] = "verified"
         operation["history"].append({"state": "verified", "at": now_iso(), "via": "reconcile"})
+        finalize_abandoned_task(task, temp)
         write_task(task, expected_revision=task["revision"])
         print(f"TEMP_CLEANUP_RECONCILE_OK | {args.task_id} | archived")
         return 0
