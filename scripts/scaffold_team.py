@@ -26,7 +26,7 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.4.1"
+PROTOCOL_VERSION = "1.4.3"
 PROTOCOL_FILE = "协议版本.json"
 ADD_TRANSACTION_FILE = ".add-roles-transaction.json"
 
@@ -979,7 +979,7 @@ LOCKS = COLLAB / ".locks"
 SESSION_STATE = COLLAB / "会话启动状态.json"
 INDEX_MARKER = "<!-- agent-team task index; use scripts/agent_team_task.py -->"
 SCHEMA_VERSION = 1
-PROTOCOL_VERSION = "1.4.1"
+PROTOCOL_VERSION = "1.4.3"
 STATES = ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged")
 BUSY_STATES = {"claimed"}
 VISIBLE_ACTIVE_STATES = {"claimed", "blocked", "waiting_input"}
@@ -2797,7 +2797,8 @@ docs/collaboration/
 7. 设计意图预览仅在用户明确提出或任务列为交付物时制作。触发后必须让用户直接看到，并说明与最终实现的保真差距。
 8. 会话变重时只说明具体症状、风险和当前任务，询问用户是否换班；用户未授权时不自动创建、登记或归档。
 9. 已有授权清楚的 `claimed` 任务且无冲突时，新会话短报接班状态后同一轮续做。
-10. `LOG_OK` 只用于 `MILESTONE / CHANGE / CORRECTION / DECISION / INCIDENT`，普通任务不凑日志。
+10. 临时外包最终清理后，必须用 TASK 登记的 thread ID 调用真实会话归档工具；成功后再用 `agent_team_temporary.py session-mark --state archived --evidence "host=set_thread_archived thread_id=<真实ID> archived=true"` 写入收据。归档失败时保持 `temporary_session=standby`；旧协议升级也会把缺少宿主收据的 `archived` 退回 `standby`，不得把资源已清理冒充为真实会话已归档。
+11. `LOG_OK` 只用于 `MILESTONE / CHANGE / CORRECTION / DECISION / INCIDENT`，普通任务不凑日志。
 
 ## 报告
 
@@ -3447,6 +3448,17 @@ def validate_upgrade_temporary(value: object, source: Path, department: str) -> 
             if record["state"] not in {"planned", "started", "succeeded", "verified", "failed"}:
                 raise ValueError(f"temporary_executor {field} state 无效: {source}")
             validate_upgrade_operation_history(record["history"], record["state"], source, field)
+    if session.get("state") == "archived":
+        cleanup = value.get("cleanup_operation")
+        if (
+            not session.get("thread_id")
+            or not session.get("evidence")
+            or value["promotion_state"] != "archived"
+            or workspace.get("state") != "removed"
+            or not isinstance(cleanup, dict)
+            or cleanup.get("state") != "verified"
+        ):
+            raise ValueError(f"temporary_executor archived 会话缺少真实收据或清理证据: {source}")
 
 
 def validate_upgrade_task_payload(payload: object, source: Path, departments: set[str], expected_state: str | None) -> None:
@@ -3614,9 +3626,25 @@ def run_upgrade(collab: Path) -> int:
     except ValueError as exc:
         print(f"升级已停止:任务真值未通过完整性预检: {exc}", file=sys.stderr)
         return 9
-    if read_protocol_version(collab) == PROTOCOL_VERSION and current_runtime_complete(collab):
+    previous_protocol_version = read_protocol_version(collab)
+    if previous_protocol_version == PROTOCOL_VERSION and current_runtime_complete(collab):
         print(f"UPGRADE_NOT_NEEDED | protocol:{PROTOCOL_VERSION}")
         return 0
+    legacy_archive_repairs: list[tuple[Path, str, str]] = []
+    tasks_root = collab / "tasks"
+    if previous_protocol_version != PROTOCOL_VERSION and tasks_root.exists():
+        for entry in tasks_root.iterdir():
+            candidates = list(entry.iterdir()) if entry.is_dir() else [entry]
+            for source in candidates:
+                if not source.is_file() or not source.name.startswith("TASK-") or source.suffix != ".json":
+                    continue
+                payload = json.loads(read_utf8(source))
+                temporary = payload.get("temporary_executor")
+                if not isinstance(temporary, dict):
+                    continue
+                session = temporary.get("temporary_session")
+                if isinstance(session, dict) and session.get("state") == "archived":
+                    legacy_archive_repairs.append((source, payload["task_id"], session["thread_id"]))
     date = dt.date.today().isoformat()
     session_data = registry_session_data(registry_text)
     pending_legacy = []
@@ -3756,6 +3784,15 @@ def run_upgrade(collab: Path) -> int:
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, backup)
             originals[source] = backup
+        legacy_sources = {source for source, _ in legacy_tasks}
+        for source, _, _ in legacy_archive_repairs:
+            if source in legacy_sources:
+                continue
+            relative = source.relative_to(collab)
+            backup = backup_root / relative
+            backup.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, backup)
+            originals[source] = backup
         locks = collab / ".locks"
         if locks.exists() and (locks.is_symlink() or not locks.is_dir()):
             raise ValueError(".locks 路径不安全")
@@ -3771,6 +3808,21 @@ def run_upgrade(collab: Path) -> int:
             state_dir = tasks / state
             if state_dir.exists():
                 state_dir.rmdir()
+        repair_time = dt.datetime.now().astimezone().isoformat(timespec="minutes")
+        for source, _, thread_id in legacy_archive_repairs:
+            destination = tasks / source.name
+            payload = json.loads(read_utf8(destination))
+            session = payload["temporary_executor"]["temporary_session"]
+            old_evidence = session.get("evidence", "")
+            session["state"] = "standby"
+            session["evidence"] = (
+                f"协议 {previous_protocol_version or 'unknown'} 升级到 {PROTOCOL_VERSION}："
+                f"旧 archived 记录缺少宿主收据，等待重新归档 thread_id={thread_id}；"
+                f"旧 evidence={old_evidence}"
+            )[:1000]
+            payload["revision"] += 1
+            payload["updated_at"] = repair_time
+            write_utf8_atomic(destination, json.dumps(payload, ensure_ascii=False, indent=2) + "\n", mode=0o600)
         # 协议版本是整次升级的提交标记。其他文件全部落盘后才最后写它;
         # 进程在此之前崩溃时,旧/缺失版本会迫使下次操作重新升级。
         for path, (content, mode) in managed.items():
@@ -3803,6 +3855,11 @@ def run_upgrade(collab: Path) -> int:
         print(f"升级失败,已尝试从 {backup_root} 恢复: {exc}", file=sys.stderr)
         return 6
     print(f"UPGRADE_OK | {operation_id} | protocol:{PROTOCOL_VERSION} | backup:{backup_root}")
+    for _, task_id, thread_id in legacy_archive_repairs:
+        print(
+            f"ARCHIVE_THREAD_REQUIRED:{thread_id} | task:{task_id}"
+            f" | reason:legacy-unverified-archive"
+        )
     return 0
 
 

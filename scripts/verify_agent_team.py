@@ -113,11 +113,14 @@ def verify_generated(project: Path) -> None:
     check(not (collab / "读取路由规则.md").exists(), "obsolete reading rules generated")
     check(not (collab / "scripts" / "agent_team_read.py").exists(), "obsolete reader generated")
     protocol = json.loads((collab / "协议版本.json").read_text(encoding="utf-8"))
-    check(protocol["protocol_version"] == "1.4.1", "unexpected protocol version")
+    check(protocol["protocol_version"] == "1.4.3", "unexpected protocol version")
     for script in (collab / "scripts").glob("*.py"):
         py_compile.compile(str(script), doraise=True)
     guide = (project / "docs" / "agent-guide.md").read_text(encoding="utf-8")
-    check("受管协议版本:1.4.1" in guide and "任务真值" in guide, "project guide not refreshed")
+    check("受管协议版本:1.4.3" in guide and "任务真值" in guide, "project guide not refreshed")
+    collaboration_readme = (collab / "README.md").read_text(encoding="utf-8")
+    check("真实会话归档工具" in collaboration_readme and "temporary_session=standby" in collaboration_readme,
+          "generated collaboration guide omitted the real temporary-session archive receipt")
     for department in ("统筹部", "执行部", "检验部"):
         root = collab / "部门" / department
         check((root / "报告").is_dir() and (root / "日志").is_dir(), "department output directories missing")
@@ -663,7 +666,7 @@ def verify_temporary_executor(root: Path) -> None:
     normalized_temp = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]
     check("promotion_operation" in normalized_temp and "cleanup_operation" in normalized_temp
           and normalized_temp["operation"]["request_digest"] == "legacy-unknown",
-          "1.4.0 temporary TASK did not normalize safely for 1.4.1")
+          "legacy temporary TASK did not normalize safely for 1.4.3")
     copied_scripts = workspace / "docs" / "collaboration" / "scripts"
     copied_task_list = run([sys.executable, str(copied_scripts / "agent_team_task.py"), "list"])
     check(temporary in copied_task_list.stdout, "worktree task tool read the non-authoritative TASK copy")
@@ -974,12 +977,45 @@ result: pass
     check("保护 ref 缺失" in missing_protection_cleanup.stderr and workspace.exists(),
           "cleanup removed the only delivery evidence")
     run(["git", "update-ref", delivery_record["protected_ref"], delivery], cwd=project)
+    premature_archive = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived", "--evidence", "must-not-precede-resource-cleanup",
+    ], ok=False)
+    check("资源清理验证完成后" in premature_archive.stderr,
+          "temporary session was marked archived before resource cleanup")
     cleaned = run([
         sys.executable, str(temporary_tool), "cleanup", "--task-id", temporary,
         "--evidence", "user-approved-lifecycle-complete",
     ])
-    check(cleaned.stdout.startswith("TEMP_CLEANUP_OK |"), "temporary resources were not cleaned")
+    check(cleaned.stdout.startswith("TEMP_CLEANUP_OK |")
+          and "ARCHIVE_THREAD_REQUIRED:temporary-thread-1" in cleaned.stdout,
+          "temporary cleanup did not return the real thread archive action")
     check(not workspace.exists(), "temporary workspace survived verified cleanup")
+    cleaned_payload = json.loads(task_path.read_text(encoding="utf-8"))
+    check(cleaned_payload["temporary_executor"]["promotion_state"] == "archived"
+          and cleaned_payload["temporary_executor"]["temporary_session"]["state"] == "standby",
+          "resource cleanup falsely marked the real temporary session archived")
+    unbound_archive_receipt = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived", "--evidence", "host-archive-receipt-1",
+    ], ok=False)
+    check("必须绑定当前 thread_id" in unbound_archive_receipt.stderr,
+          "temporary session accepted an archive receipt not bound to the real thread")
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived",
+        "--evidence", "host=set_thread_archived thread_id=temporary-thread-1 archived=true",
+    ])
+    externally_archived = json.loads(task_path.read_text(encoding="utf-8"))
+    check(externally_archived["temporary_executor"]["temporary_session"]["state"] == "archived",
+          "real host archive receipt did not close temporary_session")
+    archive_receipt_retry = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived",
+        "--evidence", "host=set_thread_archived thread_id=temporary-thread-1 archived=true retry=true",
+    ])
+    check(archive_receipt_retry.stdout.startswith("TEMP_SESSION_OK |"),
+          "idempotent host archive receipt retry was rejected")
     cleanup_crash = json.loads(task_path.read_text(encoding="utf-8"))
     cleanup_crash_temp = cleanup_crash["temporary_executor"]
     cleanup_crash_temp["promotion_state"] = "integrated"
@@ -993,10 +1029,33 @@ result: pass
     reconciled_cleanup = run([
         sys.executable, str(temporary_tool), "reconcile-cleanup", "--task-id", temporary,
     ])
-    check("archived" in reconciled_cleanup.stdout,
-          "cleanup crash after resource removal could not reconcile TASK truth")
+    reconciled_payload = json.loads(task_path.read_text(encoding="utf-8"))
+    check("ARCHIVE_THREAD_REQUIRED:temporary-thread-1" in reconciled_cleanup.stdout
+          and reconciled_payload["temporary_executor"]["temporary_session"]["state"] == "standby",
+          "cleanup reconcile falsely closed or lost the real thread archive action")
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived",
+        "--evidence", "host=set_thread_archived thread_id=temporary-thread-1 archived=true reconcile=true",
+    ])
     protected = run(["git", "rev-parse", delivery_record["protected_ref"]], cwd=project)
     check(protected.stdout.strip() == delivery, "protected delivery evidence was lost during cleanup")
+    missing_thread_original = json.loads(task_path.read_text(encoding="utf-8"))
+    missing_thread = json.loads(json.dumps(missing_thread_original))
+    missing_thread_temp = missing_thread["temporary_executor"]
+    missing_thread_temp["promotion_state"] = "integrated"
+    missing_thread_temp["temporary_session"].update(state="standby", thread_id="", evidence="lost-thread-regression")
+    missing_thread_temp["cleanup_operation"]["state"] = "started"
+    missing_thread_temp["cleanup_operation"]["history"].append({
+        "state": "started", "at": dt.datetime.now(dt.timezone.utc).isoformat(), "via": "missing-thread-regression",
+    })
+    task_path.write_text(json.dumps(missing_thread, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    missing_thread_reconcile = run([
+        sys.executable, str(temporary_tool), "reconcile-cleanup", "--task-id", temporary,
+    ], ok=False)
+    check("真实 thread_id 缺失" in missing_thread_reconcile.stderr,
+          "integrated cleanup without a thread id was misclassified as no-session abandonment")
+    task_path.write_text(json.dumps(missing_thread_original, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     abandoned = enqueue_dev("用户放弃的临时任务", "user_confirmed", "user-requested-temporary-outsourcing")
     abandoned_provision = run([
@@ -1019,11 +1078,14 @@ result: pass
         sys.executable, str(temporary_tool), "cleanup", "--task-id", abandoned,
         "--evidence", "user-approved-abandoned-workspace-cleanup",
     ])
-    check(abandoned_cleanup.stdout.startswith("TEMP_CLEANUP_OK |") and not abandoned_workspace.exists(),
+    check(abandoned_cleanup.stdout.startswith("TEMP_CLEANUP_OK |")
+          and "NO_THREAD_ARCHIVE_REQUIRED" in abandoned_cleanup.stdout
+          and not abandoned_workspace.exists(),
           "abandoned temporary resources were not cleaned")
     abandoned_closed = json.loads(abandoned_path.read_text(encoding="utf-8"))
     check(abandoned_closed["execution_state"] == "completed"
           and abandoned_closed["temporary_executor"]["promotion_state"] == "archived"
+          and abandoned_closed["temporary_executor"]["temporary_session"]["state"] == "cancelled"
           and abandoned_closed["artifacts"] == [f"docs/collaboration/tasks/{abandoned}.json"],
           "abandoned cleanup left the ordinary TASK axis active")
     run([sys.executable, str(task_tool), "list"])
@@ -1038,6 +1100,7 @@ result: pass
     abandoned_crash["report"] = ""
     abandoned_crash["event_receipts"] = []
     abandoned_crash_temp = abandoned_crash["temporary_executor"]
+    abandoned_crash_temp["promotion_state"] = "abandoned"
     abandoned_crash_temp["workspace"]["state"] = "ready"
     abandoned_crash_temp["temporary_session"]["state"] = "standby"
     abandoned_crash_temp["cleanup_operation"]["state"] = "started"
@@ -1049,7 +1112,9 @@ result: pass
         sys.executable, str(temporary_tool), "reconcile-cleanup", "--task-id", abandoned,
     ])
     abandoned_recovered = json.loads(abandoned_path.read_text(encoding="utf-8"))
-    check("archived" in abandoned_reconciled.stdout and abandoned_recovered["execution_state"] == "completed",
+    check("NO_THREAD_ARCHIVE_REQUIRED" in abandoned_reconciled.stdout
+          and abandoned_recovered["execution_state"] == "completed"
+          and abandoned_recovered["temporary_executor"]["temporary_session"]["state"] == "cancelled",
           "abandoned cleanup reconcile left the ordinary TASK axis active")
     abandoned_ack = run([
         sys.executable, str(temporary_tool), "acknowledge", "--task-id", abandoned,
@@ -1067,11 +1132,11 @@ result: pass
     run(["git", "cat-file", "-e", f"{delivery}^{{commit}}"], cwd=project)
     legacy_protocol = collab / "协议版本.json"
     legacy_protocol_payload = json.loads(legacy_protocol.read_text(encoding="utf-8"))
-    legacy_protocol_payload["protocol_version"] = "1.4.0"
+    legacy_protocol_payload["protocol_version"] = "1.4.1"
     legacy_protocol.write_text(json.dumps(legacy_protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     project_guide = project / "docs" / "agent-guide.md"
     project_guide.write_text(
-        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.1", "受管协议版本:1.4.0"),
+        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.3", "受管协议版本:1.4.1"),
         encoding="utf-8",
     )
     corrupt_legacy = json.loads(task_path.read_text(encoding="utf-8"))
@@ -1079,8 +1144,8 @@ result: pass
     task_path.write_text(json.dumps(corrupt_legacy, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     corrupt_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"], ok=False)
     check("temporary_executor 版本或类型无效" in corrupt_upgrade.stderr,
-          "1.4.0 upgrade accepted a corrupt temporary executor truth")
-    check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.0",
+          "1.4.1 upgrade accepted a corrupt temporary executor truth")
+    check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.1",
           "failed temporary TASK preflight advanced protocol")
     corrupt_legacy["temporary_executor"]["executor_type"] = "temporary"
     valid_legacy = json.loads(json.dumps(corrupt_legacy))
@@ -1095,8 +1160,8 @@ result: pass
         damaged["temporary_executor"][field] = malformed
         task_path.write_text(json.dumps(damaged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         rejected = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"], ok=False)
-        check(expected_error in rejected.stderr, f"1.4.0 upgrade accepted malformed nested {field}")
-        check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.0",
+        check(expected_error in rejected.stderr, f"1.4.1 upgrade accepted malformed nested {field}")
+        check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.1",
               f"failed nested {field} preflight advanced protocol")
     for operation_mutation, expected_error in (
         ({"state": "not-a-real-operation-state"}, "operation state 无效"),
@@ -1108,13 +1173,19 @@ result: pass
         damaged["temporary_executor"]["operation"].update(operation_mutation)
         task_path.write_text(json.dumps(damaged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         rejected = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"], ok=False)
-        check(expected_error in rejected.stderr, "1.4.0 upgrade accepted malformed operation")
-        check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.0",
+        check(expected_error in rejected.stderr, "1.4.1 upgrade accepted malformed operation")
+        check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.1",
               "failed operation preflight advanced protocol")
     corrupt_legacy = valid_legacy
     task_path.write_text(json.dumps(corrupt_legacy, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     repaired_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
-    check(repaired_upgrade.stdout.startswith("UPGRADE_OK |"), "valid 1.4.0 temporary TASK did not upgrade to 1.4.1")
+    repaired_payload = json.loads(task_path.read_text(encoding="utf-8"))
+    check(repaired_upgrade.stdout.startswith("UPGRADE_OK |")
+          and "ARCHIVE_THREAD_REQUIRED:temporary-thread-1" in repaired_upgrade.stdout,
+          "valid legacy temporary TASK did not surface the real thread archive repair")
+    check(repaired_payload["temporary_executor"]["temporary_session"]["state"] == "standby"
+          and "旧 archived 记录缺少宿主收据" in repaired_payload["temporary_executor"]["temporary_session"]["evidence"],
+          "legacy upgrade retained an unverified archived session state")
 
 
 def verify_upgrade_and_guards(root: Path) -> None:
@@ -1159,7 +1230,7 @@ def verify_upgrade_and_guards(root: Path) -> None:
     protocol_payload["protocol_version"] = "1.3.0"
     flat_protocol.write_text(json.dumps(protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     flat_guide = flat_project / "docs" / "agent-guide.md"
-    flat_guide.write_text(flat_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.1", "受管协议版本:1.3.0"), encoding="utf-8")
+    flat_guide.write_text(flat_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.3", "受管协议版本:1.3.0"), encoding="utf-8")
     task_tool_before = flat_tool.read_bytes()
     denied_flat = run([sys.executable, str(SCAFFOLD), str(flat_project), "--upgrade-collaboration"], ok=False)
     check("任务真值未通过完整性预检" in denied_flat.stderr, "corrupt flat TASK did not block upgrade")
@@ -1171,7 +1242,7 @@ def verify_upgrade_and_guards(root: Path) -> None:
     clean_flat_upgrade = run([sys.executable, str(SCAFFOLD), str(flat_project), "--upgrade-collaboration"])
     check(clean_flat_upgrade.stdout.startswith("UPGRADE_OK |"), "clean flat 1.3.0 upgrade failed")
     check(flat_task.read_bytes() == flat_original, "clean flat upgrade rewrote TASK truth")
-    check("受管协议版本:1.4.1" in flat_guide.read_text(encoding="utf-8"),
+    check("受管协议版本:1.4.3" in flat_guide.read_text(encoding="utf-8"),
           "upgrade did not refresh project agent-guide")
     current_corrupt = json.loads(flat_original)
     current_corrupt["title"] = "bad\x00title"

@@ -130,6 +130,8 @@ brief 实质 amend 必须带 expected revision 并重新进行并行判断。新
 
 provision、promotion 和 cleanup 都记录 planned、started、succeeded、verified 轨迹。Git ref 已改变但 TASK 未更新，或资源已删除但 TASK 未归档时，reconcile 必须根据真实 ref、worktree 注册、完整 ownership marker 和保护证据恢复；存在一半资源时保留现场并转人工。
 
+cleanup 成功或 reconcile 确认资源已移除后，`promotion_state` 可以进入 `archived`，但存在真实 thread ID 时 `temporary_session` 必须继续保持 `standby` 并返回该 ID。只有宿主会话归档工具成功后，才能用同时包含当前 `thread_id` 和 `archived=true` 的收据把 `temporary_session` 标记为 `archived`；外部归档失败时不得伪造闭环。从未创建真实会话的 abandoned 路径返回无需归档并收口为 `cancelled`。已交付任务在 cleanup 崩溃恢复时若缺失 thread ID，必须转人工核对。
+
 ## 32. 首轮适配诚实边界
 
 数据模型与 preflight 支持任意父部门，但当前完整 workspace、candidate、delivery、tested-tree 和 main 晋升链只开放临时开发外包。设计、研究等专业候选和权威吸收适配完成前，不得声称可完整执行。
@@ -144,7 +146,7 @@ provision、promotion 和 cleanup 都记录 planned、started、succeeded、veri
 
 ## 35. 旧 TASK 深度升级预检
 
-1.4.0 TASK 的 temporary executor、impact、workspace、rule、session、acceptance、candidate、review、delivery、integration、operation 和 absorption 必须在备份与写入前深度验证。operation 还要校验状态枚举、资源元素、历史事件结构，以及当前状态与历史末项一致性。允许安全补齐 1.4.1 新字段，但 executor type、父部门、状态、候选绑定或嵌套结构损坏时升级保持原协议和真值不变。
+旧版 TASK 的 temporary executor、impact、workspace、rule、session、acceptance、candidate、review、delivery、integration、operation 和 absorption 必须在备份与写入前深度验证。operation 还要校验状态枚举、资源元素、历史事件结构，以及当前状态与历史末项一致性。允许安全补齐新字段，但 executor type、父部门、状态、候选绑定或嵌套结构损坏时升级保持原协议和真值不变。旧 `temporary_session=archived` 必须先备份，再退回 `standby` 并返回真实 thread ID，等待宿主归档收据。
 
 ## 自动复验
 

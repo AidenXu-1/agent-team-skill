@@ -23,7 +23,7 @@ else:
     import fcntl
 
 
-PROTOCOL_VERSION = "1.4.1"
+PROTOCOL_VERSION = "1.4.3"
 TASK_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
 SAFE_STATES = {"safe", "manual", "unsafe", "waiting_base"}
 USER_ACCEPTANCE = {"pending", "confirmed", "rejected", "delegated", "not_applicable"}
@@ -400,6 +400,17 @@ def validate_extension(task: dict) -> None:
             if record["state"] not in {"planned", "started", "succeeded", "verified", "failed"}:
                 raise ValueError(f"{field} state 无效")
             validate_operation_history(record["history"], record["state"], field)
+    if session["state"] == "archived":
+        cleanup = temp.get("cleanup_operation")
+        if (
+            not session["thread_id"]
+            or not session["evidence"]
+            or temp["promotion_state"] != "archived"
+            or workspace["state"] != "removed"
+            or not isinstance(cleanup, dict)
+            or cleanup.get("state") != "verified"
+        ):
+            raise ValueError("临时会话 archived 缺少真实归档收据或资源清理证据")
 
 
 def overlap(left: str, right: str) -> bool:
@@ -801,7 +812,7 @@ def temp_task(task_id: str) -> tuple[dict, dict]:
             operation["request_digest"] = "legacy-unknown"
             changed = True
         if "history" not in operation:
-            operation["history"] = [{"state": operation.get("state", "unknown"), "at": now_iso(), "via": "1.4.1-normalize"}]
+            operation["history"] = [{"state": operation.get("state", "unknown"), "at": now_iso(), "via": "legacy-normalize"}]
             changed = True
     acceptance = temp.get("user_acceptance")
     if isinstance(acceptance, dict) and "candidate_digest" not in acceptance:
@@ -829,7 +840,8 @@ def cmd_session(args: argparse.Namespace) -> int:
     state = args.state
     allowed = {
         "active": {"provisioning", "awaiting_rule_confirmation", "failed"}, "standby": {"active"},
-        "archived": {"standby"}, "failed": {"provisioning", "active"}, "cancelled": {"provisioning", "active", "standby"},
+        "archived": {"standby", "archived"}, "failed": {"provisioning", "active"},
+        "cancelled": {"provisioning", "active", "standby"},
     }
     if state not in allowed or temp["temporary_session"]["state"] not in allowed[state]:
         raise ValueError("临时会话状态转换非法")
@@ -840,6 +852,22 @@ def cmd_session(args: argparse.Namespace) -> int:
             raise ValueError("临时会话确认的规则 digest 不匹配")
         temp["temporary_session"].update(state=state, thread_id=thread_id, evidence=evidence)
         temp["rule"]["confirmed_at"] = now_iso()
+    elif state == "archived":
+        cleanup = temp.get("cleanup_operation")
+        if (
+            temp["promotion_state"] != "archived"
+            or temp["workspace"]["state"] != "removed"
+            or not isinstance(cleanup, dict)
+            or cleanup.get("state") != "verified"
+        ):
+            raise ValueError("真实会话只能在临时资源清理验证完成后登记 archived")
+        if not temp["temporary_session"].get("thread_id"):
+            raise ValueError("临时会话缺少真实 thread_id，不能登记 archived")
+        thread_id = temp["temporary_session"]["thread_id"]
+        normalized_evidence = evidence.lower().replace(" ", "")
+        if f"thread_id={thread_id}".lower() not in normalized_evidence or "archived=true" not in normalized_evidence:
+            raise ValueError("真实归档收据必须绑定当前 thread_id 并包含 archived=true")
+        temp["temporary_session"].update(state=state, evidence=evidence)
     else:
         temp["temporary_session"].update(state=state, evidence=evidence)
     write_task(task, expected_revision=task["revision"])
@@ -1327,6 +1355,11 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             raise ValueError("成果已集成但知识吸收尚未最终收口")
     elif temp["promotion_state"] != "abandoned":
         raise ValueError("只有 integrated 或用户明确 abandoned 后可以清理")
+    session = temp["temporary_session"]
+    if session["state"] != "standby":
+        raise ValueError("清理前临时会话必须处于 standby")
+    if temp["promotion_state"] != "abandoned" and not session.get("thread_id"):
+        raise ValueError("已交付临时任务缺少真实 thread_id，不能完成清理")
     delivery = temp.get("delivery")
     if delivery is not None:
         protected_ref = delivery.get("protected_ref", "")
@@ -1379,7 +1412,6 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
         raise
     final_task, final_temp = temp_task(args.task_id)
     final_temp["workspace"]["state"] = "removed"
-    final_temp["temporary_session"]["state"] = "archived"
     final_temp["promotion_state"] = "archived"
     final_temp["operation"]["state"] = "verified"
     final_temp["operation"]["cleanup_evidence"] = evidence
@@ -1387,9 +1419,16 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     final_temp["cleanup_operation"]["history"].extend([
         {"state": "succeeded", "at": now_iso()}, {"state": "verified", "at": now_iso()},
     ])
+    thread_id = final_temp["temporary_session"]["thread_id"]
+    if not thread_id:
+        final_temp["temporary_session"].update(
+            state="cancelled", evidence="未创建真实临时会话，临时资源清理后无需归档",
+        )
     finalize_abandoned_task(final_task, final_temp)
     write_task(final_task, expected_revision=final_task["revision"])
-    print(f"TEMP_CLEANUP_OK | {args.task_id} | protected_delivery_retained")
+    archive_action = f"ARCHIVE_THREAD_REQUIRED:{thread_id}" if thread_id else "NO_THREAD_ARCHIVE_REQUIRED"
+    delivery_receipt = "protected_delivery_retained" if delivery is not None else "no_delivery_user_abandoned"
+    print(f"TEMP_CLEANUP_OK | {args.task_id} | {delivery_receipt} | {archive_action}")
     return 0
 
 
@@ -1401,19 +1440,27 @@ def cmd_reconcile_cleanup(args: argparse.Namespace) -> int:
     workspace = PROJECT / operation["workspace"]
     branch_exists = run_git(PROJECT, "show-ref", "--verify", f"refs/heads/{operation['branch']}", ok=False).returncode == 0
     if not workspace.exists() and not branch_exists:
+        prior_promotion_state = temp["promotion_state"]
+        thread_id = temp["temporary_session"]["thread_id"]
+        if not thread_id and prior_promotion_state != "abandoned":
+            raise ValueError("临时资源已移除但真实 thread_id 缺失，保留 TASK 并转人工核对")
         delivery = temp.get("delivery")
         if delivery:
             protected = run_git(PROJECT, "rev-parse", "--verify", f"{delivery['protected_ref']}^{{commit}}", ok=False)
             if protected.returncode != 0 or protected.stdout.strip() != delivery["locator"]:
                 raise ValueError("清理后 delivery 保护证据缺失，不能完成 reconcile")
         temp["workspace"]["state"] = "removed"
-        temp["temporary_session"]["state"] = "archived"
         temp["promotion_state"] = "archived"
         operation["state"] = "verified"
         operation["history"].append({"state": "verified", "at": now_iso(), "via": "reconcile"})
+        if not thread_id:
+            temp["temporary_session"].update(
+                state="cancelled", evidence="未创建真实临时会话，临时资源清理后无需归档",
+            )
         finalize_abandoned_task(task, temp)
         write_task(task, expected_revision=task["revision"])
-        print(f"TEMP_CLEANUP_RECONCILE_OK | {args.task_id} | archived")
+        archive_action = f"ARCHIVE_THREAD_REQUIRED:{thread_id}" if thread_id else "NO_THREAD_ARCHIVE_REQUIRED"
+        print(f"TEMP_CLEANUP_RECONCILE_OK | {args.task_id} | resources-archived | {archive_action}")
         return 0
     if workspace.exists() and branch_exists:
         operation["state"] = "failed"
