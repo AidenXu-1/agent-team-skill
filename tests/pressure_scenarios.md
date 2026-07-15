@@ -130,7 +130,7 @@ brief 实质 amend 必须带 expected revision 并重新进行并行判断。新
 
 provision、promotion 和 cleanup 都记录 planned、started、succeeded、verified 轨迹。Git ref 已改变但 TASK 未更新，或资源已删除但 TASK 未归档时，reconcile 必须根据真实 ref、worktree 注册、完整 ownership marker 和保护证据恢复；存在一半资源时保留现场并转人工。
 
-cleanup 成功或 reconcile 确认资源已移除后，`promotion_state` 可以进入 `archived`，但存在真实 thread ID 时 `temporary_session` 必须继续保持 `standby` 并返回该 ID。只有宿主会话归档工具成功后，才能用同时包含当前 `thread_id` 和 `archived=true` 的收据把 `temporary_session` 标记为 `archived`；外部归档失败时不得伪造闭环。从未创建真实会话的 abandoned 路径返回无需归档并收口为 `cancelled`。已交付任务在 cleanup 崩溃恢复时若缺失 thread ID，必须转人工核对。
+cleanup 成功或 reconcile 确认资源已移除后，`promotion_state` 可以进入 `archived`，但存在真实 thread ID 时 `temporary_session` 必须继续保持 `standby` 并返回该 ID。有自动归档能力时，只有绑定当前 `thread_id` 且包含 `archived=true` 的真实工具收据才能关闭会话；没有自动能力时，必须先输出具体会话名称、ID 和“我已将该会话归档”固定口令，用户原句确认后才能关闭并继续。没有提醒、含糊回复、错误会话 ID 或伪造自动收据都必须被拒绝。从未创建真实会话的 abandoned 路径返回无需归档并收口为 `cancelled`。已交付任务在 cleanup 崩溃恢复时若缺失 thread ID，必须转人工核对。
 
 ## 32. 首轮适配诚实边界
 

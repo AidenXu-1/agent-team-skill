@@ -200,7 +200,7 @@ worktree 只提供协作隔离和晋升检测。首轮禁止临时执行者接�
 - `acknowledged` 表示统筹部已经接管。
 - `integrated` 表示成果已经进入正式权威载体。
 - `promotion_state=archived` 表示成果、知识、证据和临时 Git 资源已经完成收口。
-- `temporary_session=archived` 只表示宿主返回了真实会话归档成功收据；临时 Git 资源已清理但真实会话尚未归档时，仍保持 `standby`。
+- `temporary_session=archived` 只表示自动归档工具已经返回成功，或用户在指定人工确认门明确回复“我已将该会话归档”；临时 Git 资源已清理但真实会话尚未取得这两类回执时，仍保持 `standby`。
 
 每次返工或实质 amend 增加明确 attempt，并生成新的 `candidate_revision`。任何修改都必须清空旧 candidate、review、delivery 和 integration，退回 `not_submitted`，重生成临时规则并要求会话重新确认。已完成的前置清点和吸收收据同时从当前证据中失效，只保留带旧 attempt 的历史快照供倒查。工具不能自动把旧用户确认、审查、测试或吸收证据套到新成果上。
 
@@ -283,9 +283,21 @@ delivery 是临时执行者的正式交付版本。代码类 delivery 必须使�
 
 清理前核对 delivery 保护、正式吸收证据、未提交文件和资源 ownership。`cleanup` 先安全移除 workspace、处理普通临时分支、删除临时规则；存在真实临时会话时返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`。此时只允许把 `promotion_state` 写为 `archived`，`temporary_session` 继续保持 `standby`。若创建阶段就已放弃、从未产生真实 thread ID，则返回 `NO_THREAD_ARCHIVE_REQUIRED` 并将会话状态收口为 `cancelled`。
 
-统筹部随后用 TASK 登记的 thread ID 调用宿主真实会话归档能力。只有外部工具返回成功，才运行 `session-mark --state archived --evidence "host=set_thread_archived thread_id=<真实ID> archived=true"`；工具会拒绝未绑定当前 thread ID 或缺少 `archived=true` 的说明文字。外部归档失败、超时或收据写入失败时，不得声称会话已归档；保留 `standby`，核对真实状态后按同一 thread ID 幂等重试。宿主若对 inactive / 可能已归档会话返回不确定失败，先读真实状态；仍无法确认时可对同一 ID 受控执行 `unarchive → archive`，只认最后一次明确成功的 archive 收据。这样把“临时资源已经收走”和“侧边栏会话已经归档”分成两张独立收据。
+统筹部随后按宿主能力走两条路径：
 
-从旧协议升级时，旧 `temporary_session=archived` 没有这张宿主收据，升级事务必须先备份 TASK，再把会话退回 `standby`，并返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`。统筹部按当前宿主真实归档并补收据后，才重新进入 `archived`。
+1. 有自动归档工具：立即用 TASK 登记的 thread ID 调用真实归档能力；成功后运行 `session-mark --state archived --archive-mode automatic --evidence "host=<真实工具> thread_id=<真实ID> archived=true"`，随后继续原流程。自动归档失败、超时或收据写入失败时保留 `standby`，核对真实状态后按同一 thread ID 幂等重试。宿主若对 inactive / 可能已归档会话返回不确定失败，先读真实状态；仍无法确认时可对同一 ID 受控执行 `unarchive → archive`，只认最后一次明确成功的 archive 收据。
+2. 没有自动归档工具：运行 `archive-request --task-id <TASK-ID>`，将工具输出原样提醒用户。提醒必须指出具体会话名称和 ID，并要求用户归档完成后回复“我已将该会话归档”。此时暂停后续运行并保留 `standby`。只有收到这句明确回复，才运行 `session-mark --state archived --archive-mode manual --user-confirmation "我已将该会话归档" --evidence "当前用户确认消息"`，随后继续原流程。含糊回复、无回复或用户无法完成归档时继续停在该确认门。
+
+人工提醒的固定格式为：
+
+```text
+请归档临时外包会话「<会话名称>」（会话 ID：<thread_id>）。
+归档完成后，请回复：我已将该会话归档
+```
+
+两条路径把“临时资源已经收走”和“侧边栏会话已经归档”分成两张独立收据，同时让缺少自动工具的 Agent 可以通过用户确认继续运行。
+
+从旧协议升级时，升级事务必须先备份 TASK。1.4.3 中已经绑定真实 thread ID 和 `archived=true` 的有效收据继续保留；更早版本或缺少可信回执的 `temporary_session=archived` 退回 `standby`，并返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`。统筹部按当前宿主完成自动或人工归档闭环后，才重新进入 `archived`。
 
 ## 16. 首轮实现边界
 

@@ -23,7 +23,8 @@ else:
     import fcntl
 
 
-PROTOCOL_VERSION = "1.4.3"
+PROTOCOL_VERSION = "1.4.4"
+MANUAL_ARCHIVE_CONFIRMATION = "我已将该会话归档"
 TASK_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
 SAFE_STATES = {"safe", "manual", "unsafe", "waiting_base"}
 USER_ACCEPTANCE = {"pending", "confirmed", "rejected", "delegated", "not_applicable"}
@@ -835,6 +836,38 @@ def temp_task(task_id: str) -> tuple[dict, dict]:
     return task, temp
 
 
+def archive_ready_session(temp: dict) -> tuple[dict, str]:
+    cleanup = temp.get("cleanup_operation")
+    if (
+        temp["promotion_state"] != "archived"
+        or temp["workspace"]["state"] != "removed"
+        or not isinstance(cleanup, dict)
+        or cleanup.get("state") != "verified"
+    ):
+        raise ValueError("真实会话只能在临时资源清理验证完成后登记 archived")
+    session = temp["temporary_session"]
+    thread_id = session.get("thread_id", "")
+    if not thread_id:
+        raise ValueError("临时会话缺少真实 thread_id，不能登记 archived")
+    return session, thread_id
+
+
+def cmd_archive_request(args: argparse.Namespace) -> int:
+    task, temp = temp_task(args.task_id)
+    session, thread_id = archive_ready_session(temp)
+    if session["state"] != "standby":
+        raise ValueError("只有等待归档的 standby 会话可以请求用户人工归档")
+    session["evidence"] = (
+        f"manual_archive_requested=true thread_id={thread_id} "
+        f"expected_confirmation={MANUAL_ARCHIVE_CONFIRMATION}"
+    )
+    write_task(task, expected_revision=task["revision"])
+    print(f"MANUAL_ARCHIVE_REQUIRED | {args.task_id} | thread_id:{thread_id}")
+    print(f"请归档临时外包会话「{temp['display_name']}」（会话 ID：{thread_id}）。")
+    print(f"归档完成后，请回复：{MANUAL_ARCHIVE_CONFIRMATION}")
+    return 0
+
+
 def cmd_session(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
     state = args.state
@@ -853,22 +886,42 @@ def cmd_session(args: argparse.Namespace) -> int:
         temp["temporary_session"].update(state=state, thread_id=thread_id, evidence=evidence)
         temp["rule"]["confirmed_at"] = now_iso()
     elif state == "archived":
-        cleanup = temp.get("cleanup_operation")
-        if (
-            temp["promotion_state"] != "archived"
-            or temp["workspace"]["state"] != "removed"
-            or not isinstance(cleanup, dict)
-            or cleanup.get("state") != "verified"
-        ):
-            raise ValueError("真实会话只能在临时资源清理验证完成后登记 archived")
-        if not temp["temporary_session"].get("thread_id"):
-            raise ValueError("临时会话缺少真实 thread_id，不能登记 archived")
-        thread_id = temp["temporary_session"]["thread_id"]
-        normalized_evidence = evidence.lower().replace(" ", "")
-        if f"thread_id={thread_id}".lower() not in normalized_evidence or "archived=true" not in normalized_evidence:
-            raise ValueError("真实归档收据必须绑定当前 thread_id 并包含 archived=true")
-        temp["temporary_session"].update(state=state, evidence=evidence)
+        session, thread_id = archive_ready_session(temp)
+        prior_state = session["state"]
+        prior_evidence = session["evidence"]
+        archive_mode = args.archive_mode
+        if archive_mode not in {"automatic", "manual"}:
+            raise ValueError("登记 archived 必须明确 archive-mode=automatic 或 manual")
+        if archive_mode == "automatic":
+            normalized_evidence = evidence.lower().replace(" ", "")
+            if (
+                "host=" not in normalized_evidence
+                or f"thread_id={thread_id}".lower() not in normalized_evidence
+                or "archived=true" not in normalized_evidence
+            ):
+                raise ValueError("自动归档收据必须包含真实 host、绑定当前 thread_id 并包含 archived=true")
+            if args.user_confirmation:
+                raise ValueError("自动归档不能附带人工确认口令")
+            receipt = f"archive_mode=automatic {evidence}"
+        else:
+            if args.user_confirmation != MANUAL_ARCHIVE_CONFIRMATION:
+                raise ValueError(f"人工归档只接受用户明确回复：{MANUAL_ARCHIVE_CONFIRMATION}")
+            normalized_prior = prior_evidence.lower().replace(" ", "")
+            requested = (
+                "manual_archive_requested=true" in normalized_prior
+                and f"thread_id={thread_id}".lower() in normalized_prior
+            )
+            retry = prior_state == "archived" and "archive_mode=manual" in normalized_prior
+            if not requested and not retry:
+                raise ValueError("人工归档前必须先运行 archive-request 并向用户发出指定提醒")
+            receipt = (
+                f"archive_mode=manual thread_id={thread_id} archived=true "
+                f"user_confirmation={MANUAL_ARCHIVE_CONFIRMATION} evidence={evidence}"
+            )
+        session.update(state=state, evidence=receipt[:1000])
     else:
+        if args.archive_mode or args.user_confirmation:
+            raise ValueError("archive-mode 和 user-confirmation 只用于 archived")
         temp["temporary_session"].update(state=state, evidence=evidence)
     write_task(task, expected_revision=task["revision"])
     print(f"TEMP_SESSION_OK | {args.task_id} | {state}")
@@ -1509,11 +1562,16 @@ def parser() -> argparse.ArgumentParser:
     reset_failed.add_argument("--task-id", required=True)
     reset_failed.add_argument("--evidence", required=True)
     reset_failed.set_defaults(func=cmd_reset_failed_provision)
+    archive_request = sub.add_parser("archive-request")
+    archive_request.add_argument("--task-id", required=True)
+    archive_request.set_defaults(func=cmd_archive_request)
     session = sub.add_parser("session-mark")
     session.add_argument("--task-id", required=True)
     session.add_argument("--state", choices=("active", "standby", "archived", "failed", "cancelled"), required=True)
     session.add_argument("--thread-id", default="")
     session.add_argument("--rule-digest", default="")
+    session.add_argument("--archive-mode", choices=("automatic", "manual"), default="")
+    session.add_argument("--user-confirmation", default="")
     session.add_argument("--evidence", required=True)
     session.set_defaults(func=cmd_session)
     reconcile_rule = sub.add_parser("reconcile-rule")

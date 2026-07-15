@@ -167,7 +167,7 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 清理前同时通过成果吸收和知识吸收，并验证 delivery 保护 ref 仍指向正确 commit/tree。知识默认只回到所属正式部门与项目全局 Spec、ADR、conventions、progress 或错题集；其他部门只有明确受影响时才介入。未集成或用户未明确放弃时不得清理，长期无回复只进入 standby。创建、晋升和清理的半失败必须先运行对应 reconcile，不能根据名称猜测重做或删除。
 
-* `cleanup` 只清理受控 workspace / branch；存在真实临时会话时返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`，不能把 TASK 内部状态冒充成真实 Codex 会话已经归档。统筹部收到清理收据后必须立即调用当前宿主的真实会话归档能力；只有归档成功，才运行 `session-mark --state archived --evidence "host=set_thread_archived thread_id=<真实ID> archived=true"`。收据必须绑定 TASK 已登记的 thread ID；外部归档或收据持久化失败时保留 `temporary_session=standby`，明确回报并按同一 thread ID 幂等重试。宿主对 inactive / 可能已归档会话返回不确定失败时，不能把失败文字当收据；先读取真实状态，仍无法确认时可对同一 ID 受控执行 `unarchive → archive`，以最后一次明确成功的 archive 收据为准。若创建阶段就已放弃、从未产生真实 thread ID，则返回 `NO_THREAD_ARCHIVE_REQUIRED` 并把会话状态收口为 `cancelled`。旧协议升级时，缺少宿主收据的 `archived` 会话必须退回 `standby` 并返回同样的归档动作，不能继承旧的账面结论。
+* `cleanup` 只清理受控 workspace / branch；存在真实临时会话时返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`，不能把 TASK 内部状态冒充成真实会话已经归档。统筹部先检查当前宿主能力：有自动归档工具时立即调用，成功后运行 `session-mark --state archived --archive-mode automatic --evidence "host=<真实工具> thread_id=<真实ID> archived=true"` 并继续原流程；没有自动归档工具时运行 `archive-request --task-id ...`，把工具生成的具体会话名称、ID 和固定回复口令原样提醒用户，然后停在该确认门。只有用户回复“我已将该会话归档”，才运行 `session-mark --state archived --archive-mode manual --user-confirmation "我已将该会话归档" --evidence "当前用户确认消息"` 并继续原流程。用户未回复、回复含糊、归档失败或回执写入失败时保留 `temporary_session=standby`，不得静默越过；自动工具对 inactive / 可能已归档会话返回不确定失败时，先读取真实状态，仍无法确认时可对同一 ID 受控执行 `unarchive → archive`，以最后一次明确成功的 archive 收据为准。若创建阶段就已放弃、从未产生真实 thread ID，则返回 `NO_THREAD_ARCHIVE_REQUIRED` 并把会话状态收口为 `cancelled`。旧协议升级时，缺少可信宿主收据的 `archived` 会话必须退回 `standby` 并返回同样的归档动作，不能继承旧的账面结论。
 
 * 所有临时生命周期机械操作使用 `agent_team_temporary.py`。普通任务继续走原有三个工具；临时功能未启用时，正式部门不增加必读文件或状态步骤。
 

@@ -26,7 +26,7 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.4.3"
+PROTOCOL_VERSION = "1.4.4"
 PROTOCOL_FILE = "协议版本.json"
 ADD_TRANSACTION_FILE = ".add-roles-transaction.json"
 
@@ -979,7 +979,7 @@ LOCKS = COLLAB / ".locks"
 SESSION_STATE = COLLAB / "会话启动状态.json"
 INDEX_MARKER = "<!-- agent-team task index; use scripts/agent_team_task.py -->"
 SCHEMA_VERSION = 1
-PROTOCOL_VERSION = "1.4.3"
+PROTOCOL_VERSION = "1.4.4"
 STATES = ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged")
 BUSY_STATES = {"claimed"}
 VISIBLE_ACTIVE_STATES = {"claimed", "blocked", "waiting_input"}
@@ -2686,6 +2686,8 @@ def session_startup_markdown(roles: list[str], session_mode: str, date: str) -> 
 4. 部门会话先短报职责、当前任务和待确认问题;已有授权清楚的 claimed 任务且无冲突时同一轮续做。
 5. 后续任务通过任务工具流转;收件箱由工具重建,会话消息只做短唤醒。
 
+临时外包清理后若当前 Agent 没有自动归档工具,运行 `agent_team_temporary.py archive-request --task-id ...`,将工具生成的具体会话名称、ID 和固定回复口令原样提醒用户,然后暂停。只有用户回复“我已将该会话归档”,才用 `session-mark --state archived --archive-mode manual --user-confirmation "我已将该会话归档" --evidence "当前用户确认消息"` 登记并继续。
+
 ## 同部门换班(需用户授权)
 
 - 会话出现反复遗忘边界、与项目文件矛盾、偏离当前任务或质量明显下降时,先说明具体原因、继续使用旧会话的风险和当前在办事项,然后询问用户是否换班。未获明确同意时保留当前会话,不自动创建、登记或归档。
@@ -2797,7 +2799,7 @@ docs/collaboration/
 7. 设计意图预览仅在用户明确提出或任务列为交付物时制作。触发后必须让用户直接看到，并说明与最终实现的保真差距。
 8. 会话变重时只说明具体症状、风险和当前任务，询问用户是否换班；用户未授权时不自动创建、登记或归档。
 9. 已有授权清楚的 `claimed` 任务且无冲突时，新会话短报接班状态后同一轮续做。
-10. 临时外包最终清理后，必须用 TASK 登记的 thread ID 调用真实会话归档工具；成功后再用 `agent_team_temporary.py session-mark --state archived --evidence "host=set_thread_archived thread_id=<真实ID> archived=true"` 写入收据。归档失败时保持 `temporary_session=standby`；旧协议升级也会把缺少宿主收据的 `archived` 退回 `standby`，不得把资源已清理冒充为真实会话已归档。
+10. 临时外包最终清理后先检查宿主能力。有自动归档工具时立即归档，用 `agent_team_temporary.py session-mark --state archived --archive-mode automatic --evidence "host=<真实工具> thread_id=<真实ID> archived=true"` 写入收据并继续；没有自动工具时运行 `archive-request --task-id ...`，原样提醒用户归档具体会话并回复“我已将该会话归档”，收到原句后用 `--archive-mode manual --user-confirmation "我已将该会话归档"` 登记并继续。未取得对应回执时保持 `temporary_session=standby`，不得静默越过。
 11. `LOG_OK` 只用于 `MILESTONE / CHANGE / CORRECTION / DECISION / INCIDENT`，普通任务不凑日志。
 
 ## 报告
@@ -3644,7 +3646,16 @@ def run_upgrade(collab: Path) -> int:
                     continue
                 session = temporary.get("temporary_session")
                 if isinstance(session, dict) and session.get("state") == "archived":
-                    legacy_archive_repairs.append((source, payload["task_id"], session["thread_id"]))
+                    thread_id = session.get("thread_id", "")
+                    normalized_evidence = session.get("evidence", "").lower().replace(" ", "")
+                    verified_143_receipt = (
+                        previous_protocol_version == "1.4.3"
+                        and bool(thread_id)
+                        and f"thread_id={thread_id}".lower() in normalized_evidence
+                        and "archived=true" in normalized_evidence
+                    )
+                    if not verified_143_receipt:
+                        legacy_archive_repairs.append((source, payload["task_id"], thread_id))
     date = dt.date.today().isoformat()
     session_data = registry_session_data(registry_text)
     pending_legacy = []
