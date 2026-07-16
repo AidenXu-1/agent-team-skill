@@ -200,7 +200,7 @@ worktree 只提供协作隔离和晋升检测。首轮禁止临时执行者接�
 - `acknowledged` 表示统筹部已经接管。
 - `integrated` 表示成果已经进入正式权威载体。
 - `promotion_state=archived` 表示成果、知识、证据和临时 Git 资源已经完成收口。
-- `temporary_session=archived` 只表示自动归档工具已经返回成功，或用户在指定人工确认门明确回复“我已将该会话归档”；临时 Git 资源已清理但真实会话尚未取得这两类回执时，仍保持 `standby`。
+- `temporary_session=archived` 只表示当前归档工具已经返回成功，或用户明确告诉 AI 已完成手动归档；临时 Git 资源已清理但真实会话尚未取得其中一种回执时，仍保持 `standby`。
 
 每次返工或实质 amend 增加明确 attempt，并生成新的 `candidate_revision`。任何修改都必须清空旧 candidate、review、delivery 和 integration，退回 `not_submitted`，重生成临时规则并要求会话重新确认。已完成的前置清点和吸收收据同时从当前证据中失效，只保留带旧 attempt 的历史快照供倒查。工具不能自动把旧用户确认、审查、测试或吸收证据套到新成果上。
 
@@ -283,21 +283,20 @@ delivery 是临时执行者的正式交付版本。代码类 delivery 必须使�
 
 清理前核对 delivery 保护、正式吸收证据、未提交文件和资源 ownership。`cleanup` 先安全移除 workspace、处理普通临时分支、删除临时规则；存在真实临时会话时返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`。此时只允许把 `promotion_state` 写为 `archived`，`temporary_session` 继续保持 `standby`。若创建阶段就已放弃、从未产生真实 thread ID，则返回 `NO_THREAD_ARCHIVE_REQUIRED` 并将会话状态收口为 `cancelled`。
 
-统筹部随后按宿主能力走两条路径：
+统筹部随后直接根据当前可用工具走两条轻量路径：
 
-1. 有自动归档工具：立即用 TASK 登记的 thread ID 调用真实归档能力；成功后运行 `session-mark --state archived --archive-mode automatic --evidence "host=<真实工具> thread_id=<真实ID> archived=true"`，随后继续原流程。自动归档失败、超时或收据写入失败时保留 `standby`，核对真实状态后按同一 thread ID 幂等重试。宿主若对 inactive / 可能已归档会话返回不确定失败，先读真实状态；仍无法确认时可对同一 ID 受控执行 `unarchive → archive`，只认最后一次明确成功的 archive 收据。
-2. 没有自动归档工具：运行 `archive-request --task-id <TASK-ID>`，将工具输出原样提醒用户。提醒必须指出具体会话名称和 ID，并要求用户归档完成后回复“我已将该会话归档”。此时暂停后续运行并保留 `standby`。只有收到这句明确回复，才运行 `session-mark --state archived --archive-mode manual --user-confirmation "我已将该会话归档" --evidence "当前用户确认消息"`，随后继续原流程。含糊回复、无回复或用户无法完成归档时继续停在该确认门。
+1. 当前工具列表里有真实会话归档能力：立即用 TASK 登记的 thread ID 调用；成功后运行 `session-mark --state archived --evidence "host=<真实工具> thread_id=<真实ID> archived=true"`，随后继续。自动调用失败时使用同一句人工提醒。
+2. 当前没有可用归档工具：直接提醒用户归档具体会话，并请用户完成后告诉 AI 一声。提醒后保留 `standby`，但不建立脚本硬闸；其他不依赖归档结果的安全工作可以继续。用户之后以任何清楚的说法表示已经完成，运行 `session-mark --state archived --evidence "user_confirmation=<用户确认指针> thread_id=<真实ID> archived=true"` 登记即可。
 
-人工提醒的固定格式为：
+人工提醒统一使用这一句话：
 
 ```text
-请归档临时外包会话「<会话名称>」（会话 ID：<thread_id>）。
-归档完成后，请回复：我已将该会话归档
+我目前无法自动归档这个会话。请你手动归档临时外包会话「<会话名称>」（会话 ID：<thread_id>），归档完成后告诉我一声。
 ```
 
-两条路径把“临时资源已经收走”和“侧边栏会话已经归档”分成两张独立收据，同时让缺少自动工具的 Agent 可以通过用户确认继续运行。
+用户没有回复时，AI 只保留“待归档”的事实，不需要阻断整个项目。两条路径仍把“临时资源已经收走”和“侧边栏会话已经归档”分成两张独立收据。
 
-从旧协议升级时，升级事务必须先备份 TASK。1.4.3 中已经绑定真实 thread ID 和 `archived=true` 的有效收据继续保留；更早版本或缺少可信回执的 `temporary_session=archived` 退回 `standby`，并返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`。统筹部按当前宿主完成自动或人工归档闭环后，才重新进入 `archived`。
+从旧协议升级时，升级事务必须先备份 TASK。1.4.3 和 1.4.4 中已经绑定真实 thread ID、`archived=true` 与真实来源的有效收据继续保留；更早版本或缺少可信回执的 `temporary_session=archived` 退回 `standby`，并返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`。已经完成资源清理但仍在 `standby` 的旧任务也会重新返回该归档动作，避免遗留会话继续沉默。
 
 ## 16. 首轮实现边界
 

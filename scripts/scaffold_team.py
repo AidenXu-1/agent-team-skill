@@ -26,7 +26,7 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.4.4"
+PROTOCOL_VERSION = "1.4.5"
 PROTOCOL_FILE = "协议版本.json"
 ADD_TRANSACTION_FILE = ".add-roles-transaction.json"
 
@@ -54,6 +54,25 @@ ensure_utf8_filesystem_runtime()
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def archive_receipt_fields(evidence: str) -> dict[str, set[str]]:
+    fields: dict[str, set[str]] = {}
+    for token in evidence.split():
+        key, separator, value = token.partition("=")
+        normalized_value = value.casefold()
+        if separator and key and normalized_value and not normalized_value.startswith("="):
+            fields.setdefault(key.casefold(), set()).add(normalized_value)
+    return fields
+
+
+def valid_archive_receipt(evidence: str, thread_id: str) -> bool:
+    fields = archive_receipt_fields(evidence)
+    return (
+        fields.get("thread_id") == {thread_id.casefold()}
+        and fields.get("archived") == {"true"}
+        and bool(fields.get("host") or fields.get("user_confirmation"))
+    )
 
 
 class CollaborationBusyError(RuntimeError):
@@ -979,7 +998,7 @@ LOCKS = COLLAB / ".locks"
 SESSION_STATE = COLLAB / "会话启动状态.json"
 INDEX_MARKER = "<!-- agent-team task index; use scripts/agent_team_task.py -->"
 SCHEMA_VERSION = 1
-PROTOCOL_VERSION = "1.4.4"
+PROTOCOL_VERSION = "1.4.5"
 STATES = ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged")
 BUSY_STATES = {"claimed"}
 VISIBLE_ACTIVE_STATES = {"claimed", "blocked", "waiting_input"}
@@ -2686,7 +2705,7 @@ def session_startup_markdown(roles: list[str], session_mode: str, date: str) -> 
 4. 部门会话先短报职责、当前任务和待确认问题;已有授权清楚的 claimed 任务且无冲突时同一轮续做。
 5. 后续任务通过任务工具流转;收件箱由工具重建,会话消息只做短唤醒。
 
-临时外包清理后若当前 Agent 没有自动归档工具,运行 `agent_team_temporary.py archive-request --task-id ...`,将工具生成的具体会话名称、ID 和固定回复口令原样提醒用户,然后暂停。只有用户回复“我已将该会话归档”,才用 `session-mark --state archived --archive-mode manual --user-confirmation "我已将该会话归档" --evidence "当前用户确认消息"` 登记并继续。
+临时外包清理后,当前 Agent 有归档工具就直接执行;调用失败或没有工具时提醒用户:“我目前无法自动归档这个会话。请你手动归档临时外包会话「<会话名称>」（会话 ID：<真实ID>）,归档完成后告诉我一声。”提醒不形成脚本硬闸;未确认前保持待归档,其他不依赖归档结果的安全工作可以继续。用户之后明确表示已完成时,再用绑定 thread ID 的 `user_confirmation` 收据登记。
 
 ## 同部门换班(需用户授权)
 
@@ -2799,7 +2818,7 @@ docs/collaboration/
 7. 设计意图预览仅在用户明确提出或任务列为交付物时制作。触发后必须让用户直接看到，并说明与最终实现的保真差距。
 8. 会话变重时只说明具体症状、风险和当前任务，询问用户是否换班；用户未授权时不自动创建、登记或归档。
 9. 已有授权清楚的 `claimed` 任务且无冲突时，新会话短报接班状态后同一轮续做。
-10. 临时外包最终清理后先检查宿主能力。有自动归档工具时立即归档，用 `agent_team_temporary.py session-mark --state archived --archive-mode automatic --evidence "host=<真实工具> thread_id=<真实ID> archived=true"` 写入收据并继续；没有自动工具时运行 `archive-request --task-id ...`，原样提醒用户归档具体会话并回复“我已将该会话归档”，收到原句后用 `--archive-mode manual --user-confirmation "我已将该会话归档"` 登记并继续。未取得对应回执时保持 `temporary_session=standby`，不得静默越过。
+10. 临时外包最终清理后直接看当前可用工具。有归档工具时立即调用,成功后用 `agent_team_temporary.py session-mark --state archived --evidence "host=<真实工具> thread_id=<真实ID> archived=true"` 登记;调用失败或没有工具时提醒用户:“我目前无法自动归档这个会话。请你手动归档临时外包会话「<会话名称>」（会话 ID：<真实ID>）,归档完成后告诉我一声。”提醒不阻断其他安全工作;用户未确认前保持 `temporary_session=standby`,之后收到明确确认再用 `user_confirmation=<确认指针> thread_id=<真实ID> archived=true` 登记。
 11. `LOG_OK` 只用于 `MILESTONE / CHANGE / CORRECTION / DECISION / INCIDENT`，普通任务不凑日志。
 
 ## 报告
@@ -3350,7 +3369,11 @@ def validate_upgrade_temporary(value: object, source: Path, department: str) -> 
     }:
         raise ValueError(f"temporary_executor 晋升状态无效: {source}")
     session = value["temporary_session"]
-    if not isinstance(session, dict) or session.get("state") not in {
+    if not isinstance(session, dict) or set(session) != {"state", "thread_id", "evidence"} or any(
+        not isinstance(session[key], str) for key in session
+    ):
+        raise ValueError(f"temporary_executor 会话结构无效: {source}")
+    if session["state"] not in {
         "provisioning", "awaiting_rule_confirmation", "active", "standby", "archived", "failed", "cancelled",
     }:
         raise ValueError(f"temporary_executor 会话状态无效: {source}")
@@ -3633,6 +3656,7 @@ def run_upgrade(collab: Path) -> int:
         print(f"UPGRADE_NOT_NEEDED | protocol:{PROTOCOL_VERSION}")
         return 0
     legacy_archive_repairs: list[tuple[Path, str, str]] = []
+    pending_archive_actions: list[tuple[str, str]] = []
     tasks_root = collab / "tasks"
     if previous_protocol_version != PROTOCOL_VERSION and tasks_root.exists():
         for entry in tasks_root.iterdir():
@@ -3647,15 +3671,24 @@ def run_upgrade(collab: Path) -> int:
                 session = temporary.get("temporary_session")
                 if isinstance(session, dict) and session.get("state") == "archived":
                     thread_id = session.get("thread_id", "")
-                    normalized_evidence = session.get("evidence", "").lower().replace(" ", "")
-                    verified_143_receipt = (
-                        previous_protocol_version == "1.4.3"
+                    verified_recent_receipt = (
+                        previous_protocol_version in {"1.4.3", "1.4.4"}
                         and bool(thread_id)
-                        and f"thread_id={thread_id}".lower() in normalized_evidence
-                        and "archived=true" in normalized_evidence
+                        and valid_archive_receipt(session.get("evidence", ""), thread_id)
                     )
-                    if not verified_143_receipt:
+                    if not verified_recent_receipt:
                         legacy_archive_repairs.append((source, payload["task_id"], thread_id))
+                elif (
+                    isinstance(session, dict)
+                    and session.get("state") == "standby"
+                    and session.get("thread_id")
+                    and temporary.get("promotion_state") == "archived"
+                    and isinstance(temporary.get("workspace"), dict)
+                    and temporary["workspace"].get("state") == "removed"
+                    and isinstance(temporary.get("cleanup_operation"), dict)
+                    and temporary["cleanup_operation"].get("state") == "verified"
+                ):
+                    pending_archive_actions.append((payload["task_id"], session["thread_id"]))
     date = dt.date.today().isoformat()
     session_data = registry_session_data(registry_text)
     pending_legacy = []
@@ -3870,6 +3903,11 @@ def run_upgrade(collab: Path) -> int:
         print(
             f"ARCHIVE_THREAD_REQUIRED:{thread_id} | task:{task_id}"
             f" | reason:legacy-unverified-archive"
+        )
+    for task_id, thread_id in pending_archive_actions:
+        print(
+            f"ARCHIVE_THREAD_REQUIRED:{thread_id} | task:{task_id}"
+            f" | reason:existing-standby-archive"
         )
     return 0
 

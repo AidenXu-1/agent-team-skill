@@ -130,7 +130,7 @@ brief 实质 amend 必须带 expected revision 并重新进行并行判断。新
 
 provision、promotion 和 cleanup 都记录 planned、started、succeeded、verified 轨迹。Git ref 已改变但 TASK 未更新，或资源已删除但 TASK 未归档时，reconcile 必须根据真实 ref、worktree 注册、完整 ownership marker 和保护证据恢复；存在一半资源时保留现场并转人工。
 
-cleanup 成功或 reconcile 确认资源已移除后，`promotion_state` 可以进入 `archived`，但存在真实 thread ID 时 `temporary_session` 必须继续保持 `standby` 并返回该 ID。有自动归档能力时，只有绑定当前 `thread_id` 且包含 `archived=true` 的真实工具收据才能关闭会话；没有自动能力时，必须先输出具体会话名称、ID 和“我已将该会话归档”固定口令，用户原句确认后才能关闭并继续。没有提醒、含糊回复、错误会话 ID 或伪造自动收据都必须被拒绝。从未创建真实会话的 abandoned 路径返回无需归档并收口为 `cancelled`。已交付任务在 cleanup 崩溃恢复时若缺失 thread ID，必须转人工核对。
+cleanup 成功或 reconcile 确认资源已移除后，`promotion_state` 可以进入 `archived`，但存在真实 thread ID 时 `temporary_session` 必须继续保持 `standby` 并返回该 ID。AI 当前有归档工具时直接执行并记录绑定 thread ID 的成功收据；没有时提醒用户归档具体会话并在完成后告诉 AI，不设置固定口令或全流程硬锁。用户未确认前不得声称已归档，但其他不依赖该归档结果的安全工作可以继续；之后收到明确确认即可登记。错误 thread ID、缺少 `archived=true` 或既无 host 也无 user_confirmation 的回执必须拒绝。从未创建真实会话的 abandoned 路径返回无需归档并收口为 `cancelled`。已交付任务在 cleanup 崩溃恢复时若缺失 thread ID，必须转人工核对。
 
 ## 32. 首轮适配诚实边界
 
@@ -146,7 +146,7 @@ cleanup 成功或 reconcile 确认资源已移除后，`promotion_state` 可以�
 
 ## 35. 旧 TASK 深度升级预检
 
-旧版 TASK 的 temporary executor、impact、workspace、rule、session、acceptance、candidate、review、delivery、integration、operation 和 absorption 必须在备份与写入前深度验证。operation 还要校验状态枚举、资源元素、历史事件结构，以及当前状态与历史末项一致性。允许安全补齐新字段，但 executor type、父部门、状态、候选绑定或嵌套结构损坏时升级保持原协议和真值不变。旧 `temporary_session=archived` 必须先备份，再退回 `standby` 并返回真实 thread ID，等待宿主归档收据。
+旧版 TASK 的 temporary executor、impact、workspace、rule、session、acceptance、candidate、review、delivery、integration、operation 和 absorption 必须在备份与写入前深度验证。operation 还要校验状态枚举、资源元素、历史事件结构，以及当前状态与历史末项一致性。允许安全补齐新字段，但 executor type、父部门、状态、候选绑定或嵌套结构损坏时升级保持原协议和真值不变。1.4.3 和 1.4.4 中绑定真实 thread ID、`archived=true` 与真实来源的有效回执继续保留；更早版本或缺少可信回执的 `temporary_session=archived` 必须先备份，再退回 `standby` 并返回真实 thread ID。已经完成资源清理但仍在 `standby` 的旧任务，升级时重新返回归档动作，但不改写事实或形成全流程硬锁。
 
 ## 自动复验
 

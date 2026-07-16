@@ -113,17 +113,22 @@ def verify_generated(project: Path) -> None:
     check(not (collab / "读取路由规则.md").exists(), "obsolete reading rules generated")
     check(not (collab / "scripts" / "agent_team_read.py").exists(), "obsolete reader generated")
     protocol = json.loads((collab / "协议版本.json").read_text(encoding="utf-8"))
-    check(protocol["protocol_version"] == "1.4.4", "unexpected protocol version")
+    check(protocol["protocol_version"] == "1.4.5", "unexpected protocol version")
     for script in (collab / "scripts").glob("*.py"):
         py_compile.compile(str(script), doraise=True)
     guide = (project / "docs" / "agent-guide.md").read_text(encoding="utf-8")
-    check("受管协议版本:1.4.4" in guide and "任务真值" in guide, "project guide not refreshed")
+    check("受管协议版本:1.4.5" in guide and "任务真值" in guide, "project guide not refreshed")
     collaboration_readme = (collab / "README.md").read_text(encoding="utf-8")
-    check("archive-request" in collaboration_readme
-          and "我已将该会话归档" in collaboration_readme
-          and "--archive-mode automatic" in collaboration_readme
+    check("有归档工具时立即调用" in collaboration_readme
+          and "host=<真实工具>" in collaboration_readme
+          and "调用失败或没有工具时提醒用户" in collaboration_readme
+          and "我目前无法自动归档这个会话" in collaboration_readme
+          and "归档完成后告诉我一声" in collaboration_readme
+          and "user_confirmation=" in collaboration_readme
           and "temporary_session=standby" in collaboration_readme,
-          "generated collaboration guide omitted the automatic/manual archive gate")
+          "generated collaboration guide omitted the automatic path or lightweight manual fallback")
+    check("archive-request" not in collaboration_readme and "--archive-mode" not in collaboration_readme,
+          "generated collaboration guide retained the rejected hard archive gate")
     for department in ("统筹部", "执行部", "检验部"):
         root = collab / "部门" / department
         check((root / "报告").is_dir() and (root / "日志").is_dir(), "department output directories missing")
@@ -669,7 +674,7 @@ def verify_temporary_executor(root: Path) -> None:
     normalized_temp = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]
     check("promotion_operation" in normalized_temp and "cleanup_operation" in normalized_temp
           and normalized_temp["operation"]["request_digest"] == "legacy-unknown",
-          "legacy temporary TASK did not normalize safely for 1.4.4")
+          "legacy temporary TASK did not normalize safely for 1.4.5")
     copied_scripts = workspace / "docs" / "collaboration" / "scripts"
     copied_task_list = run([sys.executable, str(copied_scripts / "agent_team_task.py"), "list"])
     check(temporary in copied_task_list.stdout, "worktree task tool read the non-authoritative TASK copy")
@@ -1000,57 +1005,81 @@ result: pass
           "resource cleanup falsely marked the real temporary session archived")
     unbound_archive_receipt = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived", "--archive-mode", "automatic",
-        "--evidence", "host-archive-receipt-1",
+        "--state", "archived", "--evidence", "host=set_thread_archived archived=true",
     ], ok=False)
     check("绑定当前 thread_id" in unbound_archive_receipt.stderr,
           "temporary session accepted an archive receipt not bound to the real thread")
-    hostless_archive_receipt = run([
+    sourceless_archive_receipt = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived", "--archive-mode", "automatic",
-        "--evidence", "thread_id=temporary-thread-1 archived=true",
+        "--state", "archived", "--evidence", "thread_id=temporary-thread-1 archived=true",
     ], ok=False)
-    check("必须包含真实 host" in hostless_archive_receipt.stderr,
-          "automatic archive path accepted a receipt without a host tool identity")
-    manual_without_prompt = run([
+    check("host 或 user_confirmation" in sourceless_archive_receipt.stderr,
+          "archive path accepted a receipt without an automatic or user-confirmation source")
+    wrong_thread_archive_receipt = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived", "--archive-mode", "manual",
-        "--user-confirmation", "我已将该会话归档", "--evidence", "user-confirmed-without-prompt",
+        "--state", "archived",
+        "--evidence", "host=set_thread_archived thread_id=temporary-thread-1-extra archived=true",
     ], ok=False)
-    check("必须先运行 archive-request" in manual_without_prompt.stderr,
-          "manual archive confirmation bypassed the user reminder gate")
-    manual_prompt = run([
-        sys.executable, str(temporary_tool), "archive-request", "--task-id", temporary,
-    ])
-    check("MANUAL_ARCHIVE_REQUIRED" in manual_prompt.stdout
-          and "临时开发外包" in manual_prompt.stdout
-          and "temporary-thread-1" in manual_prompt.stdout
-          and "归档完成后，请回复：我已将该会话归档" in manual_prompt.stdout,
-          "manual archive fallback did not identify the session and exact confirmation phrase")
-    wrong_manual_confirmation = run([
+    check("绑定当前 thread_id" in wrong_thread_archive_receipt.stderr,
+          "archive path accepted a prefixed but incorrect thread ID")
+    empty_host_archive_receipt = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived", "--archive-mode", "manual",
-        "--user-confirmation", "已经处理好了", "--evidence", "ambiguous-user-message",
+        "--state", "archived",
+        "--evidence", "host= thread_id=temporary-thread-1 archived=true",
     ], ok=False)
-    check("只接受用户明确回复" in wrong_manual_confirmation.stderr,
-          "manual archive gate accepted an ambiguous user reply")
-    manual_archive = run([
+    check("host 或 user_confirmation" in empty_host_archive_receipt.stderr,
+          "archive path accepted an empty host source")
+    empty_user_archive_receipt = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived", "--archive-mode", "manual",
-        "--user-confirmation", "我已将该会话归档", "--evidence", "current-user-message",
-    ])
-    manually_archived = json.loads(task_path.read_text(encoding="utf-8"))
-    check(manual_archive.stdout.startswith("TEMP_SESSION_OK |")
-          and manually_archived["temporary_executor"]["temporary_session"]["state"] == "archived"
-          and "archive_mode=manual" in manually_archived["temporary_executor"]["temporary_session"]["evidence"],
-          "exact user confirmation did not close the manual archive gate")
-    manual_archive_retry = run([
+        "--state", "archived",
+        "--evidence", "user_confirmation= thread_id=temporary-thread-1 archived=true",
+    ], ok=False)
+    check("host 或 user_confirmation" in empty_user_archive_receipt.stderr,
+          "archive path accepted an empty user-confirmation source")
+    inexact_archived_flag = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived", "--archive-mode", "manual",
-        "--user-confirmation", "我已将该会话归档", "--evidence", "current-user-message-retry",
+        "--state", "archived",
+        "--evidence", "host=set_thread_archived thread_id=temporary-thread-1 archived=trueish",
+    ], ok=False)
+    check("包含 archived=true" in inexact_archived_flag.stderr,
+          "archive path accepted an inexact archived flag")
+    conflicting_thread_receipt = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived",
+        "--evidence", (
+            "host=set_thread_archived thread_id=temporary-thread-1 "
+            "thread_id=another-thread archived=true"
+        ),
+    ], ok=False)
+    check("绑定当前 thread_id" in conflicting_thread_receipt.stderr,
+          "archive path accepted conflicting thread IDs")
+    conflicting_archived_receipt = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived",
+        "--evidence", (
+            "host=set_thread_archived thread_id=temporary-thread-1 "
+            "archived=false archived=true"
+        ),
+    ], ok=False)
+    check("包含 archived=true" in conflicting_archived_receipt.stderr,
+          "archive path accepted conflicting archived flags")
+    automatic_archive = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived",
+        "--evidence", "host=set_thread_archived thread_id=temporary-thread-1 archived=true",
     ])
-    check(manual_archive_retry.stdout.startswith("TEMP_SESSION_OK |"),
-          "idempotent manual archive receipt retry was rejected")
+    automatically_archived = json.loads(task_path.read_text(encoding="utf-8"))
+    check(automatic_archive.stdout.startswith("TEMP_SESSION_OK |")
+          and automatically_archived["temporary_executor"]["temporary_session"]["state"] == "archived"
+          and "host=set_thread_archived" in automatically_archived["temporary_executor"]["temporary_session"]["evidence"],
+          "real host archive receipt did not close the automatic path")
+    automatic_archive_retry = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived",
+        "--evidence", "host=set_thread_archived thread_id=temporary-thread-1 archived=true retry=true",
+    ])
+    check(automatic_archive_retry.stdout.startswith("TEMP_SESSION_OK |"),
+          "idempotent automatic archive receipt retry was rejected")
     cleanup_crash = json.loads(task_path.read_text(encoding="utf-8"))
     cleanup_crash_temp = cleanup_crash["temporary_executor"]
     cleanup_crash_temp["promotion_state"] = "integrated"
@@ -1068,21 +1097,22 @@ result: pass
     check("ARCHIVE_THREAD_REQUIRED:temporary-thread-1" in reconciled_cleanup.stdout
           and reconciled_payload["temporary_executor"]["temporary_session"]["state"] == "standby",
           "cleanup reconcile falsely closed or lost the real thread archive action")
-    run([
+    manual_archive = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived", "--archive-mode", "automatic",
-        "--evidence", "host=set_thread_archived thread_id=temporary-thread-1 archived=true reconcile=true",
+        "--state", "archived",
+        "--evidence", "user_confirmation=用户明确说已经归档 thread_id=temporary-thread-1 archived=true",
     ])
-    automatically_archived = json.loads(task_path.read_text(encoding="utf-8"))
-    check("archive_mode=automatic" in automatically_archived["temporary_executor"]["temporary_session"]["evidence"],
-          "real host archive receipt did not close the automatic archive path")
-    automatic_archive_retry = run([
+    manually_archived = json.loads(task_path.read_text(encoding="utf-8"))
+    check(manual_archive.stdout.startswith("TEMP_SESSION_OK |")
+          and "user_confirmation=" in manually_archived["temporary_executor"]["temporary_session"]["evidence"],
+          "clear user confirmation did not close the lightweight manual archive path")
+    manual_archive_retry = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived", "--archive-mode", "automatic",
-        "--evidence", "host=set_thread_archived thread_id=temporary-thread-1 archived=true retry=true",
+        "--state", "archived",
+        "--evidence", "user_confirmation=用户再次确认 thread_id=temporary-thread-1 archived=true retry=true",
     ])
-    check(automatic_archive_retry.stdout.startswith("TEMP_SESSION_OK |"),
-          "idempotent automatic archive receipt retry was rejected")
+    check(manual_archive_retry.stdout.startswith("TEMP_SESSION_OK |"),
+          "idempotent manual archive receipt retry was rejected")
     protected = run(["git", "rev-parse", delivery_record["protected_ref"]], cwd=project)
     check(protected.stdout.strip() == delivery, "protected delivery evidence was lost during cleanup")
     missing_thread_original = json.loads(task_path.read_text(encoding="utf-8"))
@@ -1181,7 +1211,7 @@ result: pass
     legacy_protocol.write_text(json.dumps(legacy_protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     project_guide = project / "docs" / "agent-guide.md"
     project_guide.write_text(
-        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.4", "受管协议版本:1.4.1"),
+        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.1"),
         encoding="utf-8",
     )
     corrupt_legacy = json.loads(task_path.read_text(encoding="utf-8"))
@@ -1221,6 +1251,24 @@ result: pass
         check(expected_error in rejected.stderr, "1.4.1 upgrade accepted malformed operation")
         check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.1",
               "failed operation preflight advanced protocol")
+    valid_session = valid_legacy["temporary_executor"]["temporary_session"]
+    malformed_sessions = (
+        ("not-dict", ["not", "a", "session"]),
+        ("missing-key", {key: value for key, value in valid_session.items() if key != "evidence"}),
+        ("extra-key", {**valid_session, "unexpected": "field"}),
+        ("state-type", {**valid_session, "state": 42}),
+        ("thread-id-type", {**valid_session, "thread_id": 42}),
+        ("evidence-type", {**valid_session, "evidence": ["not", "text"]}),
+    )
+    for label, malformed_session in malformed_sessions:
+        damaged = json.loads(json.dumps(valid_legacy))
+        damaged["temporary_executor"]["temporary_session"] = malformed_session
+        task_path.write_text(json.dumps(damaged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        rejected = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"], ok=False)
+        check("temporary_executor 会话结构无效" in rejected.stderr,
+              f"1.4.1 upgrade did not cleanly reject malformed session {label}")
+        check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.1",
+              f"failed session {label} preflight advanced protocol")
     corrupt_legacy = valid_legacy
     task_path.write_text(json.dumps(corrupt_legacy, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     repaired_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
@@ -1231,23 +1279,128 @@ result: pass
     check(repaired_payload["temporary_executor"]["temporary_session"]["state"] == "standby"
           and "旧 archived 记录缺少宿主收据" in repaired_payload["temporary_executor"]["temporary_session"]["evidence"],
           "legacy upgrade retained an unverified archived session state")
+    for invalid_evidence, label in (
+        ("host= thread_id=temporary-thread-1 archived=true", "empty-source"),
+        ("host=set_thread_archived thread_id=temporary-thread-1-extra archived=true", "wrong-thread"),
+        ("host=set_thread_archived thread_id=temporary-thread-1 archived=trueish", "inexact-flag"),
+        (
+            "host=set_thread_archived thread_id=temporary-thread-1 "
+            "thread_id=another-thread archived=true",
+            "conflicting-thread",
+        ),
+        (
+            "host=set_thread_archived thread_id=temporary-thread-1 archived=false archived=true",
+            "conflicting-flag",
+        ),
+    ):
+        invalid_144_receipt = json.loads(task_path.read_text(encoding="utf-8"))
+        invalid_144_receipt["temporary_executor"]["temporary_session"].update(
+            state="archived",
+            evidence=invalid_evidence,
+        )
+        task_path.write_text(json.dumps(invalid_144_receipt, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        current_protocol_payload = json.loads(legacy_protocol.read_text(encoding="utf-8"))
+        current_protocol_payload["protocol_version"] = "1.4.4"
+        legacy_protocol.write_text(json.dumps(current_protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        project_guide.write_text(
+            project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.4"),
+            encoding="utf-8",
+        )
+        rejected_144_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+        rejected_144_payload = json.loads(task_path.read_text(encoding="utf-8"))
+        check("ARCHIVE_THREAD_REQUIRED:temporary-thread-1" in rejected_144_upgrade.stdout
+              and rejected_144_payload["temporary_executor"]["temporary_session"]["state"] == "standby",
+              f"1.4.4 upgrade retained an invalid {label} archive receipt")
+
+    receipt_143 = "host=set_thread_archived thread_id=temporary-thread-1 archived=true"
     run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived", "--archive-mode", "automatic",
-        "--evidence", "host=set_thread_archived thread_id=temporary-thread-1 archived=true preserved-upgrade=true",
+        "--state", "archived",
+        "--evidence", receipt_143,
     ])
-    current_protocol_payload = json.loads(legacy_protocol.read_text(encoding="utf-8"))
-    current_protocol_payload["protocol_version"] = "1.4.3"
-    legacy_protocol.write_text(json.dumps(current_protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    protocol_143_payload = json.loads(legacy_protocol.read_text(encoding="utf-8"))
+    protocol_143_payload["protocol_version"] = "1.4.3"
+    legacy_protocol.write_text(json.dumps(protocol_143_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     project_guide.write_text(
-        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.4", "受管协议版本:1.4.3"),
+        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.3"),
         encoding="utf-8",
     )
-    preserved_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
-    preserved_payload = json.loads(task_path.read_text(encoding="utf-8"))
-    check("ARCHIVE_THREAD_REQUIRED" not in preserved_upgrade.stdout
-          and preserved_payload["temporary_executor"]["temporary_session"]["state"] == "archived",
-          "1.4.3 bound archive receipt was needlessly invalidated during 1.4.4 upgrade")
+    preserved_143_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    preserved_143_payload = json.loads(task_path.read_text(encoding="utf-8"))
+    check(preserved_143_upgrade.stdout.startswith("UPGRADE_OK |")
+          and "ARCHIVE_THREAD_REQUIRED" not in preserved_143_upgrade.stdout
+          and json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.5"
+          and preserved_143_payload["temporary_executor"]["temporary_session"]["state"] == "archived"
+          and preserved_143_payload["temporary_executor"]["temporary_session"]["evidence"] == receipt_143,
+          "real 1.4.3 host receipt was needlessly invalidated during 1.4.5 upgrade")
+
+    receipt_144_automatic = "archive_mode=automatic host=set_thread_archived thread_id=temporary-thread-1 archived=true"
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived",
+        "--evidence", receipt_144_automatic,
+    ])
+    automatic_144_protocol = json.loads(legacy_protocol.read_text(encoding="utf-8"))
+    automatic_144_protocol["protocol_version"] = "1.4.4"
+    legacy_protocol.write_text(json.dumps(automatic_144_protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    project_guide.write_text(
+        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.4"),
+        encoding="utf-8",
+    )
+    preserved_144_automatic = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    preserved_144_automatic_payload = json.loads(task_path.read_text(encoding="utf-8"))
+    check(preserved_144_automatic.stdout.startswith("UPGRADE_OK |")
+          and "ARCHIVE_THREAD_REQUIRED" not in preserved_144_automatic.stdout
+          and json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.5"
+          and preserved_144_automatic_payload["temporary_executor"]["temporary_session"]["state"] == "archived"
+          and preserved_144_automatic_payload["temporary_executor"]["temporary_session"]["evidence"] == receipt_144_automatic,
+          "real 1.4.4 automatic receipt was needlessly invalidated during 1.4.5 upgrade")
+
+    receipt_144_manual = (
+        "archive_mode=manual thread_id=temporary-thread-1 archived=true "
+        "user_confirmation=我已将该会话归档 evidence=current-user-message"
+    )
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived",
+        "--evidence", receipt_144_manual,
+    ])
+    manual_144_protocol = json.loads(legacy_protocol.read_text(encoding="utf-8"))
+    manual_144_protocol["protocol_version"] = "1.4.4"
+    legacy_protocol.write_text(json.dumps(manual_144_protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    project_guide.write_text(
+        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.4"),
+        encoding="utf-8",
+    )
+    preserved_144_manual = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    preserved_144_manual_payload = json.loads(task_path.read_text(encoding="utf-8"))
+    check(preserved_144_manual.stdout.startswith("UPGRADE_OK |")
+          and "ARCHIVE_THREAD_REQUIRED" not in preserved_144_manual.stdout
+          and json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.5"
+          and preserved_144_manual_payload["temporary_executor"]["temporary_session"]["state"] == "archived"
+          and preserved_144_manual_payload["temporary_executor"]["temporary_session"]["evidence"] == receipt_144_manual,
+          "real 1.4.4 manual receipt was needlessly invalidated during 1.4.5 upgrade")
+
+    pending_144_archive = json.loads(task_path.read_text(encoding="utf-8"))
+    pending_144_archive["temporary_executor"]["temporary_session"].update(
+        state="standby",
+        evidence="waiting-for-user-manual-archive",
+    )
+    task_path.write_text(json.dumps(pending_144_archive, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    pending_144_protocol = json.loads(legacy_protocol.read_text(encoding="utf-8"))
+    pending_144_protocol["protocol_version"] = "1.4.4"
+    legacy_protocol.write_text(json.dumps(pending_144_protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    project_guide.write_text(
+        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.4"),
+        encoding="utf-8",
+    )
+    pending_archive_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    pending_archive_payload = json.loads(task_path.read_text(encoding="utf-8"))
+    check("ARCHIVE_THREAD_REQUIRED:temporary-thread-1" in pending_archive_upgrade.stdout
+          and "reason:existing-standby-archive" in pending_archive_upgrade.stdout
+          and pending_archive_payload["temporary_executor"]["temporary_session"]["state"] == "standby"
+          and pending_archive_payload["temporary_executor"]["temporary_session"]["evidence"] == "waiting-for-user-manual-archive",
+          "1.4.4 cleaned standby session did not resurface its pending archive action")
 
 
 def verify_upgrade_and_guards(root: Path) -> None:
@@ -1292,7 +1445,7 @@ def verify_upgrade_and_guards(root: Path) -> None:
     protocol_payload["protocol_version"] = "1.3.0"
     flat_protocol.write_text(json.dumps(protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     flat_guide = flat_project / "docs" / "agent-guide.md"
-    flat_guide.write_text(flat_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.4", "受管协议版本:1.3.0"), encoding="utf-8")
+    flat_guide.write_text(flat_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.3.0"), encoding="utf-8")
     task_tool_before = flat_tool.read_bytes()
     denied_flat = run([sys.executable, str(SCAFFOLD), str(flat_project), "--upgrade-collaboration"], ok=False)
     check("任务真值未通过完整性预检" in denied_flat.stderr, "corrupt flat TASK did not block upgrade")
@@ -1304,7 +1457,7 @@ def verify_upgrade_and_guards(root: Path) -> None:
     clean_flat_upgrade = run([sys.executable, str(SCAFFOLD), str(flat_project), "--upgrade-collaboration"])
     check(clean_flat_upgrade.stdout.startswith("UPGRADE_OK |"), "clean flat 1.3.0 upgrade failed")
     check(flat_task.read_bytes() == flat_original, "clean flat upgrade rewrote TASK truth")
-    check("受管协议版本:1.4.4" in flat_guide.read_text(encoding="utf-8"),
+    check("受管协议版本:1.4.5" in flat_guide.read_text(encoding="utf-8"),
           "upgrade did not refresh project agent-guide")
     current_corrupt = json.loads(flat_original)
     current_corrupt["title"] = "bad\x00title"
