@@ -40,7 +40,7 @@ TASK 文件固定为 `tasks/TASK-*.json`，状态只在 `execution_state`。领�
 
 ## 9. 同部门换班
 
-会话变重只产生带原因的换班建议。用户授权后才 `begin-switch`。新会话依次登记 created、onboarded、registered，旧会话归档后才 `finish-switch`；中途失败用带原因的 `restore-old`。
+会话变重只产生带原因的换班建议。用户授权后才 `begin-switch`。新会话依次登记 created、onboarded、registered，旧会话归档后才 `finish-switch`。新 thread ID 尚未产生时，中途失败可直接用带原因的 `restore-old`；一旦新 ID 已登记，`restore-old` 必须精确验证新会话的归档回执后才能恢复旧会话。旧会话归档失败时保留新旧两个 ID 并重试，不能启动第二次换班覆盖 `previous_thread_id`。
 
 ## 10. 已有任务的接班
 
@@ -146,13 +146,91 @@ cleanup 成功或 reconcile 确认资源已移除后，`promotion_state` 可以�
 
 ## 35. 旧 TASK 深度升级预检
 
-旧版 TASK 的 temporary executor、impact、workspace、rule、session、acceptance、candidate、review、delivery、integration、operation 和 absorption 必须在备份与写入前深度验证。operation 还要校验状态枚举、资源元素、历史事件结构，以及当前状态与历史末项一致性。允许安全补齐新字段，但 executor type、父部门、状态、候选绑定或嵌套结构损坏时升级保持原协议和真值不变。1.4.3 和 1.4.4 中绑定真实 thread ID、`archived=true` 与真实来源的有效回执继续保留；更早版本或缺少可信回执的 `temporary_session=archived` 必须先备份，再退回 `standby` 并返回真实 thread ID。已经完成资源清理但仍在 `standby` 的旧任务，升级时重新返回归档动作，但不改写事实或形成全流程硬锁。
+旧版 TASK 的 temporary executor、impact、workspace、rule、session、acceptance、candidate、review、delivery、integration、operation 和 absorption 必须在备份与写入前深度验证。operation 还要校验状态枚举、资源元素、历史事件结构，以及当前状态与历史末项一致性。允许安全补齐新字段，但 executor type、父部门、状态、候选绑定或嵌套结构损坏时升级保持原协议和真值不变。任何旧版本中能通过当前严格解析，精确绑定真实 thread ID、`archived=true` 与 host 或 user confirmation 来源的有效回执都继续保留；缺失、冲突或无法验证的回执必须先备份，再退回 `standby` 并返回真实 thread ID。已经完成资源清理但仍在 `standby` 的旧任务，升级时重新返回归档动作，但不改写事实或形成全流程硬锁。
+
+## 36. 正式报告只认 frontmatter
+
+正式测试证据只解析文档开头的 YAML frontmatter，并精确核对 type、department、target、status、related task、decision、tested commit/tree 和 result。正文里出现一组看似正确的子串，不能覆盖 frontmatter 中的失败或错误版本；frontmatter 重复字段同样拒绝。
+
+## 37. 固定候选与 workspace HEAD
+
+候选固定后，只要 workspace 又产生 commit，即使工作区干净，旧候选也不能 submit。必须重新固定候选，并重新绑定用户确认与可选审查。
+
+## 38. 不可逆状态与可收口取消
+
+`integrated / archived / cancelled` 不能被 `abandon` 改写。真实会话进入 `standby` 后，外部 `session-mark --state cancelled` 必须拒绝，避免绕过资源核对形成无法 reconcile 的死角；从未产生 thread ID 的 abandoned 清理可以在资源验证完成后由清理事务内部收口为 `cancelled`。
+
+## 39. thread ID 全局唯一
+
+正式部门之间、正式部门与临时 TASK 之间、两个临时 TASK 之间都不能复用同一个真实 thread ID。任何一侧后登记时都必须读取全局真相并在写入前拒绝。
+
+## 40. 影响范围双向冲突
+
+正式任务先声明、临时任务后 preflight 时要查冲突；临时任务已经 provision 后，正式任务再 `declare-impact` 也要反向检查写路径、共享契约和外部副作用。拒绝时不得改变正式 TASK revision 或旧声明。
+
+## 41. 路径与 JSON 严格性
+
+TASK 文件的 `tasks/` 父目录若被替换为指向项目外的符号链接，所有任务写操作必须在创建外部文件前拒绝。任务、会话、协议、operation 和 ownership 等受控 JSON 一律拒绝重复 key，不能采用“最后一个值覆盖前值”的宽松解析。
+
+## 42. 1.4.6 受管升级
+
+`1.4.5 → 1.4.6` 升级保留 created、onboarded、registered、previous thread、evidence、notification 和进行中的 operation 真相。同版本受管脚本内容漂移时按 manifest 修复；每个部门四份入口文档与根级 `错题集.md` 中任一缺失都能被完整性检查发现，并由显式升级补回，已有错题集、交接和收件箱正文不被覆盖。
+
+## 43. 待归档动作可重复读取
+
+`pending-archives` 是无写锁、无突变的只读查询，相同真相重复查询得到相同 `ARCHIVE_THREAD_REQUIRED`。same-version 升级也要重放尚未取得真实收据的人工归档提醒；登记有效 archived 收据后查询返回无待办。
+
+## 44. 换班归档证据
+
+`finish-switch` 只接受精确绑定 `previous_thread_id`、包含独立 `archived=true` 字段，并注明 host 或 user confirmation 的收据。普通文字、相似前缀 ID、冲突字段和 false 值都不能清空旧会话真相。
+
+## 45. 默认权限与安装副本
+
+验证器在系统临时目录生成编译缓存，不要求改写 `HOME`，可在 Codex 默认工作区写权限下运行。安装副本只能包含 `SKILL.md`、`agents/openai.yaml`、`scripts/scaffold_team.py`、`scripts/temporary_executor_runtime.py`，且四个文件必须与仓库逐字节一致；多一个开发文件或任一内容漂移都失败。CI 对所有 push 与 pull request 执行这些检查。
+
+## 46. 恢复与返工重做准入
+
+临时 TASK 因 amend 后的写路径或共享契约冲突进入 `blocked` 时，`resume` 和 `rework` 都必须在同一把任务锁内重新扫描当前影响。冲突仍在时保持 blocked，不增加 attempt，不恢复 claimed。正式 TASK 从 blocked/waiting 恢复时也要重查活跃临时影响，不能只在第一次 claim 时检查。
+
+## 47. 增量部门与全新搭建收敛
+
+同一天、同一 profile 和同一最终 roles 下，“一次搭建全部部门”与“先搭建再 `--add-roles`”生成的部门表、会话启动清单、路由表和会话状态必须逐字节一致。重复新增已存在部门只返回幂等跳过，不改写已收敛真值。
+
+## 48. 升级回滚保留目录真值
+
+旧版 `tasks/queued|claimed|.../` 在迁移后、新受管文件落盘前故障时，回滚必须恢复原任务路径、原本存在的空状态目录和每个目录的权限。`rollback-manifest.json` 必须记录这些子目录的 existed 与 mode；丢目录或用默认 0755 替代原权限都不得声称“逐项恢复”。
+
+## 49. 会话 ID 精确性与缺失态
+
+归档收据中的 `thread_id` 按原始字符串精确比较，大小写不同也必须拒绝；只有 key 和 `archived=true` 布尔语义可做大小写归一。资源已验证清理且 `promotion_state=archived` 时，存在 thread ID 只能是 standby/archived；缺少 thread ID 只能是“从未创建真实会话”的 cancelled。已清理+standby+空 ID 必须拒绝升级和查询，不能沉默消失。
+
+## 50. 提交、集成与清理终态不可回退
+
+delivery submit 后，`candidate` 和 `review` 不得继续改写证据；只有显式 `rework` 可生成新 attempt。`record-integration-test` 不得把 integrated 候选退回 ready/reviewing。已验证的 integrated promotion 重试 reconcile 只返回幂等收据且 TASK 字节不变；已清理的 archived TASK 不得被 review 或 promotion reconcile 重开，`pending-archives` 仍必须保留待归档会话。
+
+## 51. 会话身份不可覆盖
+
+正式换班中，新会话进入 created/onboarded/registered 后，无精确归档回执的 `restore-old` 必须原子拒绝；待归档旧 ID 存在时也不得再次 `begin-switch`。临时会话一旦登记真实 thread ID，failed 重试、规则重建和重新 active 都只能使用原始字符串完全相同的 ID。外部 `session-mark --state cancelled` 不能取消任何真实会话；`cancelled` 只由无 thread ID 的 abandoned cleanup 在资源验证完成后内部收口。
+
+## 52. 归档回执可表示性
+
+正式和临时 thread ID 都不得包含空白、以 `=` 开头或超过 300 字符，避免真实身份无法放进结构化归档回执。正式 `finish-switch` 的精确旧会话收据必须持久化到 evidence；之后切换通知模式只能更新通知说明，不能删除归档事实。
+
+## 53. 未决事务冻结
+
+workspace 创建事务处于 started 或 failed 且尚未 reconcile 时，resume、rework 和 abandon 必须原子拒绝。promotion 处于 planned、started、succeeded 或尚未 reconcile 的 failed 时，重新测试、晋升、返工、放弃和 preflight 知识吸收都不得继续；只有 reconcile 确认 main 未前进后写入的 failed 才能重新进入正常生命周期。cleanup 进入 started 或尚未 reconcile 的 failed 后，知识吸收等其他写操作必须冻结，不能在资源实际状态未判定时改写终态证据。
+
+## 54. 创建失败仍保留真实会话
+
+workspace 创建事务 verified 后，临时会话在 provisioning 阶段已经取得真实 thread ID、但后续上岗失败时，`session-mark --state failed --thread-id <真实ID>` 必须保存该 ID。后续 active 只能复用同一原始 ID；最终 abandoned cleanup 仍返回 `ARCHIVE_THREAD_REQUIRED:<真实ID>`，不得把它降格为从未创建会话的 cancelled。创建事务尚未 verified 时必须先 reconcile，不得提前登记会话后再被 reset 丢失。
 
 ## 自动复验
 
 ```bash
+python3 -m pip install -r requirements-dev.txt
 python3 -m py_compile scripts/scaffold_team.py scripts/temporary_executor_runtime.py scripts/verify_agent_team.py
 python3 scripts/verify_agent_team.py
+python3 scripts/verify_agent_team.py --check-installed-copy "$HOME/.codex/skills/agent-team"
 python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" .
 ```
 

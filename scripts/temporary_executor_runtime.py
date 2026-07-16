@@ -11,6 +11,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import uuid
@@ -23,7 +24,7 @@ else:
     import fcntl
 
 
-PROTOCOL_VERSION = "1.4.5"
+PROTOCOL_VERSION = "1.4.6"
 TASK_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
 SAFE_STATES = {"safe", "manual", "unsafe", "waiting_base"}
 USER_ACCEPTANCE = {"pending", "confirmed", "rejected", "delegated", "not_applicable"}
@@ -49,6 +50,86 @@ def run_git(project: Path, *args: str, ok: bool = True) -> subprocess.CompletedP
     return result
 
 
+def reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict:
+    payload: dict = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError(f"JSON 含重复 key: {key}")
+        payload[key] = value
+    return payload
+
+
+def load_json_text(text: str, *, label: str) -> object:
+    try:
+        return json.loads(text, object_pairs_hook=reject_duplicate_json_keys)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{label} JSON 无效: {exc.msg}") from exc
+
+
+def ensure_plain_directory(path: Path, root: Path, *, label: str) -> Path:
+    root_lexical = Path(os.path.abspath(str(root)))
+    path_lexical = Path(os.path.abspath(str(path)))
+    if root_lexical.is_symlink():
+        raise ValueError(f"{label} 父根禁止符号链接")
+    try:
+        relative = path_lexical.relative_to(root_lexical)
+        root_resolved = root_lexical.resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{label} 路径越界或根目录无效") from exc
+    current = root_lexical
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label} 禁止符号链接: {current}")
+    try:
+        resolved = path_lexical.resolve(strict=True)
+        resolved.relative_to(root_resolved)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{label} 不存在或 resolved 路径越界") from exc
+    if not resolved.is_dir():
+        raise ValueError(f"{label} 必须是普通目录")
+    return path_lexical
+
+
+def ensure_plain_file(path: Path, root: Path, *, label: str) -> Path:
+    root_directory = ensure_plain_directory(root, root, label=f"{label} 父根")
+    root_lexical = Path(os.path.abspath(str(root_directory)))
+    path_lexical = Path(os.path.abspath(str(path)))
+    try:
+        relative = path_lexical.relative_to(root_lexical)
+        root_resolved = root_lexical.resolve(strict=True)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{label} 路径越界") from exc
+    current = root_lexical
+    for part in relative.parts:
+        current = current / part
+        if current.is_symlink():
+            raise ValueError(f"{label} 禁止符号链接: {current}")
+    try:
+        resolved = path_lexical.resolve(strict=True)
+        resolved.relative_to(root_resolved)
+    except (OSError, ValueError) as exc:
+        raise ValueError(f"{label} 不存在或 resolved 路径越界") from exc
+    if not resolved.is_file():
+        raise ValueError(f"{label} 必须是普通文件")
+    return path_lexical
+
+
+def read_plain_json(path: Path, root: Path, *, label: str) -> object:
+    safe_path = ensure_plain_file(path, root, label=label)
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(safe_path, flags)
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError(f"{label} 必须是普通文件")
+        with os.fdopen(fd, "r", encoding="utf-8") as handle:
+            fd = -1
+            return load_json_text(handle.read(), label=label)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+
+
 def local_project() -> Path:
     return Path(__file__).resolve().parents[3]
 
@@ -63,7 +144,9 @@ def main_project() -> Path:
         raise ValueError("无法发现 Git 主 worktree")
     root = Path(first).resolve(strict=True)
     collab = root / "docs" / "collaboration"
-    if collab.is_symlink() or not collab.is_dir():
+    try:
+        ensure_plain_directory(collab, root, label="docs/collaboration 控制根")
+    except ValueError as exc:
         raise ValueError("主 worktree 缺少安全的 docs/collaboration 控制根")
     return root
 
@@ -75,6 +158,66 @@ LOCKS = COLLAB / ".locks"
 SESSION_STATE = COLLAB / "会话启动状态.json"
 
 
+def secure_collaboration_root() -> Path:
+    return ensure_plain_directory(COLLAB, PROJECT, label="docs/collaboration 控制根")
+
+
+def secure_tasks_root() -> Path:
+    collab = secure_collaboration_root()
+    return ensure_plain_directory(TASKS, collab, label="tasks 真值目录")
+
+
+def secure_locks_root() -> Path:
+    collab = secure_collaboration_root()
+    if LOCKS.is_symlink():
+        raise ValueError(".locks 禁止符号链接")
+    try:
+        LOCKS.mkdir(mode=0o700)
+    except FileExistsError:
+        pass
+    return ensure_plain_directory(LOCKS, collab, label=".locks 目录")
+
+
+def read_session_state() -> dict:
+    collab = secure_collaboration_root()
+    payload = read_plain_json(SESSION_STATE, collab, label="会话启动状态")
+    if not isinstance(payload, dict):
+        raise ValueError("会话启动状态根节点必须是 JSON 对象")
+    if payload.get("schema_version") != 1 or payload.get("protocol_version") != PROTOCOL_VERSION:
+        raise ValueError("会话启动状态版本与临时外包工具不一致")
+    departments = payload.get("departments")
+    if not isinstance(departments, dict):
+        raise ValueError("会话启动状态缺少部门登记")
+    identities: dict[str, str] = {}
+    for department, item in departments.items():
+        if not isinstance(department, str) or not isinstance(item, dict):
+            raise ValueError("会话启动状态部门条目无效")
+        for field in ("thread_id", "previous_thread_id"):
+            thread_id = item.get(field, "")
+            if not isinstance(thread_id, str):
+                raise ValueError(f"会话启动状态 {department}.{field} 无效")
+            if not thread_id:
+                continue
+            if len(thread_id) > 300 or thread_id.startswith("=") or any(char.isspace() for char in thread_id):
+                raise ValueError(f"会话启动状态 {department}.{field} 不可表示为归档回执")
+            owner = f"{department}.{field}"
+            if thread_id in identities:
+                raise ValueError(
+                    f"会话启动状态 thread_id 重复: {thread_id} ({identities[thread_id]}, {owner})"
+                )
+            identities[thread_id] = owner
+    return payload
+
+
+def task_files() -> list[Path]:
+    tasks = secure_tasks_root()
+    result: list[Path] = []
+    for path in sorted(tasks.glob("TASK-*.json")):
+        if TASK_RE.fullmatch(path.stem):
+            result.append(path)
+    return result
+
+
 def clean(name: str, value: str, *, max_chars: int = 2000) -> str:
     result = value.strip()
     if not result:
@@ -84,21 +227,29 @@ def clean(name: str, value: str, *, max_chars: int = 2000) -> str:
     return result
 
 
+def clean_thread_id(value: str) -> str:
+    result = clean("thread-id", value, max_chars=300)
+    if any(char.isspace() for char in result):
+        raise ValueError("thread-id 不能包含空格、换行或制表符")
+    if result.startswith("="):
+        raise ValueError("thread-id 不能以等号开头")
+    return result
+
+
 def archive_receipt_fields(evidence: str) -> dict[str, set[str]]:
     fields: dict[str, set[str]] = {}
     for token in evidence.split():
         key, separator, value = token.partition("=")
-        normalized_value = value.casefold()
-        if separator and key and normalized_value and not normalized_value.startswith("="):
-            fields.setdefault(key.casefold(), set()).add(normalized_value)
+        if separator and key and value and not value.startswith("="):
+            fields.setdefault(key.casefold(), set()).add(value)
     return fields
 
 
 def valid_archive_receipt(evidence: str, thread_id: str) -> bool:
     fields = archive_receipt_fields(evidence)
     return (
-        fields.get("thread_id") == {thread_id.casefold()}
-        and fields.get("archived") == {"true"}
+        fields.get("thread_id") == {thread_id}
+        and {value.casefold() for value in fields.get("archived", set())} == {"true"}
         and bool(fields.get("host") or fields.get("user_confirmation"))
     )
 
@@ -158,7 +309,7 @@ def safe_project_artifact(raw: str, *, field: str) -> str:
 
 
 def configured_departments() -> set[str]:
-    payload = json.loads(SESSION_STATE.read_text(encoding="utf-8"))
+    payload = read_session_state()
     if payload.get("protocol_version") != PROTOCOL_VERSION:
         raise ValueError("协作层协议版本与临时外包工具不一致")
     departments = payload.get("departments")
@@ -168,7 +319,7 @@ def configured_departments() -> set[str]:
 
 
 def registered_lead_actor() -> str:
-    payload = json.loads(SESSION_STATE.read_text(encoding="utf-8"))
+    payload = read_session_state()
     departments = payload.get("departments", {})
     lead = departments.get("统筹部")
     if not isinstance(lead, dict) or lead.get("step") != "registered" or not lead.get("thread_id"):
@@ -179,14 +330,17 @@ def registered_lead_actor() -> str:
 def task_path(task_id: str) -> Path:
     if not TASK_RE.fullmatch(task_id):
         raise ValueError("TASK ID 格式无效")
-    return TASKS / f"{task_id}.json"
+    return secure_tasks_root() / f"{task_id}.json"
 
 
 def read_task(task_id: str) -> dict:
     path = task_path(task_id)
-    if path.is_symlink() or not path.is_file():
-        raise ValueError(f"TASK 不存在或路径不安全: {task_id}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    try:
+        payload = read_plain_json(path, path.parent, label=f"TASK {task_id}")
+    except ValueError as exc:
+        raise ValueError(f"TASK 不存在、路径不安全或 JSON 无效: {task_id}: {exc}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError("TASK 真值根节点必须是 JSON 对象")
     if payload.get("task_id") != task_id or not isinstance(payload.get("revision"), int):
         raise ValueError("TASK 真值损坏")
     return payload
@@ -205,7 +359,9 @@ def fsync_dir(path: Path) -> None:
 
 def write_task(task: dict, *, expected_revision: int) -> None:
     path = task_path(task["task_id"])
-    current = json.loads(path.read_text(encoding="utf-8"))
+    current = read_plain_json(path, path.parent, label=f"TASK {task['task_id']}")
+    if not isinstance(current, dict):
+        raise ValueError("TASK 真值根节点必须是 JSON 对象")
     if current.get("revision") != expected_revision:
         raise ValueError(f"TASK revision 已变化，预期 {expected_revision}，实际 {current.get('revision')}")
     task["revision"] = expected_revision + 1
@@ -232,9 +388,11 @@ def write_task(task: dict, *, expected_revision: int) -> None:
 
 
 @contextmanager
-def task_lock():
-    LOCKS.mkdir(mode=0o700, exist_ok=True)
-    lock_path = LOCKS / "tasks.lock"
+def named_lock(filename: str):
+    if filename not in {"tasks.lock", "identity.lock"}:
+        raise ValueError("锁文件名无效")
+    locks = secure_locks_root()
+    lock_path = locks / filename
     fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
     handle = os.fdopen(fd, "a+b", buffering=0)
     try:
@@ -253,6 +411,18 @@ def task_lock():
         else:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         handle.close()
+
+
+@contextmanager
+def task_lock():
+    with named_lock("tasks.lock"):
+        yield
+
+
+@contextmanager
+def identity_lock():
+    with named_lock("identity.lock"):
+        yield
 
 
 def validate_impact(value: object) -> dict:
@@ -323,6 +493,12 @@ def validate_extension(task: dict) -> None:
         not isinstance(session[key], str) for key in session
     ):
         raise ValueError("temporary_session 结构无效")
+    if session["thread_id"] and (
+        len(session["thread_id"]) > 300
+        or session["thread_id"].startswith("=")
+        or any(char.isspace() for char in session["thread_id"])
+    ):
+        raise ValueError("temporary_session thread_id 不可表示为归档回执")
     absorption = temp["absorption"]
     required_absorption = {"preflight", "parent_department", "project_global", "final", "receipts"}
     if not isinstance(absorption, dict) or required_absorption - set(absorption) or set(absorption) - required_absorption - {"history"}:
@@ -339,6 +515,8 @@ def validate_extension(task: dict) -> None:
     if temp["temporary_session"]["state"] not in SESSION_STATES:
         raise ValueError("临时会话状态无效")
     validate_impact(temp["impact"])
+    if task.get("impact_declaration") != temp["impact"]:
+        raise ValueError("temporary_executor impact 与 TASK impact_declaration 不一致")
     if temp["absorption"]["preflight"] not in ABSORPTION_STATES:
         raise ValueError("前置知识清点状态无效")
     for key in ("parent_department", "project_global", "final"):
@@ -431,6 +609,29 @@ def validate_extension(task: dict) -> None:
             or cleanup.get("state") != "verified"
         ):
             raise ValueError("临时会话 archived 缺少真实归档收据或资源清理证据")
+    cleanup = temp.get("cleanup_operation")
+    cleanup_state = cleanup.get("state") if isinstance(cleanup, dict) else None
+    cleanup_terminal = (
+        temp["promotion_state"] == "archived"
+        and workspace["state"] == "removed"
+        and cleanup_state == "verified"
+    )
+    if any((temp["promotion_state"] == "archived", workspace["state"] == "removed", cleanup_state == "verified")) and not cleanup_terminal:
+        raise ValueError("临时资源终态必须同时满足 promotion=archived、workspace=removed 和 cleanup=verified")
+    promotion_operation = temp.get("promotion_operation")
+    if (
+        isinstance(promotion_operation, dict)
+        and promotion_operation.get("state") == "verified"
+        and temp["promotion_state"] not in {"integrated", "archived"}
+    ):
+        raise ValueError("已验证的晋升事务不能退回 integrated 之前")
+    if cleanup_terminal:
+        if session["thread_id"] and session["state"] not in {"standby", "archived"}:
+            raise ValueError("资源已清理且存在真实 thread_id 时，会话必须待归档或已归档")
+        if not session["thread_id"] and session["state"] != "cancelled":
+            raise ValueError("资源已清理但 thread_id 缺失；仅“从未创建真实会话”可收口为 cancelled")
+    if session["state"] == "cancelled" and (session["thread_id"] or not cleanup_terminal):
+        raise ValueError("cancelled 只能表示从未创建真实会话且资源已验证清理")
 
 
 def overlap(left: str, right: str) -> bool:
@@ -476,8 +677,8 @@ def impact_from_args(args: argparse.Namespace, task_id: str, base_revision: str)
 def admission_for(task_id: str, impact: dict) -> tuple[str, list[str]]:
     reasons: list[str] = []
     unknown = False
-    for path in sorted(TASKS.glob("TASK-*.json")):
-        other = json.loads(path.read_text(encoding="utf-8"))
+    for path in task_files():
+        other = read_task(path.stem)
         if other.get("task_id") == task_id:
             continue
         other_temp = other.get("temporary_executor")
@@ -525,15 +726,20 @@ def admission_for(task_id: str, impact: dict) -> tuple[str, list[str]]:
 
 def cmd_declare_impact(args: argparse.Namespace) -> int:
     task = read_task(args.task_id)
+    if task.get("temporary_executor") is not None:
+        raise ValueError("已绑定临时执行者的 TASK 必须通过 amend/rework 维护唯一影响真值")
     if task["revision"] != args.expected_revision:
         raise ValueError("expected-revision 与 TASK 当前 revision 不一致")
     revision_name = clean_revision("base-revision", args.base_revision)
     base = run_git(PROJECT, "rev-parse", "--verify", f"{revision_name}^{{commit}}").stdout.strip()
     impact = impact_from_args(args, args.task_id, base)
-    impact["admission"] = "manual"
+    admission, reasons = admission_for(args.task_id, impact)
+    if admission in {"unsafe", "waiting_base"}:
+        raise ValueError(f"影响声明与已有在办任务冲突: {'；'.join(reasons)}")
+    impact["admission"] = admission
     task["impact_declaration"] = impact
     write_task(task, expected_revision=args.expected_revision)
-    print(f"TEMP_IMPACT_OK | {args.task_id} | revision:{task['revision']}")
+    print(f"TEMP_IMPACT_OK | {args.task_id} | revision:{task['revision']} | admission:{admission}")
     return 0
 
 
@@ -750,6 +956,22 @@ def cmd_provision(args: argparse.Namespace) -> int:
 
 def cmd_reconcile_provision(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
+    initial_lifecycle = (
+        temp["promotion_state"] == "not_submitted"
+        and temp.get("candidate") is None
+        and temp.get("review") is None
+        and temp.get("delivery") is None
+        and temp.get("integration") is None
+        and temp.get("promotion_operation") is None
+        and temp.get("cleanup_operation") is None
+    )
+    if not initial_lifecycle:
+        raise ValueError("只有候选形成前的初始创建事务可 reconcile provision")
+    operation_state = temp["operation"]["state"]
+    if operation_state == "verified" and (
+        task.get("execution_state") != "claimed" or temp["workspace"]["state"] != "ready"
+    ):
+        raise ValueError("已验证创建事务与当前 TASK 生命周期不一致")
     workspace = PROJECT / temp["workspace"]["path"]
     branch = temp["workspace"]["branch"]
     branch_exists = run_git(PROJECT, "show-ref", "--verify", f"refs/heads/{branch}", ok=False).returncode == 0
@@ -758,7 +980,9 @@ def cmd_reconcile_provision(args: argparse.Namespace) -> int:
         rule = workspace / ".agent-team" / "临时执行规则.md"
         if marker.is_symlink() or rule.is_symlink() or not marker.is_file() or not rule.is_file():
             raise ValueError("已存在 workspace 缺少 ownership marker 或临时规则，拒绝猜测修复")
-        ownership = json.loads(marker.read_text(encoding="utf-8"))
+        ownership = read_plain_json(marker, workspace, label="workspace ownership marker")
+        if not isinstance(ownership, dict):
+            raise ValueError("workspace ownership marker 根节点无效")
         expected_ownership = {
             "operation_id": temp["operation"]["id"], "task_id": args.task_id,
             "executor_id": temp["executor_id"], "workspace": temp["workspace"]["path"],
@@ -770,6 +994,9 @@ def cmd_reconcile_provision(args: argparse.Namespace) -> int:
         digest = hashlib.sha256(rule.read_bytes()).hexdigest()
         if temp["rule"]["digest"] and temp["rule"]["digest"] != digest:
             raise ValueError("已存在临时规则 digest 与 TASK 不一致")
+        if operation_state == "verified":
+            print(f"TEMP_RECONCILE_OK | {args.task_id} | verified | idempotent")
+            return 0
         temp["rule"]["digest"] = digest
         temp["workspace"]["state"] = "ready"
         temp["operation"]["state"] = "verified"
@@ -782,6 +1009,8 @@ def cmd_reconcile_provision(args: argparse.Namespace) -> int:
         return 0
     if workspace.exists() != branch_exists:
         raise ValueError("workspace 与 branch 只存在一半，保留现场并转人工处理")
+    if operation_state == "verified":
+        raise ValueError("已验证创建事务的 workspace/branch 缺失，拒绝覆写真值")
     temp["workspace"]["state"] = "failed"
     temp["operation"]["state"] = "failed"
     temp["operation"].setdefault("history", []).append({"state": "failed", "at": now_iso(), "reason": "no-owned-resource"})
@@ -796,6 +1025,18 @@ def cmd_reset_failed_provision(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
     if temp["operation"]["state"] != "failed":
         raise ValueError("只有 reconcile 确认失败且无资源的创建操作可以重置")
+    if (
+        temp["promotion_state"] != "not_submitted"
+        or any(temp.get(field) is not None for field in ("candidate", "review", "delivery", "integration"))
+        or temp.get("promotion_operation") is not None
+        or temp.get("cleanup_operation") is not None
+    ):
+        raise ValueError("已进入候选或后续事务的 TASK 不能重置创建真值")
+    session = temp["temporary_session"]
+    if session.get("thread_id"):
+        raise ValueError("创建失败状态仍登记真实 thread_id，必须先完成会话归档收口，不能重置真值")
+    if session.get("state") not in {"provisioning", "failed"}:
+        raise ValueError("临时会话已越过创建失败阶段，不能重置创建真值")
     workspace = PROJECT / temp["workspace"]["path"]
     branch = temp["workspace"]["branch"]
     if workspace.exists() or run_git(PROJECT, "show-ref", "--verify", f"refs/heads/{branch}", ok=False).returncode == 0:
@@ -855,6 +1096,47 @@ def temp_task(task_id: str) -> tuple[dict, dict]:
     return task, temp
 
 
+def require_verified_provision(temp: dict) -> None:
+    operation = temp.get("operation")
+    workspace = temp.get("workspace")
+    if (
+        not isinstance(operation, dict)
+        or operation.get("state") != "verified"
+        or not isinstance(workspace, dict)
+        or workspace.get("state") != "ready"
+    ):
+        raise ValueError("临时 workspace 创建事务尚未 verified，必须先 reconcile/reset provision")
+
+
+def operation_has_reconciled_failure(operation: object) -> bool:
+    if not isinstance(operation, dict) or operation.get("state") != "failed":
+        return False
+    history = operation.get("history")
+    return bool(
+        isinstance(history, list)
+        and history
+        and isinstance(history[-1], dict)
+        and history[-1].get("state") == "failed"
+        and history[-1].get("via") == "reconcile"
+    )
+
+
+def require_settled_promotion(temp: dict) -> None:
+    operation = temp.get("promotion_operation")
+    if not isinstance(operation, dict):
+        return
+    if operation.get("state") == "verified" and temp.get("promotion_state") in {"integrated", "archived"}:
+        return
+    if operation_has_reconciled_failure(operation):
+        return
+    raise ValueError("存在未收口的晋升事务，必须先 reconcile promotion")
+
+
+def require_cleanup_not_started(temp: dict) -> None:
+    if isinstance(temp.get("cleanup_operation"), dict):
+        raise ValueError("清理事务已经开始，必须先 reconcile cleanup；收口前冻结其他写操作")
+
+
 def archive_ready_session(temp: dict) -> tuple[dict, str]:
     cleanup = temp.get("cleanup_operation")
     if (
@@ -871,29 +1153,104 @@ def archive_ready_session(temp: dict) -> tuple[dict, str]:
     return session, thread_id
 
 
+def registered_thread_owners() -> tuple[dict[str, str], dict[str, str]]:
+    session_state = read_session_state()
+    departments = session_state.get("departments")
+    if not isinstance(departments, dict):
+        raise ValueError("会话启动状态缺少部门登记")
+    formal_owners: dict[str, str] = {}
+    for department, item in departments.items():
+        if not isinstance(department, str) or not isinstance(item, dict):
+            raise ValueError("会话启动状态部门条目无效")
+        for field in ("thread_id", "previous_thread_id"):
+            registered = item.get(field, "")
+            if registered and not isinstance(registered, str):
+                raise ValueError(f"会话启动状态 {field} 无效")
+            if registered:
+                formal_owners[registered] = f"{department}.{field}"
+    temporary_owners: dict[str, str] = {}
+    for path in task_files():
+        other = read_task(path.stem)
+        other_temp = other.get("temporary_executor")
+        if not isinstance(other_temp, dict):
+            continue
+        validate_extension(other)
+        other_session = other_temp.get("temporary_session")
+        registered = other_session.get("thread_id", "") if isinstance(other_session, dict) else ""
+        if not registered:
+            continue
+        if registered in formal_owners:
+            raise ValueError(
+                f"持久状态 thread_id 重复: {registered} ({formal_owners[registered]}, {path.stem})"
+            )
+        if registered in temporary_owners:
+            raise ValueError(
+                f"持久状态 thread_id 重复: {registered} ({temporary_owners[registered]}, {path.stem})"
+            )
+        temporary_owners[registered] = path.stem
+    return formal_owners, temporary_owners
+
+
+def require_unique_thread_id(task_id: str, thread_id: str) -> None:
+    formal_owners, temporary_owners = registered_thread_owners()
+    if thread_id in formal_owners:
+        department, field = formal_owners[thread_id].rsplit(".", 1)
+        identity = "当前会话" if field == "thread_id" else "待归档旧会话"
+        raise ValueError(f"thread-id 已被正式部门{identity}占用: {department}")
+    owner = temporary_owners.get(thread_id)
+    if owner and owner != task_id:
+        raise ValueError(f"thread-id 已被其他临时 TASK 占用: {owner}")
+
+
 def cmd_session(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
     state = args.state
     allowed = {
         "active": {"provisioning", "awaiting_rule_confirmation", "failed"}, "standby": {"active"},
-        "archived": {"standby", "archived"}, "failed": {"provisioning", "active"},
-        "cancelled": {"provisioning", "active", "standby"},
+        "archived": {"standby", "archived"},
+        "failed": {"provisioning", "awaiting_rule_confirmation", "active"},
     }
+    if state == "cancelled":
+        raise ValueError("临时会话状态转换非法：cancelled 只由无真实会话的 abandoned cleanup 内部写入")
     if state not in allowed or temp["temporary_session"]["state"] not in allowed[state]:
         raise ValueError("临时会话状态转换非法")
+    if state in {"active", "standby", "failed"}:
+        require_verified_provision(temp)
     evidence = clean("evidence", args.evidence, max_chars=1000)
     if state == "active":
-        thread_id = clean("thread-id", args.thread_id, max_chars=300)
+        thread_id = clean_thread_id(args.thread_id)
+        registered_thread_id = temp["temporary_session"].get("thread_id", "")
+        if registered_thread_id and thread_id != registered_thread_id:
+            raise ValueError("临时会话已绑定真实 thread_id，重试 active 必须使用原始 ID")
         if clean("rule-digest", args.rule_digest, max_chars=128) != temp["rule"]["digest"]:
             raise ValueError("临时会话确认的规则 digest 不匹配")
-        temp["temporary_session"].update(state=state, thread_id=thread_id, evidence=evidence)
-        temp["rule"]["confirmed_at"] = now_iso()
+        with identity_lock():
+            require_unique_thread_id(args.task_id, thread_id)
+            temp["temporary_session"].update(state=state, thread_id=thread_id, evidence=evidence)
+            temp["rule"]["confirmed_at"] = now_iso()
+            write_task(task, expected_revision=task["revision"])
+        print(f"TEMP_SESSION_OK | {args.task_id} | {state}")
+        return 0
+    elif state == "failed" and args.thread_id:
+        thread_id = clean_thread_id(args.thread_id)
+        registered_thread_id = temp["temporary_session"].get("thread_id", "")
+        if registered_thread_id and thread_id != registered_thread_id:
+            raise ValueError("临时会话已绑定真实 thread_id，failed 只能保留原始 ID")
+        with identity_lock():
+            require_unique_thread_id(args.task_id, thread_id)
+            temp["temporary_session"].update(state=state, thread_id=thread_id, evidence=evidence)
+            write_task(task, expected_revision=task["revision"])
+        print(f"TEMP_SESSION_OK | {args.task_id} | {state}")
+        return 0
     elif state == "archived":
         session, thread_id = archive_ready_session(temp)
         if not valid_archive_receipt(evidence, thread_id):
             raise ValueError(
                 "归档回执必须绑定当前 thread_id、包含 archived=true，并注明 host 或 user_confirmation"
             )
+        if session["state"] == "archived":
+            print(f"TEMP_SESSION_OK | {args.task_id} | archived | idempotent")
+            return 0
         session.update(state=state, evidence=evidence)
     else:
         temp["temporary_session"].update(state=state, evidence=evidence)
@@ -904,8 +1261,9 @@ def cmd_session(args: argparse.Namespace) -> int:
 
 def cmd_reconcile_rule(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
-    if temp["promotion_state"] in {"integrated", "archived", "abandoned", "cancelled"}:
+    if task["execution_state"] != "claimed" or temp["promotion_state"] != "not_submitted":
         raise ValueError("当前生命周期不能重建临时规则")
+    require_verified_provision(temp)
     temp["rule"]["digest"] = write_current_rule(task, temp)
     temp["rule"]["confirmed_at"] = ""
     temp["temporary_session"]["state"] = "awaiting_rule_confirmation"
@@ -919,6 +1277,7 @@ def cmd_amend(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
     if task["execution_state"] != "claimed" or temp["promotion_state"] != "not_submitted":
         raise ValueError("当前生命周期不允许直接 amend；已 submit 或接管的 TASK 必须先 rework")
+    require_verified_provision(temp)
     require_current_rule_confirmation(temp)
     if temp["brief_revision"] != args.expected_brief_revision:
         raise ValueError("expected-brief-revision 已过期")
@@ -955,8 +1314,9 @@ def cmd_accept(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
     if args.state not in USER_ACCEPTANCE - {"pending"}:
         raise ValueError("用户验收状态无效")
-    if task["execution_state"] != "claimed":
+    if task["execution_state"] != "claimed" or temp["promotion_state"] != "not_submitted":
         raise ValueError("只有正在执行的临时 TASK 可以记录用户验收")
+    require_verified_provision(temp)
     candidate = temp.get("candidate")
     if not isinstance(candidate, dict):
         raise ValueError("必须先固定候选，再把用户验收绑定到候选 commit/tree")
@@ -973,6 +1333,7 @@ def cmd_pause(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
     if task["execution_state"] != "claimed" or temp["promotion_state"] != "not_submitted":
         raise ValueError("当前临时 TASK 不能暂停")
+    require_verified_provision(temp)
     task["execution_state"] = args.state
     task["block_reason"] = clean("reason", args.reason)
     if temp["temporary_session"]["state"] == "active":
@@ -986,6 +1347,17 @@ def cmd_resume(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
     if task["execution_state"] not in {"blocked", "waiting_input"} or temp["promotion_state"] != "not_submitted":
         raise ValueError("当前临时 TASK 不能恢复")
+    require_verified_provision(temp)
+    admission, reasons = admission_for(args.task_id, temp["impact"])
+    temp["impact"]["admission"] = admission
+    task["impact_declaration"] = temp["impact"]
+    if admission != "safe":
+        task["block_reason"] = f"resume 重新准入为 {admission}: {'；'.join(reasons)}"
+        if temp["temporary_session"]["state"] == "active":
+            temp["temporary_session"]["state"] = "standby"
+        write_task(task, expected_revision=task["revision"])
+        print(f"TEMP_RESUME_BLOCKED | {args.task_id} | admission:{admission} | {'；'.join(reasons)}")
+        return 4
     task["execution_state"] = "claimed"
     task["block_reason"] = ""
     temp["temporary_session"]["evidence"] = clean("evidence", args.evidence, max_chars=1000)
@@ -1000,7 +1372,9 @@ def workspace_for(temp: dict) -> Path:
     marker = workspace / ".agent-team" / "ownership.json"
     if workspace.is_symlink() or not workspace.is_dir() or marker.is_symlink() or not marker.is_file():
         raise ValueError("临时 workspace 或 ownership marker 缺失")
-    payload = json.loads(marker.read_text(encoding="utf-8"))
+    payload = read_plain_json(marker, workspace, label="workspace ownership marker")
+    if not isinstance(payload, dict):
+        raise ValueError("workspace ownership marker 根节点无效")
     expected = {
         "operation_id": temp["operation"]["id"], "task_id": temp["impact"]["owner_task"],
         "executor_id": temp["executor_id"], "workspace": temp["workspace"]["path"],
@@ -1028,6 +1402,9 @@ def changed_paths(base: str, commit: str) -> list[str]:
 
 def cmd_candidate(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
+    if task["execution_state"] != "claimed" or temp["promotion_state"] != "not_submitted":
+        raise ValueError("只有正在执行且未 submit 的临时 TASK 可固定候选")
+    require_verified_provision(temp)
     require_current_rule_confirmation(temp)
     workspace = workspace_for(temp)
     if run_git(workspace, "status", "--porcelain").stdout.strip():
@@ -1062,6 +1439,13 @@ def cmd_candidate(args: argparse.Namespace) -> int:
 
 def cmd_review(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
+    if (
+        task["execution_state"] != "claimed"
+        or temp["promotion_state"] != "not_submitted"
+        or temp["temporary_session"]["state"] != "active"
+    ):
+        raise ValueError("独立审查只能绑定尚未 submit 的活跃候选")
+    require_verified_provision(temp)
     candidate = temp["candidate"]
     if not candidate or candidate["revision"] != args.candidate_revision:
         raise ValueError("审查目标候选不存在或 revision 已失效")
@@ -1076,6 +1460,9 @@ def cmd_review(args: argparse.Namespace) -> int:
 
 def cmd_submit(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
+    if task["execution_state"] != "claimed" or temp["promotion_state"] != "not_submitted":
+        raise ValueError("只有正在执行且未 submit 的临时 TASK 可提交 delivery")
+    require_verified_provision(temp)
     require_current_rule_confirmation(temp)
     candidate = temp["candidate"]
     if not candidate or candidate["revision"] != args.candidate_revision:
@@ -1090,6 +1477,13 @@ def cmd_submit(args: argparse.Namespace) -> int:
     workspace = workspace_for(temp)
     if run_git(workspace, "status", "--porcelain").stdout.strip():
         raise ValueError("submit 前 workspace 必须干净")
+    workspace_head = run_git(workspace, "rev-parse", "HEAD").stdout.strip()
+    if workspace_head != candidate["locator"]:
+        raise ValueError("submit 时 workspace HEAD 与固定候选不一致，需重新固定候选并验收")
+    workspace_tree = run_git(workspace, "rev-parse", "HEAD^{tree}").stdout.strip()
+    candidate_tree = run_git(PROJECT, "rev-parse", f"{candidate['locator']}^{{tree}}").stdout.strip()
+    if workspace_tree != candidate["digest"] or candidate_tree != candidate["digest"]:
+        raise ValueError("submit 时 workspace tree 与固定候选 digest 不一致")
     protected_ref = f"refs/agent-team/deliveries/{args.task_id}-C{args.candidate_revision}"
     existing = run_git(PROJECT, "rev-parse", "--verify", protected_ref, ok=False)
     if existing.returncode == 0 and existing.stdout.strip() != candidate["locator"]:
@@ -1119,6 +1513,17 @@ def cmd_rework(args: argparse.Namespace) -> int:
         raise ValueError("当前 TASK 不在可返工状态")
     if temp["promotion_state"] in {"integrated", "archived", "abandoned", "cancelled"}:
         raise ValueError("已集成、归档、放弃或取消的临时 TASK 不能返工")
+    require_verified_provision(temp)
+    require_settled_promotion(temp)
+    admission, reasons = admission_for(args.task_id, temp["impact"])
+    temp["impact"]["admission"] = admission
+    task["impact_declaration"] = temp["impact"]
+    if admission != "safe":
+        if task["execution_state"] in {"blocked", "waiting_input"}:
+            task["block_reason"] = f"rework 重新准入为 {admission}: {'；'.join(reasons)}"
+        write_task(task, expected_revision=task["revision"])
+        print(f"TEMP_REWORK_BLOCKED | {args.task_id} | admission:{admission} | {'；'.join(reasons)}")
+        return 4
     invalidated_attempt = temp["attempt"]
     temp["attempt"] += 1
     temp["candidate"] = None
@@ -1179,6 +1584,7 @@ def cmd_acknowledge(args: argparse.Namespace) -> int:
         return 0
     if task["execution_state"] != "completed" or temp["promotion_state"] != "submitted":
         raise ValueError("只有已 submit 的临时交付或已清理的 abandoned 任务可以核收")
+    require_verified_provision(temp)
     task["execution_state"] = "acknowledged"
     task["acknowledged_by"] = actor
     temp["promotion_state"] = "reviewing"
@@ -1197,6 +1603,9 @@ def cmd_absorb(args: argparse.Namespace) -> int:
         integration = temp.get("integration")
         if temp["promotion_state"] != "integrated" or not isinstance(integration, dict) or integration.get("result") != "pass":
             raise ValueError("所属部门、项目全局和最终吸收必须在正式验证通过并 integrated 后进行")
+    require_verified_provision(temp)
+    require_settled_promotion(temp)
+    require_cleanup_not_started(temp)
     temp["absorption"][field] = args.state
     temp["absorption"]["receipts"].append({
         "scope": args.scope, "state": args.state, "evidence": clean("evidence", args.evidence, max_chars=1000),
@@ -1209,6 +1618,52 @@ def cmd_absorb(args: argparse.Namespace) -> int:
     write_task(task, expected_revision=task["revision"])
     print(f"TEMP_ABSORPTION_OK | {args.task_id} | {args.scope}:{args.state}")
     return 0
+
+
+YAML_FIELD_RE = re.compile(r"^([A-Za-z_][A-Za-z0-9_-]*):[ \t]*(.*)$")
+
+
+def yaml_scalar(value: str, *, field: str) -> str:
+    scalar = value.strip()
+    if not scalar:
+        raise ValueError(f"正式测试报告 YAML 字段为空: {field}")
+    if scalar.startswith('"') or scalar.endswith('"'):
+        if not (scalar.startswith('"') and scalar.endswith('"')):
+            raise ValueError(f"正式测试报告 YAML 引号无效: {field}")
+        try:
+            decoded = json.loads(scalar)
+        except json.JSONDecodeError as exc:
+            raise ValueError(f"正式测试报告 YAML 字符串无效: {field}") from exc
+        if not isinstance(decoded, str):
+            raise ValueError(f"正式测试报告 YAML 字段必须是标量: {field}")
+        return decoded
+    if scalar.startswith("'") or scalar.endswith("'"):
+        if not (scalar.startswith("'") and scalar.endswith("'")):
+            raise ValueError(f"正式测试报告 YAML 引号无效: {field}")
+        return scalar[1:-1].replace("''", "'")
+    return scalar
+
+
+def audit_report_frontmatter(text: str) -> dict[str, str]:
+    if not text.startswith("---\n"):
+        raise ValueError("正式测试报告缺少文件开头 YAML frontmatter")
+    closing = text.find("\n---\n", 4)
+    if closing < 0:
+        raise ValueError("正式测试报告 YAML frontmatter 未闭合")
+    fields: dict[str, str] = {}
+    for line_number, line in enumerate(text[4:closing].splitlines(), start=2):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line != line.lstrip():
+            raise ValueError(f"正式测试报告 YAML 只允许顶层单行字段: line {line_number}")
+        match = YAML_FIELD_RE.fullmatch(line)
+        if not match:
+            raise ValueError(f"正式测试报告 YAML 字段格式无效: line {line_number}")
+        key, raw_value = match.groups()
+        if key in fields:
+            raise ValueError(f"正式测试报告 YAML 含重复字段: {key}")
+        fields[key] = yaml_scalar(raw_value, field=key)
+    return fields
 
 
 def formal_test_evidence(args: argparse.Namespace, *, commit: str, tree: str, result: str) -> tuple[str, str]:
@@ -1228,16 +1683,37 @@ def formal_test_evidence(args: argparse.Namespace, *, commit: str, tree: str, re
     if not report_relative.startswith(expected_root):
         raise ValueError("正式测试报告不在测试部门报告目录")
     text = report.read_text(encoding="utf-8-sig")
-    required_lines = (f"tested_commit: {commit}", f"tested_tree: {tree}", f"result: {result}")
-    if any(line not in text for line in required_lines):
-        raise ValueError("正式测试报告没有绑定当前 commit、tree 和通过结论")
+    fields = audit_report_frontmatter(text)
+    expected_fields = {
+        "type": "audit_report",
+        "department": test_task["department"],
+        "target": args.task_id,
+        "status": "final",
+        "related_task": args.test_task_id,
+        "decision": result,
+        "tested_commit": commit,
+        "tested_tree": tree,
+        "result": result,
+    }
+    missing = sorted(key for key in expected_fields if key not in fields)
+    if missing:
+        raise ValueError("正式测试报告 YAML 缺少字段: " + ", ".join(missing))
+    mismatched = sorted(key for key, expected in expected_fields.items() if fields.get(key) != expected)
+    if mismatched:
+        raise ValueError("正式测试报告 YAML 未精确绑定当前审核任务、commit、tree 和结论: " + ", ".join(mismatched))
     return args.test_task_id, report_relative
 
 
 def cmd_integration(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
-    if task["execution_state"] != "acknowledged" or not temp["delivery"]:
+    if (
+        task["execution_state"] != "acknowledged"
+        or not temp["delivery"]
+        or temp["promotion_state"] not in {"reviewing", "waiting_base", "ready"}
+    ):
         raise ValueError("统筹部接管 delivery 后才能记录正式集成候选")
+    require_verified_provision(temp)
+    require_settled_promotion(temp)
     commit_name = clean_revision("commit", args.commit)
     base_name = clean_revision("tested-base", args.tested_base)
     commit = run_git(PROJECT, "rev-parse", "--verify", f"{commit_name}^{{commit}}").stdout.strip()
@@ -1268,6 +1744,8 @@ def cmd_promote(args: argparse.Namespace) -> int:
     integration = temp["integration"]
     if not integration or integration["result"] != "pass" or temp["promotion_state"] != "ready":
         raise ValueError("没有可晋升的已测试候选")
+    require_verified_provision(temp)
+    require_settled_promotion(temp)
     main_branch = clean_branch(args.main_branch)
     current = run_git(PROJECT, "rev-parse", main_branch).stdout.strip()
     if current != integration["tested_base"]:
@@ -1322,6 +1800,16 @@ def cmd_reconcile_promotion(args: argparse.Namespace) -> int:
     operation = temp.get("promotion_operation")
     if not isinstance(operation, dict):
         raise ValueError("没有可 reconcile 的 promotion operation")
+    if temp["promotion_state"] == "integrated" and operation.get("state") == "verified":
+        print(f"TEMP_PROMOTION_RECONCILE_OK | {args.task_id} | integrated | idempotent")
+        return 0
+    if temp["promotion_state"] != "ready":
+        raise ValueError("只有 ready 且晋升事务未完成的临时 TASK 可 reconcile promotion")
+    if temp["workspace"]["state"] == "removed" or (
+        isinstance(temp.get("cleanup_operation"), dict)
+        and temp["cleanup_operation"].get("state") == "verified"
+    ):
+        raise ValueError("临时资源已清理，不能重新打开晋升状态")
     current = run_git(PROJECT, "rev-parse", operation["main_branch"]).stdout.strip()
     if current == operation["candidate_commit"]:
         tree = run_git(PROJECT, "rev-parse", f"{current}^{{tree}}").stdout.strip()
@@ -1336,8 +1824,19 @@ def cmd_reconcile_promotion(args: argparse.Namespace) -> int:
         print(f"TEMP_PROMOTION_RECONCILE_OK | {args.task_id} | integrated")
         return 0
     if current == operation["expected_old"]:
+        history = operation.get("history", [])
+        if (
+            operation.get("state") == "failed"
+            and history
+            and history[-1].get("state") == "failed"
+            and history[-1].get("via") == "reconcile"
+        ):
+            print(f"TEMP_PROMOTION_RECONCILE_BLOCKED | {args.task_id} | main-not-advanced | idempotent")
+            return 4
         operation["state"] = "failed"
-        operation["history"].append({"state": "failed", "at": now_iso(), "reason": "main-not-advanced"})
+        operation["history"].append({
+            "state": "failed", "at": now_iso(), "reason": "main-not-advanced", "via": "reconcile",
+        })
         write_task(task, expected_revision=task["revision"])
         print(f"TEMP_PROMOTION_RECONCILE_BLOCKED | {args.task_id} | main-not-advanced")
         return 4
@@ -1346,6 +1845,12 @@ def cmd_reconcile_promotion(args: argparse.Namespace) -> int:
 
 def cmd_abandon(args: argparse.Namespace) -> int:
     task, temp = temp_task(args.task_id)
+    if temp["promotion_state"] in {"integrated", "archived", "cancelled"}:
+        raise ValueError("已集成、归档或取消的临时 TASK 不能改为 abandoned")
+    if temp["promotion_state"] == "abandoned":
+        raise ValueError("临时 TASK 已是 abandoned，不能重复改写放弃证据")
+    require_verified_provision(temp)
+    require_settled_promotion(temp)
     temp["promotion_state"] = "abandoned"
     temp["temporary_session"]["state"] = "standby"
     temp["operation"]["abandon_evidence"] = clean("evidence", args.evidence, max_chars=1000)
@@ -1382,6 +1887,18 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
             raise ValueError("成果已集成但知识吸收尚未最终收口")
     elif temp["promotion_state"] != "abandoned":
         raise ValueError("只有 integrated 或用户明确 abandoned 后可以清理")
+    require_verified_provision(temp)
+    prior_cleanup = temp.get("cleanup_operation")
+    if isinstance(prior_cleanup, dict):
+        history = prior_cleanup.get("history", [])
+        reconciled_failure = (
+            prior_cleanup.get("state") == "failed"
+            and bool(history)
+            and history[-1].get("state") == "failed"
+            and history[-1].get("via") == "reconcile"
+        )
+        if not reconciled_failure:
+            raise ValueError("存在未收口的清理事务，必须先 reconcile cleanup")
     session = temp["temporary_session"]
     if session["state"] != "standby":
         raise ValueError("清理前临时会话必须处于 standby")
@@ -1401,7 +1918,11 @@ def cmd_cleanup(args: argparse.Namespace) -> int:
     workspace = workspace_for(temp)
     if run_git(workspace, "status", "--porcelain").stdout.strip():
         raise ValueError("workspace 存在未提交内容，拒绝清理")
-    marker = json.loads((workspace / ".agent-team" / "ownership.json").read_text(encoding="utf-8"))
+    marker = read_plain_json(
+        workspace / ".agent-team" / "ownership.json", workspace, label="workspace ownership marker",
+    )
+    if not isinstance(marker, dict):
+        raise ValueError("workspace ownership marker 根节点无效")
     expected_marker = {
         "operation_id": temp["operation"]["id"], "task_id": args.task_id,
         "executor_id": temp["executor_id"], "workspace": temp["workspace"]["path"],
@@ -1466,6 +1987,15 @@ def cmd_reconcile_cleanup(args: argparse.Namespace) -> int:
         raise ValueError("没有可 reconcile 的 cleanup operation")
     workspace = PROJECT / operation["workspace"]
     branch_exists = run_git(PROJECT, "show-ref", "--verify", f"refs/heads/{operation['branch']}", ok=False).returncode == 0
+    if (
+        temp["promotion_state"] == "archived"
+        and temp["workspace"]["state"] == "removed"
+        and operation.get("state") == "verified"
+    ):
+        if workspace.exists() or branch_exists:
+            raise ValueError("清理真值已 verified，但 workspace 或 branch 重新出现")
+        print(f"TEMP_CLEANUP_RECONCILE_OK | {args.task_id} | resources-archived | idempotent")
+        return 0
     if not workspace.exists() and not branch_exists:
         prior_promotion_state = temp["promotion_state"]
         thread_id = temp["temporary_session"]["thread_id"]
@@ -1490,12 +2020,61 @@ def cmd_reconcile_cleanup(args: argparse.Namespace) -> int:
         print(f"TEMP_CLEANUP_RECONCILE_OK | {args.task_id} | resources-archived | {archive_action}")
         return 0
     if workspace.exists() and branch_exists:
+        history = operation.get("history", [])
+        if (
+            operation.get("state") == "failed"
+            and history
+            and history[-1].get("state") == "failed"
+            and history[-1].get("via") == "reconcile"
+        ):
+            print(f"TEMP_CLEANUP_RECONCILE_BLOCKED | {args.task_id} | resources-still-present | idempotent")
+            return 4
         operation["state"] = "failed"
-        operation["history"].append({"state": "failed", "at": now_iso(), "reason": "resources-still-present"})
+        operation["history"].append({
+            "state": "failed", "at": now_iso(), "reason": "resources-still-present", "via": "reconcile",
+        })
         write_task(task, expected_revision=task["revision"])
         print(f"TEMP_CLEANUP_RECONCILE_BLOCKED | {args.task_id} | resources-still-present")
         return 4
     raise ValueError("workspace 与 branch 只剩一项，保留现场并转人工处理")
+
+
+def cmd_pending_archives(args: argparse.Namespace) -> int:
+    registered_thread_owners()
+    pending: list[tuple[str, str]] = []
+    for path in task_files():
+        task = read_task(path.stem)
+        temp = task.get("temporary_executor")
+        if not isinstance(temp, dict):
+            continue
+        validate_extension(task)
+        workspace = temp.get("workspace")
+        cleanup = temp.get("cleanup_operation")
+        session = temp.get("temporary_session")
+        if not isinstance(workspace, dict) or not isinstance(cleanup, dict) or not isinstance(session, dict):
+            continue
+        thread_id = session.get("thread_id")
+        cleaned_with_thread = (
+            temp.get("promotion_state") == "archived"
+            and workspace.get("state") == "removed"
+            and cleanup.get("state") == "verified"
+            and isinstance(thread_id, str)
+            and thread_id
+        )
+        if not cleaned_with_thread or session.get("state") == "archived":
+            continue
+        if session.get("state") != "standby":
+            raise ValueError(
+                f"{task['task_id']} 清理后真实会话状态异常，不能生成归档提醒: {session.get('state')}"
+            )
+        if session.get("state") == "standby":
+            pending.append((task["task_id"], thread_id))
+    if not pending:
+        print("NO_PENDING_THREAD_ARCHIVES")
+        return 0
+    for task_id, thread_id in pending:
+        print(f"ARCHIVE_THREAD_REQUIRED:{thread_id} | {task_id}")
+    return 0
 
 
 def impact_arguments(command: argparse.ArgumentParser, *, include_base: bool = True) -> None:
@@ -1626,12 +2205,16 @@ def parser() -> argparse.ArgumentParser:
     reconcile_cleanup = sub.add_parser("reconcile-cleanup")
     reconcile_cleanup.add_argument("--task-id", required=True)
     reconcile_cleanup.set_defaults(func=cmd_reconcile_cleanup)
+    pending_archives = sub.add_parser("pending-archives")
+    pending_archives.set_defaults(func=cmd_pending_archives, read_only=True)
     return root
 
 
 def main() -> int:
     args = parser().parse_args()
     try:
+        if getattr(args, "read_only", False):
+            return args.func(args)
         with task_lock():
             return args.func(args)
     except (OSError, ValueError, json.JSONDecodeError) as exc:

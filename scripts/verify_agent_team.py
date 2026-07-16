@@ -4,18 +4,35 @@
 from __future__ import annotations
 
 import datetime as dt
+import contextlib
+import importlib.util
+import io
 import json
 import os
 import py_compile
+import re
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = Path(os.environ.get("AGENT_TEAM_SCAFFOLD", ROOT / "scripts" / "scaffold_team.py")).expanduser().resolve()
+PRODUCT_VERSION = "2.0.1"
+PROTOCOL_VERSION = "1.4.6"
+PREVIOUS_PROTOCOL_VERSION = "1.4.5"
+PROTOCOL_DOCUMENT_VERSION = "0.3.0"
+RUNTIME_FILES = (
+    "SKILL.md",
+    "agents/openai.yaml",
+    "scripts/scaffold_team.py",
+    "scripts/temporary_executor_runtime.py",
+)
 SPEC = """# Project
 
 ## 目标与用户需求
@@ -64,6 +81,157 @@ def check(condition: bool, message: str) -> None:
         raise VerifyError(message)
 
 
+class UniqueKeyLoader(yaml.SafeLoader):
+    pass
+
+
+def _construct_unique_mapping(loader, node, deep=False):
+    mapping = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if key in mapping:
+            raise VerifyError(f"frontmatter contains a duplicate YAML key: {key}")
+        mapping[key] = loader.construct_object(value_node, deep=deep)
+    return mapping
+
+
+UniqueKeyLoader.add_constructor(
+    yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG,
+    _construct_unique_mapping,
+)
+
+
+def yaml_frontmatter(text: str, *, label: str) -> dict[object, object]:
+    match = re.match(r"^---\n(.*?)\n---(?:\n|$)", text, re.DOTALL)
+    check(match is not None, f"{label} frontmatter is missing or malformed")
+    try:
+        fields = yaml.load(match.group(1), Loader=UniqueKeyLoader)
+    except yaml.YAMLError as exc:
+        raise VerifyError(f"{label} frontmatter is invalid YAML: {exc}") from exc
+    check(isinstance(fields, dict), f"{label} frontmatter must be a YAML mapping")
+    return fields
+
+
+def compile_script(path: Path) -> None:
+    """Compile without writing to the host user's global Python cache."""
+    with tempfile.TemporaryDirectory(prefix="agent-team-pycompile-") as temp:
+        py_compile.compile(str(path), cfile=str(Path(temp) / f"{path.name}.pyc"), doraise=True)
+
+
+def verify_installed_copy(installed_root: Path) -> None:
+    check(installed_root.is_dir() and not installed_root.is_symlink(), "installed copy root is missing or unsafe")
+    actual: set[str] = set()
+    for path in installed_root.rglob("*"):
+        if path.is_symlink():
+            raise VerifyError(f"installed copy contains symlink: {path.relative_to(installed_root)}")
+        if path.is_file():
+            actual.add(path.relative_to(installed_root).as_posix())
+    expected = set(RUNTIME_FILES)
+    check(actual == expected,
+          f"installed copy file list mismatch: expected={sorted(expected)} actual={sorted(actual)}")
+    for relative in RUNTIME_FILES:
+        source = ROOT / relative
+        installed = installed_root / relative
+        check(source.is_file() and installed.is_file(), f"runtime file missing: {relative}")
+        check(source.read_bytes() == installed.read_bytes(), f"installed copy content mismatch: {relative}")
+
+
+def verify_install_bundle_contract(root: Path) -> None:
+    installed = root / "installed-copy"
+    for relative in RUNTIME_FILES:
+        destination = installed / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, destination)
+    good = run([sys.executable, str(Path(__file__).resolve()), "--check-installed-copy", str(installed)])
+    check(good.stdout.startswith("INSTALL_COPY_OK |"), "exact four-file installed copy was rejected")
+
+    extra = installed / "README.md"
+    extra.write_text("development-only\n", encoding="utf-8")
+    rejected_extra = run(
+        [sys.executable, str(Path(__file__).resolve()), "--check-installed-copy", str(installed)], ok=False,
+    )
+    check("file list mismatch" in rejected_extra.stderr, "installed copy accepted a fifth runtime file")
+    extra.unlink()
+
+    target = installed / "SKILL.md"
+    original = target.read_bytes()
+    target.write_bytes(original + b"\ncontent-drift\n")
+    rejected_drift = run(
+        [sys.executable, str(Path(__file__).resolve()), "--check-installed-copy", str(installed)], ok=False,
+    )
+    check("content mismatch" in rejected_drift.stderr, "installed copy accepted drifted runtime content")
+    target.write_bytes(original)
+
+
+def verify_repository_contract() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    protocol_doc = (ROOT / "docs" / "temporary-executor-protocol.md").read_text(encoding="utf-8")
+    skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    openai_yaml = (ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
+    frontmatter_fields = yaml_frontmatter(skill, label="SKILL")
+    protocol_frontmatter = yaml_frontmatter(protocol_doc, label="temporary executor protocol")
+    allowed_frontmatter = {"name", "description", "license", "allowed-tools", "metadata"}
+    check(set(frontmatter_fields) <= allowed_frontmatter,
+          "SKILL frontmatter contains unsupported fields")
+    skill_name = frontmatter_fields.get("name", "")
+    check(isinstance(skill_name, str)
+          and bool(re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", skill_name))
+          and len(skill_name) <= 64,
+          "SKILL name violates the official hyphen-case or 64-character contract")
+    description = frontmatter_fields.get("description", "")
+    check(isinstance(description, str) and bool(description)
+          and len(description) <= 1024 and "<" not in description and ">" not in description,
+          "SKILL description violates the official metadata contract")
+    check(
+        f"产品与发布版本为 `{PRODUCT_VERSION}`" in readme
+        and f"运行协议为 `{PROTOCOL_VERSION}`" in readme,
+        "README conflated or omitted product and runtime protocol versions",
+    )
+    check(
+        protocol_frontmatter.get("status") == "implemented"
+        and protocol_frontmatter.get("version") == PROTOCOL_DOCUMENT_VERSION
+        and protocol_frontmatter.get("product_version") == PRODUCT_VERSION
+        and protocol_frontmatter.get("runtime_protocol_version") == PROTOCOL_VERSION
+        and "文档修订号" in protocol_doc,
+        "temporary executor protocol did not separate implementation, product, runtime, and document revisions",
+    )
+    check(
+        f"当前运行协议为 `{PROTOCOL_VERSION}`" in skill
+        and "pending-archives" in skill
+        and "YAML frontmatter" in skill,
+        "SKILL maintenance/archive evidence contract is stale",
+    )
+    workflow_lines = workflow.splitlines()
+    try:
+        on_index = workflow_lines.index("on:")
+        jobs_index = workflow_lines.index("jobs:")
+    except ValueError as exc:
+        raise VerifyError("CI workflow is missing exact on/jobs sections") from exc
+    trigger_lines = [
+        line.strip() for line in workflow_lines[on_index + 1:jobs_index]
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    check(trigger_lines == ["push:", "pull_request:"],
+          "CI must run on every push and pull request without branch filters")
+    check('python-version: ["3.9", "3.11"]' in workflow,
+          "CI no longer verifies both Python 3.9 and 3.11")
+    try:
+        openai_metadata = yaml.load(openai_yaml, Loader=UniqueKeyLoader)
+    except yaml.YAMLError as exc:
+        raise VerifyError(f"agents/openai.yaml is invalid YAML: {exc}") from exc
+    interface = openai_metadata.get("interface") if isinstance(openai_metadata, dict) else None
+    display_name = interface.get("display_name") if isinstance(interface, dict) else None
+    short_description = interface.get("short_description") if isinstance(interface, dict) else None
+    default_prompt = interface.get("default_prompt") if isinstance(interface, dict) else None
+    check(isinstance(display_name, str) and bool(display_name.strip()) and len(display_name) <= 64,
+          "agents/openai.yaml display_name must be a non-empty string of at most 64 characters")
+    check(isinstance(short_description, str) and 25 <= len(short_description) <= 64,
+          "agents/openai.yaml short_description is outside the 25-64 character UI contract")
+    check(isinstance(default_prompt, str) and f"${skill_name}" in default_prompt,
+          "agents/openai.yaml default_prompt does not explicitly invoke the skill")
+
+
 def make_project(root: Path, name: str) -> Path:
     project = root / name
     (project / "docs").mkdir(parents=True)
@@ -104,7 +272,7 @@ def verify_generated(project: Path) -> None:
     collab = project / "docs" / "collaboration"
     required = [
         "协议版本.json", "README.md", "路由表.md", "部门表.md", "会话启动清单.md",
-        "会话启动状态.json", "任务交接模板.md", "模板/工作报告.md", "模板/审核报告.md",
+        "会话启动状态.json", "任务交接模板.md", "错题集.md", "模板/工作报告.md", "模板/审核报告.md",
         "模板/专项结论.md", "scripts/agent_team_log.py", "scripts/agent_team_task.py",
         "scripts/agent_team_session.py", "scripts/agent_team_temporary.py",
     ]
@@ -113,11 +281,12 @@ def verify_generated(project: Path) -> None:
     check(not (collab / "读取路由规则.md").exists(), "obsolete reading rules generated")
     check(not (collab / "scripts" / "agent_team_read.py").exists(), "obsolete reader generated")
     protocol = json.loads((collab / "协议版本.json").read_text(encoding="utf-8"))
-    check(protocol["protocol_version"] == "1.4.5", "unexpected protocol version")
+    check(protocol["protocol_version"] == PROTOCOL_VERSION, "unexpected protocol version")
     for script in (collab / "scripts").glob("*.py"):
-        py_compile.compile(str(script), doraise=True)
+        compile_script(script)
     guide = (project / "docs" / "agent-guide.md").read_text(encoding="utf-8")
-    check("受管协议版本:1.4.5" in guide and "任务真值" in guide, "project guide not refreshed")
+    check(f"受管协议版本:{PROTOCOL_VERSION}" in guide and "任务真值" in guide,
+          "project guide not refreshed")
     collaboration_readme = (collab / "README.md").read_text(encoding="utf-8")
     check("有归档工具时立即调用" in collaboration_readme
           and "host=<真实工具>" in collaboration_readme
@@ -125,7 +294,9 @@ def verify_generated(project: Path) -> None:
           and "我目前无法自动归档这个会话" in collaboration_readme
           and "归档完成后告诉我一声" in collaboration_readme
           and "user_confirmation=" in collaboration_readme
-          and "temporary_session=standby" in collaboration_readme,
+          and "temporary_session=standby" in collaboration_readme
+          and "一旦已登记新 thread ID" in collaboration_readme
+          and "`restore-old` 必须带精确绑定新 ID 的归档回执" in collaboration_readme,
           "generated collaboration guide omitted the automatic path or lightweight manual fallback")
     check("archive-request" not in collaboration_readme and "--archive-mode" not in collaboration_readme,
           "generated collaboration guide retained the rejected hard archive gate")
@@ -232,6 +403,27 @@ def verify_tasks(project: Path) -> None:
     for child in fake_department.iterdir():
         child.unlink()
     fake_department.rmdir()
+
+    tasks = collab / "tasks"
+    safe_tasks = collab / "tasks-safe"
+    outside_tasks = project.parent / "outside-task-store"
+    outside_tasks.mkdir()
+    tasks.rename(safe_tasks)
+    tasks.symlink_to(outside_tasks, target_is_directory=True)
+    try:
+        denied_tasks_symlink = run([
+            sys.executable, str(tool), "enqueue", "--department", "执行部",
+            "--from-department", "统筹部", "--title", "越界任务",
+            "--node", "单节点", "--details", "不得写入项目外 tasks",
+            "--acceptance-exit", "明确拒绝", "--failure-path", "tasks 父目录是符号链接",
+            "--authorization-state", "none",
+        ], ok=False)
+        check("不安全" in denied_tasks_symlink.stderr,
+              "task mutation did not reject a symlinked tasks parent")
+        check(not any(outside_tasks.iterdir()), "task mutation wrote through a symlinked tasks parent")
+    finally:
+        tasks.unlink(missing_ok=True)
+        safe_tasks.rename(tasks)
     for step, evidence in (("created", "lead-create"), ("onboarded", "lead-send"), ("registered", "lead-register")):
         run([sys.executable, str(session), "mark", "--department", "统筹部", "--step", step,
              "--thread-id", "lead-thread", "--evidence", evidence])
@@ -356,6 +548,16 @@ def verify_tasks(project: Path) -> None:
     denied_orphan_history = run([sys.executable, str(tool), "list"], ok=False)
     check("证据与历史有无不一致" in denied_orphan_history.stderr,
           "authorization history without current evidence failed open")
+    schema_path.write_text(json.dumps(original, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+
+    canonical_text = json.dumps(original, ensure_ascii=False, indent=2)
+    duplicate_key_text = canonical_text.replace(
+        "{\n", "{\n  \"title\": \"重复键不得静默覆盖\",\n", 1,
+    ) + "\n"
+    schema_path.write_text(duplicate_key_text, encoding="utf-8")
+    denied_duplicate_key = run([sys.executable, str(tool), "list"], ok=False)
+    check("重复" in denied_duplicate_key.stderr and "title" in denied_duplicate_key.stderr,
+          "TASK JSON duplicate key was silently accepted")
     schema_path.write_text(json.dumps(original, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     rejected_claimed = json.loads(json.dumps(original, ensure_ascii=False))
@@ -493,6 +695,23 @@ def verify_log_and_session(project: Path, root: Path) -> None:
     check("必须写入父部门周日志" in wrong_parent.stderr, "temporary log crossed parent department")
 
     session = collab / "scripts" / "agent_team_session.py"
+    state_path = collab / "会话启动状态.json"
+    pristine_session_truth = state_path.read_bytes()
+    for invalid_thread_id in ("thread with space", "thread\twith-tab", "=receipt-ambiguous", "x" * 301):
+        rejected_identity = run([
+            sys.executable, str(session), "mark", "--department", "执行部", "--step", "created",
+            "--thread-id", invalid_thread_id, "--evidence", "must-remain-receipt-representable",
+        ], ok=False)
+        check(("thread-id" in rejected_identity.stderr or "归档回执" in rejected_identity.stderr)
+              and state_path.read_bytes() == pristine_session_truth,
+              "formal session accepted an identity that can never be represented in an archive receipt")
+    duplicate_formal_thread = run([
+        sys.executable, str(session), "mark", "--department", "执行部", "--step", "created",
+        "--thread-id", "lead-thread", "--evidence", "must-not-reuse-lead-thread",
+    ], ok=False)
+    check("thread" in duplicate_formal_thread.stderr.casefold()
+          and ("占用" in duplicate_formal_thread.stderr or "冲突" in duplicate_formal_thread.stderr),
+          "two formal departments accepted the same thread ID")
     run([sys.executable, str(session), "mark", "--department", "执行部", "--step", "created",
          "--thread-id", "thread-1", "--evidence", "create-receipt"])
     run([sys.executable, str(session), "mark", "--department", "执行部", "--step", "failed",
@@ -508,21 +727,120 @@ def verify_log_and_session(project: Path, root: Path) -> None:
     ascii_env.update(LC_ALL="C", LANG="C", PYTHONUTF8="0")
     shown = run([sys.executable, str(session), "show"], env=ascii_env)
     check("执行部" in shown.stdout, "session tool did not preserve UTF-8 output under ASCII locale")
-    state = json.loads((collab / "会话启动状态.json").read_text(encoding="utf-8"))
+    state_text = state_path.read_text(encoding="utf-8")
+    duplicate_state_text = state_text.replace(
+        "{\n", "{\n  \"schema_version\": 1,\n", 1,
+    )
+    state_path.write_text(duplicate_state_text, encoding="utf-8")
+    duplicate_session_key = run([sys.executable, str(session), "show"], ok=False)
+    check("重复" in duplicate_session_key.stderr and "schema_version" in duplicate_session_key.stderr,
+          "session JSON duplicate key was silently accepted")
+    state_path.write_text(state_text, encoding="utf-8")
+    state = json.loads(state_text)
     check(state["departments"]["执行部"]["notification_mode"] == "manual", "initial notification mode missing")
     run([sys.executable, str(session), "set-notification", "--department", "执行部",
          "--mode", "auto", "--evidence", "user-approved-notification-change"])
+    run([sys.executable, str(session), "begin-switch", "--department", "统筹部",
+         "--old-thread-id", "lead-thread", "--reason", "verify pre-create rollback"])
+    restored_before_create = run([
+        sys.executable, str(session), "restore-old", "--department", "统筹部",
+        "--note", "new session was never created",
+    ])
+    restored_lead_state = json.loads(state_path.read_text(encoding="utf-8"))["departments"]["统筹部"]
+    check(restored_before_create.stdout.startswith("SESSION_RESTORED |")
+          and restored_lead_state["thread_id"] == "lead-thread"
+          and restored_lead_state["previous_thread_id"] == ""
+          and restored_lead_state["operation_id"].startswith("ACTIVE-"),
+          "pre-create switch rollback did not safely restore the old session")
     run([sys.executable, str(session), "begin-switch", "--department", "执行部",
          "--old-thread-id", "thread-1", "--reason", "user approved"])
     for step, evidence in (("created", "create-2"), ("onboarded", "send-2"), ("registered", "register-2")):
         args = [sys.executable, str(session), "mark", "--department", "执行部", "--step", step,
                 "--thread-id", "thread-2", "--evidence", evidence]
         run(args)
-    run([sys.executable, str(session), "finish-switch", "--department", "执行部",
-         "--new-thread-id", "thread-2", "--evidence", "archive-receipt"])
+    before_finish_switch = state_path.read_bytes()
+    unarchived_restore = run([
+        sys.executable, str(session), "restore-old", "--department", "执行部",
+        "--note", "must-not-discard-new-thread",
+    ], ok=False)
+    wrong_new_archive_restore = run([
+        sys.executable, str(session), "restore-old", "--department", "执行部",
+        "--note", "must-not-discard-new-thread",
+        "--evidence", "host=set_thread_archived thread_id=thread-2-extra archived=true",
+    ], ok=False)
+    nested_switch = run([
+        sys.executable, str(session), "begin-switch", "--department", "执行部",
+        "--old-thread-id", "thread-2", "--reason", "must-not-overwrite-pending-old-thread",
+    ], ok=False)
+    check(all(result.returncode != 0 for result in (unarchived_restore, wrong_new_archive_restore, nested_switch))
+          and "归档回执" in unarchived_restore.stderr
+          and state_path.read_bytes() == before_finish_switch,
+          "registered switch truth lost a new or previous thread without an archive receipt")
+    for false_evidence in (
+        "archive-receipt",
+        "host=set_thread_archived thread_id=thread-1-extra archived=true",
+        "host=set_thread_archived thread_id=THREAD-1 archived=true",
+        "host=set_thread_archived thread_id=thread-1 archived=false",
+    ):
+        rejected_finish = run([
+            sys.executable, str(session), "finish-switch", "--department", "执行部",
+            "--new-thread-id", "thread-2", "--evidence", false_evidence,
+        ], ok=False)
+        check("归档" in rejected_finish.stderr and state_path.read_bytes() == before_finish_switch,
+              "finish-switch accepted false archive evidence or mutated switch truth")
+    finished_switch_receipt = "host=set_thread_archived thread_id=thread-1 archived=true"
+    run([
+        sys.executable, str(session), "finish-switch", "--department", "执行部",
+        "--new-thread-id", "thread-2",
+        "--evidence", finished_switch_receipt,
+    ])
     state = json.loads((collab / "会话启动状态.json").read_text(encoding="utf-8"))
-    check(state["departments"]["执行部"]["thread_id"] == "thread-2", "switch did not persist new thread")
+    check(state["departments"]["执行部"]["thread_id"] == "thread-2"
+          and state["departments"]["执行部"]["evidence"] == finished_switch_receipt,
+          "switch did not persist the new thread and durable old-thread archive receipt")
     check(state["departments"]["执行部"]["notification_mode"] == "auto", "notification mode did not persist")
+    run([sys.executable, str(session), "set-notification", "--department", "执行部",
+         "--mode", "manual", "--evidence", "notification-change-must-not-delete-archive-receipt"])
+    notification_state = json.loads(state_path.read_text(encoding="utf-8"))["departments"]["执行部"]
+    check(notification_state["evidence"] == finished_switch_receipt,
+          "set-notification overwrote the durable finish-switch archive receipt")
+    run([sys.executable, str(session), "set-notification", "--department", "执行部",
+         "--mode", "auto", "--evidence", "restore-auto-notification-mode"])
+    for step, evidence in (("created", "review-old-create"), ("onboarded", "review-old-onboard"),
+                           ("registered", "review-old-register")):
+        run([
+            sys.executable, str(session), "mark", "--department", "检验部", "--step", step,
+            "--thread-id", "review-old-thread", "--evidence", evidence,
+        ])
+    run([
+        sys.executable, str(session), "begin-switch", "--department", "检验部",
+        "--old-thread-id", "review-old-thread", "--reason", "verify archived new-session rollback",
+    ])
+    run([
+        sys.executable, str(session), "mark", "--department", "检验部", "--step", "created",
+        "--thread-id", "review-new-thread", "--evidence", "review-new-created",
+    ])
+    review_switch_truth = state_path.read_bytes()
+    review_unarchived_restore = run([
+        sys.executable, str(session), "restore-old", "--department", "检验部",
+        "--note", "new review session failed onboarding",
+    ], ok=False)
+    check("归档回执" in review_unarchived_restore.stderr
+          and state_path.read_bytes() == review_switch_truth,
+          "created new session disappeared during restore-old without archive evidence")
+    review_archive_receipt = "host=set_thread_archived thread_id=review-new-thread archived=true"
+    restored_review = run([
+        sys.executable, str(session), "restore-old", "--department", "检验部",
+        "--note", "new review session archived after onboarding failure",
+        "--evidence", review_archive_receipt,
+    ])
+    restored_review_state = json.loads(state_path.read_text(encoding="utf-8"))["departments"]["检验部"]
+    check(restored_review.stdout.startswith("SESSION_RESTORED |")
+          and restored_review_state["thread_id"] == "review-old-thread"
+          and restored_review_state["previous_thread_id"] == ""
+          and restored_review_state["operation_id"].startswith("ACTIVE-")
+          and restored_review_state["evidence"] == review_archive_receipt,
+          "restore-old did not retain the archived new-session receipt before restoring the old session")
     registry = (collab / "部门表.md").read_text(encoding="utf-8")
     check("thread-2" in registry and "auto" in registry, "session index was not refreshed")
 
@@ -579,14 +897,26 @@ def verify_temporary_executor(root: Path) -> None:
     check("TEMP_ADMISSION_MANUAL" in blocked_manual.stdout,
           "blocked formal task without impact declaration disappeared from admission")
 
+    run([sys.executable, str(task_tool), "resume", "--task-id", formal])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", formal,
+        "--artifact", "app/base.py", "--verified", "缺声明场景已完成",
+        "--unverified", "无", "--mistake-check", "未把缺声明误判为安全",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", formal,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+
+    formal = enqueue_dev("正式任务 A（已声明影响）", "none")
     formal_path = collab / "tasks" / f"{formal}.json"
     formal_revision = json.loads(formal_path.read_text(encoding="utf-8"))["revision"]
     run([
-        sys.executable, str(temporary_tool), "declare-impact", "--task-id", formal,
+        sys.executable, str(task_tool), "declare-impact", "--task-id", formal,
         "--expected-revision", str(formal_revision), "--base-revision", "HEAD",
         "--write-path", "app/a.py", "--shared-contract", "auth-v1",
     ])
-    run([sys.executable, str(task_tool), "resume", "--task-id", formal])
+    run([sys.executable, str(task_tool), "claim", "--task-id", formal, "--claimed-by", "dev-session"])
     unsafe = run([
         sys.executable, str(temporary_tool), "preflight", "--task-id", temporary,
         "--parent-department", "开发部", "--write-path", "app/b.py",
@@ -654,6 +984,19 @@ def verify_temporary_executor(root: Path) -> None:
           "same client key accepted a different provision request")
 
     task_path = collab / "tasks" / f"{temporary}.json"
+    reverse_formal = enqueue_dev("正式任务反向冲突探针", "none")
+    reverse_formal_path = collab / "tasks" / f"{reverse_formal}.json"
+    formal_before_reverse_impact = reverse_formal_path.read_bytes()
+    formal_reverse_revision = json.loads(formal_before_reverse_impact)["revision"]
+    reverse_impact = run([
+        sys.executable, str(task_tool), "declare-impact", "--task-id", reverse_formal,
+        "--expected-revision", str(formal_reverse_revision), "--base-revision", "HEAD",
+        "--write-path", "app/b.py",
+    ], ok=False)
+    check(("冲突" in reverse_impact.stderr or "重叠" in reverse_impact.stderr)
+          and reverse_formal_path.read_bytes() == formal_before_reverse_impact,
+          "formal impact declaration overwrote a conflicting active temporary scope")
+
     legacy_payload = json.loads(task_path.read_text(encoding="utf-8"))
     legacy_temp = legacy_payload["temporary_executor"]
     legacy_temp.pop("promotion_operation")
@@ -674,7 +1017,7 @@ def verify_temporary_executor(root: Path) -> None:
     normalized_temp = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]
     check("promotion_operation" in normalized_temp and "cleanup_operation" in normalized_temp
           and normalized_temp["operation"]["request_digest"] == "legacy-unknown",
-          "legacy temporary TASK did not normalize safely for 1.4.5")
+          f"legacy temporary TASK did not normalize safely for {PROTOCOL_VERSION}")
     copied_scripts = workspace / "docs" / "collaboration" / "scripts"
     copied_task_list = run([sys.executable, str(copied_scripts / "agent_team_task.py"), "list"])
     check(temporary in copied_task_list.stdout, "worktree task tool read the non-authoritative TASK copy")
@@ -716,11 +1059,112 @@ def verify_temporary_executor(root: Path) -> None:
         check(not list(copied_logs.glob("*.md")), "control-root failure mutated the worktree copy")
     finally:
         hidden_control.rename(collab)
+    duplicate_formal_thread = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "active", "--thread-id", "lead-thread",
+        "--rule-digest", temp["rule"]["digest"], "--evidence", "must-not-reuse-formal-thread",
+    ], ok=False)
+    check("thread" in duplicate_formal_thread.stderr.casefold()
+          and ("占用" in duplicate_formal_thread.stderr or "冲突" in duplicate_formal_thread.stderr),
+          "temporary session reused a formal department thread ID")
+    pristine_temporary_identity = task_path.read_bytes()
+    for invalid_thread_id in ("temporary thread", "temporary\tthread", "=receipt-ambiguous", "t" * 301):
+        rejected_identity = run([
+            sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+            "--state", "active", "--thread-id", invalid_thread_id,
+            "--rule-digest", temp["rule"]["digest"], "--evidence", "must-remain-receipt-representable",
+        ], ok=False)
+        check(("thread-id" in rejected_identity.stderr or "归档回执" in rejected_identity.stderr)
+              and task_path.read_bytes() == pristine_temporary_identity,
+              "temporary session accepted an identity that can never be represented in an archive receipt")
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "failed", "--thread-id", "temporary-thread-1",
+        "--evidence", "real-session-created-but-onboarding-failed",
+    ])
+    provisioning_failure = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]["temporary_session"]
+    check(provisioning_failure["state"] == "failed"
+          and provisioning_failure["thread_id"] == "temporary-thread-1",
+          "failed session registration lost the real thread ID created during provisioning")
+    failed_provisioning_truth = task_path.read_bytes()
+    replaced_provisioning_thread = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "active", "--thread-id", "temporary-thread-replacement",
+        "--rule-digest", temp["rule"]["digest"], "--evidence", "must-not-replace-created-thread",
+    ], ok=False)
+    check("原始 ID" in replaced_provisioning_thread.stderr
+          and task_path.read_bytes() == failed_provisioning_truth,
+          "provisioning failure retry replaced a recorded real thread ID")
     run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
         "--state", "active", "--thread-id", "temporary-thread-1",
         "--rule-digest", temp["rule"]["digest"], "--evidence", "rule-read-confirmed",
     ])
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "failed", "--evidence", "temporary-session-connection-failed",
+    ])
+    failed_session_truth = task_path.read_bytes()
+    replaced_failed_thread = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "active", "--thread-id", "temporary-thread-replacement",
+        "--rule-digest", temp["rule"]["digest"], "--evidence", "must-not-replace-failed-thread",
+    ], ok=False)
+    check("原始 ID" in replaced_failed_thread.stderr
+          and task_path.read_bytes() == failed_session_truth,
+          "failed temporary session retry replaced a real thread ID without archive evidence")
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "active", "--thread-id", "temporary-thread-1",
+        "--rule-digest", temp["rule"]["digest"], "--evidence", "same-thread-reconnected",
+    ])
+    active_session_truth = task_path.read_bytes()
+    cancelled_real_thread = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "cancelled", "--evidence", "must-not-cancel-real-thread",
+    ], ok=False)
+    check("cleanup 内部" in cancelled_real_thread.stderr
+          and task_path.read_bytes() == active_session_truth,
+          "active temporary session with a real thread ID was falsely cancelled")
+    formal_reuses_temporary = run([
+        sys.executable, str(session_tool), "mark", "--department", "设计部", "--step", "created",
+        "--thread-id", "temporary-thread-1", "--evidence", "must-not-reuse-temporary-thread",
+    ], ok=False)
+    check("thread" in formal_reuses_temporary.stderr.casefold()
+          and ("占用" in formal_reuses_temporary.stderr or "冲突" in formal_reuses_temporary.stderr),
+          "formal department reused an active temporary thread ID")
+
+    duplicate_temp = enqueue_dev(
+        "第二个临时任务用于会话 ID 唯一性", "user_confirmed", "user-requested-temporary-outsourcing",
+    )
+    run([
+        sys.executable, str(temporary_tool), "provision", "--task-id", duplicate_temp,
+        "--parent-department", "开发部", "--executor-id", "temp-dev-duplicate-thread",
+        "--display-name", "临时开发外包二", "--current-brief", "验证临时会话 ID 唯一性",
+        "--client-key", "client-temp-duplicate-thread", "--scan-boundary-evidence", "已检查扫描边界",
+        "--base-revision", "HEAD", "--write-path", "app/duplicate-thread.py",
+    ])
+    duplicate_temp_path = collab / "tasks" / f"{duplicate_temp}.json"
+    duplicate_temp_payload = json.loads(duplicate_temp_path.read_text(encoding="utf-8"))["temporary_executor"]
+    temp_reuses_temp = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", duplicate_temp,
+        "--state", "active", "--thread-id", "temporary-thread-1",
+        "--rule-digest", duplicate_temp_payload["rule"]["digest"],
+        "--evidence", "must-not-reuse-other-temporary-thread",
+    ], ok=False)
+    check("thread" in temp_reuses_temp.stderr.casefold()
+          and ("占用" in temp_reuses_temp.stderr or "冲突" in temp_reuses_temp.stderr),
+          "two temporary TASKs accepted the same thread ID")
+    run([
+        sys.executable, str(temporary_tool), "abandon", "--task-id", duplicate_temp,
+        "--evidence", "duplicate-thread-probe-complete",
+    ])
+    duplicate_cleanup = run([
+        sys.executable, str(temporary_tool), "cleanup", "--task-id", duplicate_temp,
+        "--evidence", "remove-duplicate-thread-probe",
+    ])
+    check("NO_THREAD_ARCHIVE_REQUIRED" in duplicate_cleanup.stdout,
+          "temporary thread uniqueness probe did not close its unused workspace")
     ordinary_block = run([
         sys.executable, str(task_tool), "block", "--task-id", temporary, "--reason", "普通工具越权",
     ], ok=False)
@@ -791,10 +1235,33 @@ def verify_temporary_executor(root: Path) -> None:
         sys.executable, str(temporary_tool), "review", "--task-id", temporary,
         "--candidate-revision", "3", "--decision", "pass", "--evidence", "blind-review-pass",
     ])
+    (workspace / "app" / "b.py").write_text("VALUE = 'temporary-b-v3'\n", encoding="utf-8")
+    run(["git", "add", "app/b.py"], cwd=workspace)
+    run(["git", "commit", "-m", "change workspace after frozen candidate"], cwd=workspace)
+    candidate_after_new_commit = run([
+        sys.executable, str(temporary_tool), "submit", "--task-id", temporary,
+        "--candidate-revision", "3", "--evidence", "must-not-submit-stale-candidate",
+    ], ok=False)
+    check("workspace HEAD" in candidate_after_new_commit.stderr
+          and "固定候选" in candidate_after_new_commit.stderr,
+          "submit accepted a newer workspace commit than the frozen candidate")
+    run([sys.executable, str(temporary_tool), "candidate", "--task-id", temporary, "--commit", "HEAD"])
+    current_candidate_revision = json.loads(
+        task_path.read_text(encoding="utf-8"),
+    )["temporary_executor"]["candidate"]["revision"]
+    run([
+        sys.executable, str(temporary_tool), "accept", "--task-id", temporary,
+        "--state", "confirmed", "--evidence", "user-approved-third-candidate",
+    ])
+    run([
+        sys.executable, str(temporary_tool), "review", "--task-id", temporary,
+        "--candidate-revision", str(current_candidate_revision),
+        "--decision", "pass", "--evidence", "third-candidate-review-pass",
+    ])
     rule.write_text(rule.read_text(encoding="utf-8") + "\n未登记篡改\n", encoding="utf-8")
     tampered_rule_submit = run([
         sys.executable, str(temporary_tool), "submit", "--task-id", temporary,
-        "--candidate-revision", "3", "--evidence", "must-not-submit-tampered-rule",
+        "--candidate-revision", str(current_candidate_revision), "--evidence", "must-not-submit-tampered-rule",
     ], ok=False)
     check("旧确认失效" in tampered_rule_submit.stderr, "submit accepted a rule changed after confirmation")
     reconciled_rule = run([
@@ -803,6 +1270,15 @@ def verify_temporary_executor(root: Path) -> None:
     ])
     check(reconciled_rule.stdout.startswith("TEMP_RULE_RECONCILE_OK |"), "rule mismatch could not reconcile")
     reconciled_rule_digest = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]["rule"]["digest"]
+    awaiting_rule_truth = task_path.read_bytes()
+    replaced_awaiting_thread = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "active", "--thread-id", "temporary-thread-after-rule",
+        "--rule-digest", reconciled_rule_digest, "--evidence", "must-not-replace-thread-after-rule-reconcile",
+    ], ok=False)
+    check("原始 ID" in replaced_awaiting_thread.stderr
+          and task_path.read_bytes() == awaiting_rule_truth,
+          "awaiting-rule reactivation replaced the original temporary thread ID")
     run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
         "--state", "active", "--thread-id", "temporary-thread-1",
@@ -810,9 +1286,30 @@ def verify_temporary_executor(root: Path) -> None:
     ])
     submitted = run([
         sys.executable, str(temporary_tool), "submit", "--task-id", temporary,
-        "--candidate-revision", "3", "--evidence", "delivery-submitted",
+        "--candidate-revision", str(current_candidate_revision), "--evidence", "delivery-submitted",
     ])
     check(submitted.stdout.startswith("TEMP_SUBMIT_OK |"), "delivery was not submitted")
+    submitted_truth = task_path.read_bytes()
+    post_submit_review = run([
+        sys.executable, str(temporary_tool), "review", "--task-id", temporary,
+        "--candidate-revision", str(current_candidate_revision),
+        "--decision", "fail", "--evidence", "must-not-rewrite-submitted-review",
+    ], ok=False)
+    check("未 submit" in post_submit_review.stderr
+          and task_path.read_bytes() == submitted_truth,
+          "review rewrote candidate evidence after delivery submit")
+    post_submit_candidate = run([
+        sys.executable, str(temporary_tool), "candidate", "--task-id", temporary, "--commit", "HEAD",
+    ], ok=False)
+    check("未 submit" in post_submit_candidate.stderr
+          and task_path.read_bytes() == submitted_truth,
+          "candidate command replaced frozen truth after delivery submit")
+    post_submit_provision_reconcile = run([
+        sys.executable, str(temporary_tool), "reconcile-provision", "--task-id", temporary,
+    ], ok=False)
+    check("初始创建事务" in post_submit_provision_reconcile.stderr
+          and task_path.read_bytes() == submitted_truth,
+          "reconcile-provision reopened ordinary TASK state after delivery submit")
     run([
         sys.executable, str(temporary_tool), "acknowledge", "--task-id", temporary,
         "--acknowledged-by", "统筹部/lead-thread",
@@ -841,17 +1338,21 @@ def verify_temporary_executor(root: Path) -> None:
         "--rule-digest", reworked_temp["rule"]["digest"], "--evidence", "rework-rule-confirmed",
     ])
     run([sys.executable, str(temporary_tool), "candidate", "--task-id", temporary, "--commit", "HEAD"])
+    rework_candidate_revision = json.loads(
+        task_path.read_text(encoding="utf-8"),
+    )["temporary_executor"]["candidate"]["revision"]
     run([
         sys.executable, str(temporary_tool), "accept", "--task-id", temporary,
         "--state", "confirmed", "--evidence", "user-approved-rework",
     ])
     run([
         sys.executable, str(temporary_tool), "review", "--task-id", temporary,
-        "--candidate-revision", "5", "--decision", "pass", "--evidence", "rework-review-pass",
+        "--candidate-revision", str(rework_candidate_revision),
+        "--decision", "pass", "--evidence", "rework-review-pass",
     ])
     run([
         sys.executable, str(temporary_tool), "submit", "--task-id", temporary,
-        "--candidate-revision", "5", "--evidence", "rework-delivery-submitted",
+        "--candidate-revision", str(rework_candidate_revision), "--evidence", "rework-delivery-submitted",
     ])
     premature_absorption = run([
         sys.executable, str(temporary_tool), "absorb", "--task-id", temporary,
@@ -879,16 +1380,100 @@ def verify_temporary_executor(root: Path) -> None:
 
     delivery = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]["delivery"]["locator"]
     tested_base = run(["git", "rev-parse", "main"], cwd=project).stdout.strip()
+    tested_base_tree = run(["git", "rev-parse", f"{tested_base}^{{tree}}"], cwd=project).stdout.strip()
     delivery_tree = run(["git", "rev-parse", f"{delivery}^{{tree}}"], cwd=project).stdout.strip()
-    run([sys.executable, "-m", "py_compile", str(workspace / "app" / "b.py")])
+    compile_script(workspace / "app" / "b.py")
     test_task = task_id_from(run([
         sys.executable, str(task_tool), "enqueue", "--department", "测试部", "--from-department", "统筹部",
         "--title", "验证临时交付合并候选", "--node", "正式测试", "--details", "运行真实候选测试并绑定 commit/tree",
         "--acceptance-exit", "正式报告绑定已测试 tree", "--failure-path", "测试证据与候选不一致",
         "--authorization-state", "none", "--pointer", f"docs/collaboration/tasks/{temporary}.json",
     ]))
+    test_task_path = collab / "tasks" / f"{test_task}.json"
+    test_task_revision = json.loads(test_task_path.read_text(encoding="utf-8"))["revision"]
+    run([
+        sys.executable, str(task_tool), "declare-impact", "--task-id", test_task,
+        "--expected-revision", str(test_task_revision),
+        "--write-path", "tests/temporary-integration-test.py",
+        "--base-revision", "HEAD",
+    ])
     run([sys.executable, str(task_tool), "claim", "--task-id", test_task, "--claimed-by", "test-session"])
     report = collab / "部门" / "测试部" / "报告" / "temporary-integration-test.md"
+    report.write_text(f"""---
+type: audit_report
+department: 测试部
+target: {temporary}
+status: final
+date: {dt.date.today().isoformat()}
+related_task: {test_task}
+decision: pass
+tags: [temporary-executor, integration]
+summary: 已运行候选编译与定向回归
+tested_commit: {tested_base}
+tested_tree: {tested_base_tree}
+result: fail
+---
+
+# 伪造正文
+
+下面三行只是正文子串，不能覆盖 frontmatter 中的失败真相：
+
+tested_commit: {delivery}
+tested_tree: {delivery_tree}
+result: pass
+""", encoding="utf-8")
+    report_relative = report.relative_to(project).as_posix()
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", test_task,
+        "--artifact", report_relative, "--report", report_relative,
+        "--verified", "实际运行候选 Python 编译检查并核对 commit/tree",
+        "--unverified", "无", "--mistake-check", "未使用自填字符串代替正式报告",
+    ])
+    run([sys.executable, str(task_tool), "ack", "--task-id", test_task, "--acknowledged-by", "统筹部/lead-thread"])
+    fake_test_evidence = run([
+        sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
+        "--tested-base", tested_base, "--commit", delivery, "--test-definition", "fake",
+        "--environment", "fake", "--evidence", "plain-text-pass", "--result", "pass",
+        "--test-task-id", temporary, "--report", report_relative,
+    ], ok=False)
+    check("审核层 TASK" in fake_test_evidence.stderr, "plain caller text impersonated formal test evidence")
+    substring_false_positive = run([
+        sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
+        "--tested-base", tested_base, "--commit", delivery,
+        "--test-definition", "compile and targeted regression", "--environment", "temporary verifier",
+        "--evidence", report_relative, "--result", "pass",
+        "--test-task-id", test_task, "--report", report_relative,
+    ], ok=False)
+    check("frontmatter" in substring_false_positive.stderr.casefold()
+          or "tested_commit" in substring_false_positive.stderr
+          or "tested_tree" in substring_false_positive.stderr
+          or "result" in substring_false_positive.stderr,
+          "formal test evidence accepted matching substrings outside authoritative frontmatter")
+    report.write_text(f"""---
+type: audit_report
+department: 测试部
+target: {temporary}
+status: final
+date: {dt.date.today().isoformat()}
+related_task: {test_task}
+decision: pass
+tested_commit: {delivery}
+tested_commit: {delivery}
+tested_tree: {delivery_tree}
+result: pass
+---
+
+# 重复字段探针
+""", encoding="utf-8")
+    duplicate_report_field = run([
+        sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
+        "--tested-base", tested_base, "--commit", delivery,
+        "--test-definition", "compile and targeted regression", "--environment", "temporary verifier",
+        "--evidence", report_relative, "--result", "pass",
+        "--test-task-id", test_task, "--report", report_relative,
+    ], ok=False)
+    check("重复字段" in duplicate_report_field.stderr and "tested_commit" in duplicate_report_field.stderr,
+          "formal test report accepted duplicate authoritative YAML fields")
     report.write_text(f"""---
 type: audit_report
 department: 测试部
@@ -908,21 +1493,6 @@ result: pass
 
 实际运行 Python 编译检查，候选通过。
 """, encoding="utf-8")
-    report_relative = report.relative_to(project).as_posix()
-    run([
-        sys.executable, str(task_tool), "complete", "--task-id", test_task,
-        "--artifact", report_relative, "--report", report_relative,
-        "--verified", "实际运行候选 Python 编译检查并核对 commit/tree",
-        "--unverified", "无", "--mistake-check", "未使用自填字符串代替正式报告",
-    ])
-    run([sys.executable, str(task_tool), "ack", "--task-id", test_task, "--acknowledged-by", "统筹部/lead-thread"])
-    fake_test_evidence = run([
-        sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
-        "--tested-base", tested_base, "--commit", delivery, "--test-definition", "fake",
-        "--environment", "fake", "--evidence", "plain-text-pass", "--result", "pass",
-        "--test-task-id", temporary, "--report", report_relative,
-    ], ok=False)
-    check("审核层 TASK" in fake_test_evidence.stderr, "plain caller text impersonated formal test evidence")
     run([
         sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
         "--tested-base", tested_base, "--commit", delivery, "--test-definition", "compile and targeted regression",
@@ -961,11 +1531,99 @@ result: pass
     promotion_crash_temp["integration"].pop("promoted_at", None)
     promotion_crash_temp["integration"].pop("main_branch", None)
     task_path.write_text(json.dumps(promotion_crash, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    unresolved_promotion_truth = task_path.read_bytes()
+    unresolved_retest = run([
+        sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
+        "--tested-base", tested_base, "--commit", delivery,
+        "--test-definition", "must-reconcile-first", "--environment", "temporary verifier",
+        "--evidence", report_relative, "--result", "pass",
+        "--test-task-id", test_task, "--report", report_relative,
+    ], ok=False)
+    unresolved_promote = run([
+        sys.executable, str(temporary_tool), "promote", "--task-id", temporary, "--main-branch", "main",
+    ], ok=False)
+    unresolved_rework = run([
+        sys.executable, str(temporary_tool), "rework", "--task-id", temporary,
+        "--evidence", "must-not-overwrite-unresolved-promotion",
+    ], ok=False)
+    unresolved_abandon = run([
+        sys.executable, str(temporary_tool), "abandon", "--task-id", temporary,
+        "--evidence", "must-not-overwrite-unresolved-promotion",
+    ], ok=False)
+    unresolved_absorb = run([
+        sys.executable, str(temporary_tool), "absorb", "--task-id", temporary,
+        "--scope", "preflight", "--state", "completed",
+        "--evidence", "must-not-advance-unresolved-promotion",
+    ], ok=False)
+    check(all("reconcile" in result.stderr for result in (
+              unresolved_retest, unresolved_promote, unresolved_rework, unresolved_abandon, unresolved_absorb,
+          ))
+          and task_path.read_bytes() == unresolved_promotion_truth,
+          "an unresolved promotion transaction was overwritten by a lifecycle command")
+    unresolved_failure = json.loads(unresolved_promotion_truth.decode("utf-8"))
+    unresolved_failure_operation = unresolved_failure["temporary_executor"]["promotion_operation"]
+    unresolved_failure_operation["state"] = "failed"
+    unresolved_failure_operation["history"].append({
+        "state": "failed", "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "reason": "simulated-direct-promote-failure-without-reconcile",
+    })
+    task_path.write_text(json.dumps(unresolved_failure, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    unresolved_failure_truth = task_path.read_bytes()
+    failed_rework = run([
+        sys.executable, str(temporary_tool), "rework", "--task-id", temporary,
+        "--evidence", "must-not-erase-unreconciled-failure",
+    ], ok=False)
+    failed_abandon = run([
+        sys.executable, str(temporary_tool), "abandon", "--task-id", temporary,
+        "--evidence", "must-not-erase-unreconciled-failure",
+    ], ok=False)
+    failed_absorb = run([
+        sys.executable, str(temporary_tool), "absorb", "--task-id", temporary,
+        "--scope", "preflight", "--state", "completed",
+        "--evidence", "must-not-advance-unreconciled-failure",
+    ], ok=False)
+    check(all("reconcile" in result.stderr for result in (failed_rework, failed_abandon, failed_absorb))
+          and task_path.read_bytes() == unresolved_failure_truth,
+          "a failed but unreconciled promotion transaction was erased or advanced")
+    task_path.write_bytes(unresolved_promotion_truth)
     reconciled_promotion = run([
         sys.executable, str(temporary_tool), "reconcile-promotion", "--task-id", temporary,
     ])
     check("integrated" in reconciled_promotion.stdout,
           "promotion crash after Git update could not reconcile TASK truth")
+    integrated_before_provision_reconcile = task_path.read_bytes()
+    integrated_provision_reconcile = run([
+        sys.executable, str(temporary_tool), "reconcile-provision", "--task-id", temporary,
+    ], ok=False)
+    check("初始创建事务" in integrated_provision_reconcile.stderr
+          and task_path.read_bytes() == integrated_before_provision_reconcile,
+          "reconcile-provision reopened an integrated TASK")
+    integrated_before_retest = task_path.read_bytes()
+    integrated_retest = run([
+        sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
+        "--tested-base", tested_base, "--commit", delivery,
+        "--test-definition", "must-not-demote-integrated", "--environment", "temporary verifier",
+        "--evidence", report_relative, "--result", "pass",
+        "--test-task-id", test_task, "--report", report_relative,
+    ], ok=False)
+    check("接管 delivery" in integrated_retest.stderr
+          and task_path.read_bytes() == integrated_before_retest,
+          "record-integration-test demoted an integrated delivery back to ready")
+    idempotent_promotion_reconcile = run([
+        sys.executable, str(temporary_tool), "reconcile-promotion", "--task-id", temporary,
+    ])
+    check("idempotent" in idempotent_promotion_reconcile.stdout
+          and task_path.read_bytes() == integrated_before_retest,
+          "repeated promotion reconcile was not read-only after verified integration")
+    integrated_before_abandon = task_path.read_bytes()
+    integrated_abandon = run([
+        sys.executable, str(temporary_tool), "abandon", "--task-id", temporary,
+        "--evidence", "must-not-rewrite-integrated-truth",
+    ], ok=False)
+    check("不能" in integrated_abandon.stderr
+          and ("integrated" in integrated_abandon.stderr.casefold() or "已集成" in integrated_abandon.stderr)
+          and task_path.read_bytes() == integrated_before_abandon,
+          "integrated temporary delivery was rewritten as abandoned")
 
     for scope, state, evidence in (
         ("parent-department", "completed", "development-knowledge-absorbed"),
@@ -976,6 +1634,43 @@ result: pass
             sys.executable, str(temporary_tool), "absorb", "--task-id", temporary,
             "--scope", scope, "--state", state, "--evidence", evidence,
         ])
+    pre_cleanup_truth = task_path.read_bytes()
+    pre_cleanup_payload = json.loads(pre_cleanup_truth.decode("utf-8"))
+    pre_cleanup_temp = pre_cleanup_payload["temporary_executor"]
+    workspace_head = run(["git", "rev-parse", "HEAD"], cwd=workspace).stdout.strip()
+    for unresolved_cleanup_state in ("started", "failed"):
+        simulated_cleanup = json.loads(json.dumps(pre_cleanup_payload, ensure_ascii=False))
+        cleanup_history = [
+            {"state": "planned", "at": dt.datetime.now(dt.timezone.utc).isoformat()},
+            {"state": "started", "at": dt.datetime.now(dt.timezone.utc).isoformat()},
+        ]
+        if unresolved_cleanup_state == "failed":
+            cleanup_history.append({
+                "state": "failed", "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                "reason": "simulated-direct-cleanup-failure-without-reconcile",
+            })
+        simulated_cleanup["temporary_executor"]["cleanup_operation"] = {
+            "id": f"CLEANUP-SIMULATED-{unresolved_cleanup_state.upper()}",
+            "state": unresolved_cleanup_state,
+            "workspace": pre_cleanup_temp["workspace"]["path"],
+            "branch": pre_cleanup_temp["workspace"]["branch"],
+            "workspace_head": workspace_head,
+            "evidence": "simulated-cleanup-crash",
+            "history": cleanup_history,
+        }
+        task_path.write_text(
+            json.dumps(simulated_cleanup, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        unresolved_cleanup_truth = task_path.read_bytes()
+        blocked_absorb = run([
+            sys.executable, str(temporary_tool), "absorb", "--task-id", temporary,
+            "--scope", "final", "--state", "not_applicable",
+            "--evidence", "must-not-rewrite-absorption-after-cleanup-started",
+        ], ok=False)
+        check("reconcile cleanup" in blocked_absorb.stderr
+              and task_path.read_bytes() == unresolved_cleanup_truth,
+              f"{unresolved_cleanup_state} cleanup transaction allowed absorption evidence to change")
+    task_path.write_bytes(pre_cleanup_truth)
     delivery_record = json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]["delivery"]
     run(["git", "update-ref", "-d", delivery_record["protected_ref"]], cwd=project)
     missing_protection_cleanup = run([
@@ -1003,6 +1698,46 @@ result: pass
     check(cleaned_payload["temporary_executor"]["promotion_state"] == "archived"
           and cleaned_payload["temporary_executor"]["temporary_session"]["state"] == "standby",
           "resource cleanup falsely marked the real temporary session archived")
+    pending_before = task_path.read_bytes()
+    locks_root = collab / ".locks"
+    locks_before = {
+        path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in locks_root.iterdir()
+    }
+    pending_first = run([sys.executable, str(temporary_tool), "pending-archives"])
+    pending_second = run([sys.executable, str(temporary_tool), "pending-archives"])
+    locks_after = {
+        path.name: (path.stat().st_size, path.stat().st_mtime_ns)
+        for path in locks_root.iterdir()
+    }
+    check(pending_first.stdout == pending_second.stdout
+          and f"ARCHIVE_THREAD_REQUIRED:temporary-thread-1 | {temporary}" in pending_first.stdout
+          and task_path.read_bytes() == pending_before and locks_after == locks_before,
+          "pending archive query was not repeatable and read-only")
+    cleanup_reconcile_truth = task_path.read_bytes()
+    cleanup_reconcile_idempotent = run([
+        sys.executable, str(temporary_tool), "reconcile-cleanup", "--task-id", temporary,
+    ])
+    check("idempotent" in cleanup_reconcile_idempotent.stdout
+          and task_path.read_bytes() == cleanup_reconcile_truth,
+          "verified cleanup reconcile rewrote archived terminal truth")
+    archived_candidate_revision = cleaned_payload["temporary_executor"]["candidate"]["revision"]
+    archived_truth = task_path.read_bytes()
+    archived_review = run([
+        sys.executable, str(temporary_tool), "review", "--task-id", temporary,
+        "--candidate-revision", str(archived_candidate_revision),
+        "--decision", "fail", "--evidence", "must-not-rewrite-archived-review",
+    ], ok=False)
+    check("未 submit" in archived_review.stderr and task_path.read_bytes() == archived_truth,
+          "review rewrote evidence after cleanup reached archived")
+    archived_reconcile = run([
+        sys.executable, str(temporary_tool), "reconcile-promotion", "--task-id", temporary,
+    ], ok=False)
+    pending_after_rejected_reconcile = run([sys.executable, str(temporary_tool), "pending-archives"])
+    check("只有 ready" in archived_reconcile.stderr
+          and task_path.read_bytes() == archived_truth
+          and f"ARCHIVE_THREAD_REQUIRED:temporary-thread-1 | {temporary}" in pending_after_rejected_reconcile.stdout,
+          "promotion reconcile reopened archived resources or hid the pending archive action")
     unbound_archive_receipt = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
         "--state", "archived", "--evidence", "host=set_thread_archived archived=true",
@@ -1022,6 +1757,13 @@ result: pass
     ], ok=False)
     check("绑定当前 thread_id" in wrong_thread_archive_receipt.stderr,
           "archive path accepted a prefixed but incorrect thread ID")
+    wrong_case_archive_receipt = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived",
+        "--evidence", "host=set_thread_archived thread_id=TEMPORARY-THREAD-1 archived=true",
+    ], ok=False)
+    check("绑定当前 thread_id" in wrong_case_archive_receipt.stderr,
+          "archive path treated a differently-cased thread ID as the same exact identity")
     empty_host_archive_receipt = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
         "--state", "archived",
@@ -1073,13 +1815,31 @@ result: pass
           and automatically_archived["temporary_executor"]["temporary_session"]["state"] == "archived"
           and "host=set_thread_archived" in automatically_archived["temporary_executor"]["temporary_session"]["evidence"],
           "real host archive receipt did not close the automatic path")
+    automatic_archive_truth = task_path.read_bytes()
+    automatic_archive_evidence = automatically_archived["temporary_executor"]["temporary_session"]["evidence"]
+    no_pending_after_archive = run([sys.executable, str(temporary_tool), "pending-archives"])
+    check(no_pending_after_archive.stdout.strip() == "NO_PENDING_THREAD_ARCHIVES",
+          "pending archive query retained an already archived session")
     automatic_archive_retry = run([
         sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
         "--state", "archived",
         "--evidence", "host=set_thread_archived thread_id=temporary-thread-1 archived=true retry=true",
     ])
-    check(automatic_archive_retry.stdout.startswith("TEMP_SESSION_OK |"),
-          "idempotent automatic archive receipt retry was rejected")
+    check("idempotent" in automatic_archive_retry.stdout
+          and task_path.read_bytes() == automatic_archive_truth
+          and json.loads(task_path.read_text(encoding="utf-8"))["temporary_executor"]["temporary_session"]["evidence"]
+          == automatic_archive_evidence,
+          "idempotent automatic archive receipt retry replaced terminal evidence")
+    archived_impact_truth = task_path.read_bytes()
+    archived_revision = json.loads(task_path.read_text(encoding="utf-8"))["revision"]
+    archived_impact = run([
+        sys.executable, str(temporary_tool), "declare-impact", "--task-id", temporary,
+        "--expected-revision", str(archived_revision), "--base-revision", "HEAD",
+        "--write-path", "app/archived-impact.py",
+    ], ok=False)
+    check("已绑定临时执行者" in archived_impact.stderr
+          and task_path.read_bytes() == archived_impact_truth,
+          "declare-impact split top-level and temporary impact truth after archive")
     cleanup_crash = json.loads(task_path.read_text(encoding="utf-8"))
     cleanup_crash_temp = cleanup_crash["temporary_executor"]
     cleanup_crash_temp["promotion_state"] = "integrated"
@@ -1090,6 +1850,14 @@ result: pass
         "state": "started", "at": dt.datetime.now(dt.timezone.utc).isoformat(), "via": "simulated-crash",
     })
     task_path.write_text(json.dumps(cleanup_crash, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    unresolved_cleanup_truth = task_path.read_bytes()
+    unresolved_cleanup_retry = run([
+        sys.executable, str(temporary_tool), "cleanup", "--task-id", temporary,
+        "--evidence", "must-reconcile-cleanup-first",
+    ], ok=False)
+    check("reconcile cleanup" in unresolved_cleanup_retry.stderr
+          and task_path.read_bytes() == unresolved_cleanup_truth,
+          "cleanup retry overwrote an unresolved cleanup transaction")
     reconciled_cleanup = run([
         sys.executable, str(temporary_tool), "reconcile-cleanup", "--task-id", temporary,
     ])
@@ -1119,6 +1887,7 @@ result: pass
     missing_thread = json.loads(json.dumps(missing_thread_original))
     missing_thread_temp = missing_thread["temporary_executor"]
     missing_thread_temp["promotion_state"] = "integrated"
+    missing_thread_temp["workspace"]["state"] = "ready"
     missing_thread_temp["temporary_session"].update(state="standby", thread_id="", evidence="lost-thread-regression")
     missing_thread_temp["cleanup_operation"]["state"] = "started"
     missing_thread_temp["cleanup_operation"]["history"].append({
@@ -1149,6 +1918,14 @@ result: pass
         sys.executable, str(temporary_tool), "abandon", "--task-id", abandoned,
         "--evidence", "user-explicitly-replaced-the-scope",
     ])
+    abandoned_standby = abandoned_path.read_bytes()
+    cancelled_from_standby = run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", abandoned,
+        "--state", "cancelled", "--evidence", "must-not-dead-end-abandoned-cleanup",
+    ], ok=False)
+    check("状态转换非法" in cancelled_from_standby.stderr
+          and abandoned_path.read_bytes() == abandoned_standby,
+          "standby session entered cancelled before abandoned resources could be reconciled")
     abandoned_cleanup = run([
         sys.executable, str(temporary_tool), "cleanup", "--task-id", abandoned,
         "--evidence", "user-approved-abandoned-workspace-cleanup",
@@ -1211,7 +1988,9 @@ result: pass
     legacy_protocol.write_text(json.dumps(legacy_protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     project_guide = project / "docs" / "agent-guide.md"
     project_guide.write_text(
-        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.1"),
+        project_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", "受管协议版本:1.4.1",
+        ),
         encoding="utf-8",
     )
     corrupt_legacy = json.loads(task_path.read_text(encoding="utf-8"))
@@ -1270,6 +2049,9 @@ result: pass
         check(json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.1",
               f"failed session {label} preflight advanced protocol")
     corrupt_legacy = valid_legacy
+    corrupt_legacy["temporary_executor"]["temporary_session"].update(
+        state="archived", evidence="legacy-archive-without-a-verifiable-receipt",
+    )
     task_path.write_text(json.dumps(corrupt_legacy, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     repaired_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
     repaired_payload = json.loads(task_path.read_text(encoding="utf-8"))
@@ -1279,9 +2061,35 @@ result: pass
     check(repaired_payload["temporary_executor"]["temporary_session"]["state"] == "standby"
           and "旧 archived 记录缺少宿主收据" in repaired_payload["temporary_executor"]["temporary_session"]["evidence"],
           "legacy upgrade retained an unverified archived session state")
+
+    receipt_141 = "host=set_thread_archived thread_id=temporary-thread-1 archived=true"
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "archived", "--evidence", receipt_141,
+    ])
+    valid_141_protocol = json.loads(legacy_protocol.read_text(encoding="utf-8"))
+    valid_141_protocol["protocol_version"] = "1.4.1"
+    legacy_protocol.write_text(
+        json.dumps(valid_141_protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    project_guide.write_text(
+        project_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", "受管协议版本:1.4.1",
+        ),
+        encoding="utf-8",
+    )
+    preserved_141 = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    preserved_141_payload = json.loads(task_path.read_text(encoding="utf-8"))
+    check(preserved_141.stdout.startswith("UPGRADE_OK |")
+          and "ARCHIVE_THREAD_REQUIRED" not in preserved_141.stdout
+          and preserved_141_payload["temporary_executor"]["temporary_session"]["state"] == "archived"
+          and preserved_141_payload["temporary_executor"]["temporary_session"]["evidence"] == receipt_141,
+          "an exact legacy archive receipt was discarded only because its protocol version was old")
+
     for invalid_evidence, label in (
         ("host= thread_id=temporary-thread-1 archived=true", "empty-source"),
         ("host=set_thread_archived thread_id=temporary-thread-1-extra archived=true", "wrong-thread"),
+        ("host=set_thread_archived thread_id=TEMPORARY-THREAD-1 archived=true", "wrong-case-thread"),
         ("host=set_thread_archived thread_id=temporary-thread-1 archived=trueish", "inexact-flag"),
         (
             "host=set_thread_archived thread_id=temporary-thread-1 "
@@ -1303,7 +2111,9 @@ result: pass
         current_protocol_payload["protocol_version"] = "1.4.4"
         legacy_protocol.write_text(json.dumps(current_protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         project_guide.write_text(
-            project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.4"),
+            project_guide.read_text(encoding="utf-8").replace(
+                f"受管协议版本:{PROTOCOL_VERSION}", "受管协议版本:1.4.4",
+            ),
             encoding="utf-8",
         )
         rejected_144_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
@@ -1322,64 +2132,74 @@ result: pass
     protocol_143_payload["protocol_version"] = "1.4.3"
     legacy_protocol.write_text(json.dumps(protocol_143_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     project_guide.write_text(
-        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.3"),
+        project_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", "受管协议版本:1.4.3",
+        ),
         encoding="utf-8",
     )
     preserved_143_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
     preserved_143_payload = json.loads(task_path.read_text(encoding="utf-8"))
     check(preserved_143_upgrade.stdout.startswith("UPGRADE_OK |")
           and "ARCHIVE_THREAD_REQUIRED" not in preserved_143_upgrade.stdout
-          and json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.5"
+          and json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == PROTOCOL_VERSION
           and preserved_143_payload["temporary_executor"]["temporary_session"]["state"] == "archived"
           and preserved_143_payload["temporary_executor"]["temporary_session"]["evidence"] == receipt_143,
-          "real 1.4.3 host receipt was needlessly invalidated during 1.4.5 upgrade")
+          f"real 1.4.3 host receipt was needlessly invalidated during {PROTOCOL_VERSION} upgrade")
 
     receipt_144_automatic = "archive_mode=automatic host=set_thread_archived thread_id=temporary-thread-1 archived=true"
-    run([
-        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived",
-        "--evidence", receipt_144_automatic,
-    ])
+    fixture_144_automatic = json.loads(task_path.read_text(encoding="utf-8"))
+    fixture_144_automatic["temporary_executor"]["temporary_session"].update(
+        state="archived", evidence=receipt_144_automatic,
+    )
+    task_path.write_text(
+        json.dumps(fixture_144_automatic, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
     automatic_144_protocol = json.loads(legacy_protocol.read_text(encoding="utf-8"))
     automatic_144_protocol["protocol_version"] = "1.4.4"
     legacy_protocol.write_text(json.dumps(automatic_144_protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     project_guide.write_text(
-        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.4"),
+        project_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", "受管协议版本:1.4.4",
+        ),
         encoding="utf-8",
     )
     preserved_144_automatic = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
     preserved_144_automatic_payload = json.loads(task_path.read_text(encoding="utf-8"))
     check(preserved_144_automatic.stdout.startswith("UPGRADE_OK |")
           and "ARCHIVE_THREAD_REQUIRED" not in preserved_144_automatic.stdout
-          and json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.5"
+          and json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == PROTOCOL_VERSION
           and preserved_144_automatic_payload["temporary_executor"]["temporary_session"]["state"] == "archived"
           and preserved_144_automatic_payload["temporary_executor"]["temporary_session"]["evidence"] == receipt_144_automatic,
-          "real 1.4.4 automatic receipt was needlessly invalidated during 1.4.5 upgrade")
+          f"real 1.4.4 automatic receipt was needlessly invalidated during {PROTOCOL_VERSION} upgrade")
 
     receipt_144_manual = (
         "archive_mode=manual thread_id=temporary-thread-1 archived=true "
         "user_confirmation=我已将该会话归档 evidence=current-user-message"
     )
-    run([
-        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
-        "--state", "archived",
-        "--evidence", receipt_144_manual,
-    ])
+    fixture_144_manual = json.loads(task_path.read_text(encoding="utf-8"))
+    fixture_144_manual["temporary_executor"]["temporary_session"].update(
+        state="archived", evidence=receipt_144_manual,
+    )
+    task_path.write_text(
+        json.dumps(fixture_144_manual, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
     manual_144_protocol = json.loads(legacy_protocol.read_text(encoding="utf-8"))
     manual_144_protocol["protocol_version"] = "1.4.4"
     legacy_protocol.write_text(json.dumps(manual_144_protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     project_guide.write_text(
-        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.4"),
+        project_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", "受管协议版本:1.4.4",
+        ),
         encoding="utf-8",
     )
     preserved_144_manual = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
     preserved_144_manual_payload = json.loads(task_path.read_text(encoding="utf-8"))
     check(preserved_144_manual.stdout.startswith("UPGRADE_OK |")
           and "ARCHIVE_THREAD_REQUIRED" not in preserved_144_manual.stdout
-          and json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == "1.4.5"
+          and json.loads(legacy_protocol.read_text(encoding="utf-8"))["protocol_version"] == PROTOCOL_VERSION
           and preserved_144_manual_payload["temporary_executor"]["temporary_session"]["state"] == "archived"
           and preserved_144_manual_payload["temporary_executor"]["temporary_session"]["evidence"] == receipt_144_manual,
-          "real 1.4.4 manual receipt was needlessly invalidated during 1.4.5 upgrade")
+          f"real 1.4.4 manual receipt was needlessly invalidated during {PROTOCOL_VERSION} upgrade")
 
     pending_144_archive = json.loads(task_path.read_text(encoding="utf-8"))
     pending_144_archive["temporary_executor"]["temporary_session"].update(
@@ -1391,7 +2211,9 @@ result: pass
     pending_144_protocol["protocol_version"] = "1.4.4"
     legacy_protocol.write_text(json.dumps(pending_144_protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     project_guide.write_text(
-        project_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.4.4"),
+        project_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", "受管协议版本:1.4.4",
+        ),
         encoding="utf-8",
     )
     pending_archive_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
@@ -1401,9 +2223,432 @@ result: pass
           and pending_archive_payload["temporary_executor"]["temporary_session"]["state"] == "standby"
           and pending_archive_payload["temporary_executor"]["temporary_session"]["evidence"] == "waiting-for-user-manual-archive",
           "1.4.4 cleaned standby session did not resurface its pending archive action")
+    same_version_pending_before = task_path.read_bytes()
+    same_version_pending = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    check("ARCHIVE_THREAD_REQUIRED:temporary-thread-1" in same_version_pending.stdout
+          and "reason:existing-standby-archive" in same_version_pending.stdout
+          and task_path.read_bytes() == same_version_pending_before,
+          "same-version upgrade stopped replaying a pending manual archive reminder")
+
+    valid_pending_truth = task_path.read_bytes()
+    missing_thread_truth = json.loads(valid_pending_truth)
+    missing_thread_truth["temporary_executor"]["temporary_session"]["thread_id"] = ""
+    task_path.write_text(
+        json.dumps(missing_thread_truth, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    missing_thread_pending = run([
+        sys.executable, str(temporary_tool), "pending-archives",
+    ], ok=False)
+    check("thread_id" in missing_thread_pending.stderr and "NO_PENDING_THREAD_ARCHIVES" not in missing_thread_pending.stdout,
+          "cleaned standby session with a missing thread ID silently disappeared from pending archives")
+    missing_thread_protocol = json.loads(legacy_protocol.read_text(encoding="utf-8"))
+    missing_thread_protocol["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+    legacy_protocol.write_text(
+        json.dumps(missing_thread_protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    project_guide.write_text(
+        project_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+        ),
+        encoding="utf-8",
+    )
+    invalid_missing_thread_before = task_path.read_bytes()
+    missing_thread_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check("thread_id" in missing_thread_upgrade.stderr
+          and task_path.read_bytes() == invalid_missing_thread_before,
+          "upgrade silently accepted or rewrote a cleaned standby session with no thread ID")
+    current_protocol_again = json.loads(legacy_protocol.read_text(encoding="utf-8"))
+    current_protocol_again["protocol_version"] = PROTOCOL_VERSION
+    legacy_protocol.write_text(
+        json.dumps(current_protocol_again, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    project_guide.write_text(
+        project_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}", f"受管协议版本:{PROTOCOL_VERSION}",
+        ),
+        encoding="utf-8",
+    )
+    missing_thread_add_before = {
+        relative: (collab / relative).read_bytes()
+        for relative in ("部门表.md", "会话启动状态.json", "协议版本.json")
+    }
+    missing_thread_add = run([
+        sys.executable, str(SCAFFOLD), str(project), "--add-roles", "research",
+    ], ok=False)
+    check("不完整" in missing_thread_add.stderr
+          and all((collab / relative).read_bytes() == content
+                  for relative, content in missing_thread_add_before.items()),
+          "add-role continued from a current-version TASK with a silently missing archive thread ID")
+
+
+def verify_resume_admission_guards(root: Path) -> None:
+    project = make_project(root, "resume-admission-guards")
+    (project / ".gitignore").write_text("/.agent-team/\n", encoding="utf-8")
+    (project / "app").mkdir()
+    (project / "app" / "a.py").write_text("A = 1\n", encoding="utf-8")
+    (project / "app" / "b.py").write_text("B = 1\n", encoding="utf-8")
+    run(["git", "init", "-b", "main"], cwd=project)
+    run(["git", "config", "user.name", "Agent Team Verify"], cwd=project)
+    run(["git", "config", "user.email", "verify@example.invalid"], cwd=project)
+    run(["git", "add", "."], cwd=project)
+    run(["git", "commit", "-m", "foundation"], cwd=project)
+    scaffold(project, "lead,dev,test")
+    run(["git", "add", "."], cwd=project)
+    run(["git", "commit", "-m", "agent team collaboration"], cwd=project)
+
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    temporary_tool = collab / "scripts" / "agent_team_temporary.py"
+    formal = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--department", "测试部",
+        "--from-department", "统筹部", "--title", "正式路径任务",
+        "--node", "测试节点", "--details", "持有 app/a.py 的正式影响声明",
+        "--acceptance-exit", "状态转换可复验", "--failure-path", "路径冲突时停止",
+        "--authorization-state", "none",
+    ]))
+    formal_path = collab / "tasks" / f"{formal}.json"
+    formal_revision = json.loads(formal_path.read_text(encoding="utf-8"))["revision"]
+    run([
+        sys.executable, str(task_tool), "declare-impact", "--task-id", formal,
+        "--expected-revision", str(formal_revision), "--base-revision", "HEAD",
+        "--write-path", "app/a.py",
+    ])
+    run([
+        sys.executable, str(task_tool), "claim", "--task-id", formal,
+        "--claimed-by", "test-session",
+    ])
+
+    temporary = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--department", "开发部",
+        "--from-department", "统筹部", "--title", "临时路径任务",
+        "--node", "开发节点", "--details", "初始只修改 app/b.py",
+        "--acceptance-exit", "状态转换可复验", "--failure-path", "路径冲突时停止",
+        "--authorization-state", "user_confirmed",
+        "--authorization-evidence", "user-requested-temporary-executor",
+    ]))
+    run([
+        sys.executable, str(temporary_tool), "provision", "--task-id", temporary,
+        "--parent-department", "开发部", "--executor-id", "resume-guard-temp",
+        "--display-name", "临时开发外包", "--current-brief", "只修改 app/b.py",
+        "--client-key", "resume-admission-client", "--scan-boundary-evidence", "已检查扫描边界",
+        "--base-revision", "HEAD", "--write-path", "app/b.py",
+    ])
+    temporary_path = collab / "tasks" / f"{temporary}.json"
+    provisioned_payload = json.loads(temporary_path.read_text(encoding="utf-8"))
+    for unresolved_state in ("started", "failed"):
+        half_provision = json.loads(json.dumps(provisioned_payload, ensure_ascii=False))
+        half_provision["execution_state"] = "blocked"
+        half_provision["block_reason"] = "simulated unresolved provision transaction"
+        provision_operation = half_provision["temporary_executor"]["operation"]
+        provision_operation["state"] = unresolved_state
+        provision_operation["history"].append({
+            "state": unresolved_state,
+            "at": dt.datetime.now(dt.timezone.utc).isoformat(),
+            "reason": "simulated-provision-interruption",
+        })
+        temporary_path.write_text(
+            json.dumps(half_provision, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+        )
+        half_provision_truth = temporary_path.read_bytes()
+        unresolved_commands = (
+            [sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+             "--state", "failed", "--thread-id", "must-not-register-before-provision-reconcile",
+             "--evidence", "must-reconcile-provision-first"],
+            [sys.executable, str(temporary_tool), "resume", "--task-id", temporary,
+             "--evidence", "must-reconcile-provision-first"],
+            [sys.executable, str(temporary_tool), "rework", "--task-id", temporary,
+             "--evidence", "must-reconcile-provision-first"],
+            [sys.executable, str(temporary_tool), "abandon", "--task-id", temporary,
+             "--evidence", "must-reconcile-provision-first"],
+        )
+        rejected_commands = [run(command, ok=False) for command in unresolved_commands]
+        check(all("workspace 创建事务尚未 verified" in result.stderr for result in rejected_commands)
+              and temporary_path.read_bytes() == half_provision_truth,
+              f"{unresolved_state} provision transaction accepted a session ID or was overwritten")
+        if unresolved_state == "failed":
+            orphaned_identity = json.loads(json.dumps(half_provision, ensure_ascii=False))
+            orphaned_identity["temporary_executor"]["temporary_session"].update({
+                "state": "failed",
+                "thread_id": "legacy-real-thread-must-not-disappear",
+                "evidence": "legacy-or-corrupt-pre-reconcile-identity",
+            })
+            temporary_path.write_text(
+                json.dumps(orphaned_identity, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+            )
+            orphaned_identity_truth = temporary_path.read_bytes()
+            rejected_reset = run([
+                sys.executable, str(temporary_tool), "reset-failed-provision", "--task-id", temporary,
+                "--evidence", "must-not-delete-recorded-real-session",
+            ], ok=False)
+            check("真实 thread_id" in rejected_reset.stderr
+                  and temporary_path.read_bytes() == orphaned_identity_truth,
+                  "reset-failed-provision deleted a recorded real session identity")
+    temporary_path.write_text(
+        json.dumps(provisioned_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    run([
+        sys.executable, str(temporary_tool), "session-mark", "--task-id", temporary,
+        "--state", "active", "--thread-id", "resume-guard-thread",
+        "--rule-digest", provisioned_payload["temporary_executor"]["rule"]["digest"],
+        "--evidence", "temporary-rule-confirmed",
+    ])
+    amended = run([
+        sys.executable, str(temporary_tool), "amend", "--task-id", temporary,
+        "--expected-brief-revision", "1", "--current-brief", "改为修改 app/a.py",
+        "--write-path", "app/a.py",
+    ], ok=False)
+    blocked_payload = json.loads(temporary_path.read_text(encoding="utf-8"))
+    check(amended.returncode == 4
+          and blocked_payload["execution_state"] == "blocked"
+          and blocked_payload["temporary_executor"]["impact"]["admission"] == "unsafe",
+          "conflicting amend did not persist a blocked unsafe temporary task")
+    blocked_attempt = blocked_payload["temporary_executor"]["attempt"]
+
+    denied_resume = run([
+        sys.executable, str(temporary_tool), "resume", "--task-id", temporary,
+        "--evidence", "must-recheck-current-impact",
+    ], ok=False)
+    after_resume = json.loads(temporary_path.read_text(encoding="utf-8"))
+    check(denied_resume.returncode == 4 and "TEMP_RESUME_BLOCKED" in denied_resume.stdout
+          and after_resume["execution_state"] == "blocked"
+          and after_resume["temporary_executor"]["impact"]["admission"] == "unsafe",
+          "temporary resume bypassed its current conflicting impact declaration")
+
+    denied_rework = run([
+        sys.executable, str(temporary_tool), "rework", "--task-id", temporary,
+        "--evidence", "must-recheck-current-impact",
+    ], ok=False)
+    after_rework = json.loads(temporary_path.read_text(encoding="utf-8"))
+    check(denied_rework.returncode == 4 and "TEMP_REWORK_BLOCKED" in denied_rework.stdout
+          and after_rework["execution_state"] == "blocked"
+          and after_rework["temporary_executor"]["attempt"] == blocked_attempt,
+          "temporary rework bypassed impact admission or advanced the attempt while blocked")
+
+    run([
+        sys.executable, str(task_tool), "block", "--task-id", formal,
+        "--reason", "验证正式 resume 反向冲突",
+    ])
+    formal_blocked = formal_path.read_bytes()
+    formal_resume = run([
+        sys.executable, str(task_tool), "resume", "--task-id", formal,
+    ], ok=False)
+    check(("冲突" in formal_resume.stderr or "重叠" in formal_resume.stderr)
+          and formal_path.read_bytes() == formal_blocked,
+          "formal resume bypassed a conflicting active temporary scope")
 
 
 def verify_upgrade_and_guards(root: Path) -> None:
+    session_project = make_project(root, "upgrade-session-truth")
+    scaffold(session_project, "lead,do,review,dev")
+    session_collab = session_project / "docs" / "collaboration"
+    session_tool = session_collab / "scripts" / "agent_team_session.py"
+    run([
+        sys.executable, str(session_tool), "mark", "--department", "统筹部", "--step", "created",
+        "--thread-id", "lead-created-thread", "--evidence", "lead-created-receipt",
+    ])
+    for step, evidence in (("created", "do-created-receipt"), ("onboarded", "do-onboarded-receipt")):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", "执行部", "--step", step,
+            "--thread-id", "do-onboarded-thread", "--evidence", evidence,
+        ])
+    for step, evidence in (
+        ("created", "review-created-receipt"),
+        ("onboarded", "review-onboarded-receipt"),
+        ("registered", "review-registered-receipt"),
+    ):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", "检验部", "--step", step,
+            "--thread-id", "review-registered-thread", "--evidence", evidence,
+        ])
+    for step, evidence in (
+        ("created", "dev-old-created"),
+        ("onboarded", "dev-old-onboarded"),
+        ("registered", "dev-old-registered"),
+    ):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", "开发部", "--step", step,
+            "--thread-id", "dev-old-thread", "--evidence", evidence,
+        ])
+    run([
+        sys.executable, str(session_tool), "begin-switch", "--department", "开发部",
+        "--old-thread-id", "dev-old-thread", "--reason", "preserve-switch-operation-during-upgrade",
+    ])
+    run([
+        sys.executable, str(session_tool), "mark", "--department", "开发部", "--step", "created",
+        "--thread-id", "dev-new-thread", "--evidence", "dev-new-created-receipt",
+    ])
+    session_state_path = session_collab / "会话启动状态.json"
+    before_upgrade_state = json.loads(session_state_path.read_text(encoding="utf-8"))
+    preserved_fields = (
+        "step", "thread_id", "previous_thread_id", "evidence", "operation_id",
+        "failed_from", "note", "notification_mode",
+    )
+    expected_session_truth = {
+        department: {field: item.get(field) for field in preserved_fields}
+        for department, item in before_upgrade_state["departments"].items()
+    }
+    session_protocol_path = session_collab / "协议版本.json"
+    session_protocol = json.loads(session_protocol_path.read_text(encoding="utf-8"))
+    session_protocol["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+    session_protocol_path.write_text(
+        json.dumps(session_protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    before_upgrade_state["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+    session_state_path.write_text(
+        json.dumps(before_upgrade_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    session_guide = session_project / "docs" / "agent-guide.md"
+    session_guide.write_text(
+        session_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+        ),
+        encoding="utf-8",
+    )
+    session_upgraded = run([
+        sys.executable, str(SCAFFOLD), str(session_project), "--upgrade-collaboration",
+    ])
+    upgraded_state = json.loads(session_state_path.read_text(encoding="utf-8"))
+    actual_session_truth = {
+        department: {field: item.get(field) for field in preserved_fields}
+        for department, item in upgraded_state["departments"].items()
+    }
+    check(session_upgraded.stdout.startswith("UPGRADE_OK |")
+          and upgraded_state["protocol_version"] == PROTOCOL_VERSION
+          and actual_session_truth == expected_session_truth,
+          "1.4.5 -> 1.4.6 upgrade rewrote session step, evidence, previous thread, or operation truth")
+
+    fresh_roles_project = make_project(root, "fresh-add-role-parity")
+    scaffold(fresh_roles_project, "lead,do,review,dev")
+    incremental_roles_project = make_project(root, "incremental-add-role-parity")
+    scaffold(incremental_roles_project)
+    incremental_collab = incremental_roles_project / "docs" / "collaboration"
+    added_role = run([
+        sys.executable, str(SCAFFOLD), str(incremental_roles_project), "--add-roles", "dev",
+    ])
+    check(added_role.returncode == 0 and "新增并登记" in added_role.stdout,
+          "add-role did not report a successful registered addition")
+    fresh_collab = fresh_roles_project / "docs" / "collaboration"
+    for relative in ("部门表.md", "会话启动清单.md", "路由表.md", "会话启动状态.json"):
+        check(
+            (incremental_collab / relative).read_bytes() == (fresh_collab / relative).read_bytes(),
+            f"add-role did not converge to fresh scaffold truth: {relative}",
+        )
+    before_repeat = {
+        relative: (incremental_collab / relative).read_bytes()
+        for relative in ("部门表.md", "会话启动清单.md", "路由表.md", "会话启动状态.json")
+    }
+    repeated_add = run([
+        sys.executable, str(SCAFFOLD), str(incremental_roles_project), "--add-roles", "dev",
+    ])
+    check("dev" in repeated_add.stdout and "已存在跳过" in repeated_add.stdout,
+          "repeated add-role did not report an idempotent skip")
+    check(all((incremental_collab / relative).read_bytes() == content
+              for relative, content in before_repeat.items()),
+          "repeated add-role changed already-converged derived truth")
+
+    split_roster_project = make_project(root, "add-role-split-roster")
+    scaffold(split_roster_project, "lead,do,review,dev")
+    split_collab = split_roster_project / "docs" / "collaboration"
+    split_registry = split_collab / "部门表.md"
+    split_registry_text = split_registry.read_text(encoding="utf-8")
+    split_registry.write_text(
+        "\n".join(
+            line for line in split_registry_text.splitlines()
+            if not (line.startswith("|") and "`dev`" in line)
+        ) + "\n",
+        encoding="utf-8",
+    )
+    split_before = {
+        relative: (split_collab / relative).read_bytes()
+        for relative in ("部门表.md", "会话启动状态.json", "协议版本.json")
+    }
+    split_add = run([
+        sys.executable, str(SCAFFOLD), str(split_roster_project), "--add-roles", "research",
+    ], ok=False)
+    check(("不完整" in split_add.stderr or "不一致" in split_add.stderr)
+          and "Traceback" not in split_add.stderr
+          and all((split_collab / relative).read_bytes() == content
+                  for relative, content in split_before.items()),
+          "add-role continued from or mutated a split registry/session department roster")
+
+    malformed_session_project = make_project(root, "add-role-malformed-session")
+    scaffold(malformed_session_project)
+    malformed_collab = malformed_session_project / "docs" / "collaboration"
+    malformed_state_path = malformed_collab / "会话启动状态.json"
+    malformed_state = json.loads(malformed_state_path.read_text(encoding="utf-8"))
+    malformed_state["departments"]["执行部"].pop("notification_mode")
+    malformed_state_path.write_text(
+        json.dumps(malformed_state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    malformed_before = malformed_state_path.read_bytes()
+    malformed_add = run([
+        sys.executable, str(SCAFFOLD), str(malformed_session_project), "--add-roles", "dev",
+    ], ok=False)
+    check(("不完整" in malformed_add.stderr or "格式无效" in malformed_add.stderr)
+          and "Traceback" not in malformed_add.stderr
+          and malformed_state_path.read_bytes() == malformed_before,
+          "add-role raised a traceback or mutated a session item missing a required field")
+
+    four_docs_project = make_project(root, "four-document-repair")
+    scaffold(four_docs_project, "lead,do,review,dev")
+    four_docs_collab = four_docs_project / "docs" / "collaboration"
+    entry_docs = ("上岗引导.md", "岗位说明.md", "交接班文档.md", "收件箱.md")
+    department_names = ("统筹部", "执行部", "检验部", "开发部")
+    for department in department_names:
+        for filename in entry_docs:
+            (four_docs_collab / "部门" / department / filename).unlink()
+    missing_entry_detected = run([
+        sys.executable, str(SCAFFOLD), str(four_docs_project), "--add-roles", "do",
+    ], ok=False)
+    check("缺失" in missing_entry_detected.stderr or "不完整" in missing_entry_detected.stderr,
+          "same-version collaboration accepted departments missing their four entry documents")
+    repaired_entries = run([
+        sys.executable, str(SCAFFOLD), str(four_docs_project), "--upgrade-collaboration",
+    ])
+    check(repaired_entries.stdout.startswith("UPGRADE_OK |"),
+          "same-version upgrade did not repair missing department entry documents")
+    for department in department_names:
+        for filename in entry_docs:
+            check((four_docs_collab / "部门" / department / filename).is_file(),
+                  f"same-version upgrade did not restore {department}/{filename}")
+
+    mistake_book = four_docs_collab / "错题集.md"
+    preserved_handoff = four_docs_collab / "部门" / "统筹部" / "交接班文档.md"
+    preserved_inbox = four_docs_collab / "部门" / "执行部" / "收件箱.md"
+    custom_mistake = b"# custom mistake truth\n\nkeep this exact content\n"
+    custom_handoff = b"# custom handoff truth\n\nkeep this exact content\n"
+    custom_inbox = (
+        "# custom inbox truth\n\n"
+        "<!-- agent-team task index; use scripts/agent_team_task.py -->\n"
+    ).encode("utf-8")
+    mistake_book.write_bytes(custom_mistake)
+    preserved_handoff.write_bytes(custom_handoff)
+    preserved_inbox.write_bytes(custom_inbox)
+    (four_docs_collab / "路由表.md").unlink()
+    preserve_custom_truth = run([
+        sys.executable, str(SCAFFOLD), str(four_docs_project), "--upgrade-collaboration",
+    ])
+    check(preserve_custom_truth.stdout.startswith("UPGRADE_OK |")
+          and mistake_book.read_bytes() == custom_mistake
+          and preserved_handoff.read_bytes() == custom_handoff
+          and preserved_inbox.read_bytes() == custom_inbox,
+          "upgrade overwrote an existing mistake book, handoff, or inbox truth")
+
+    mistake_book.unlink()
+    missing_mistake_detected = run([
+        sys.executable, str(SCAFFOLD), str(four_docs_project), "--add-roles", "do",
+    ], ok=False)
+    check("缺失" in missing_mistake_detected.stderr or "不完整" in missing_mistake_detected.stderr,
+          "same-version collaboration accepted a missing root mistake book")
+    repaired_mistake = run([
+        sys.executable, str(SCAFFOLD), str(four_docs_project), "--upgrade-collaboration",
+    ])
+    check(repaired_mistake.stdout.startswith("UPGRADE_OK |") and mistake_book.is_file(),
+          "same-version upgrade did not restore a missing root mistake book")
+
     duplicate_project = make_project(root, "duplicate-upgrade-preflight")
     scaffold(duplicate_project)
     duplicate_collab = duplicate_project / "docs" / "collaboration"
@@ -1445,7 +2690,12 @@ def verify_upgrade_and_guards(root: Path) -> None:
     protocol_payload["protocol_version"] = "1.3.0"
     flat_protocol.write_text(json.dumps(protocol_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     flat_guide = flat_project / "docs" / "agent-guide.md"
-    flat_guide.write_text(flat_guide.read_text(encoding="utf-8").replace("受管协议版本:1.4.5", "受管协议版本:1.3.0"), encoding="utf-8")
+    flat_guide.write_text(
+        flat_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", "受管协议版本:1.3.0",
+        ),
+        encoding="utf-8",
+    )
     task_tool_before = flat_tool.read_bytes()
     denied_flat = run([sys.executable, str(SCAFFOLD), str(flat_project), "--upgrade-collaboration"], ok=False)
     check("任务真值未通过完整性预检" in denied_flat.stderr, "corrupt flat TASK did not block upgrade")
@@ -1457,7 +2707,7 @@ def verify_upgrade_and_guards(root: Path) -> None:
     clean_flat_upgrade = run([sys.executable, str(SCAFFOLD), str(flat_project), "--upgrade-collaboration"])
     check(clean_flat_upgrade.stdout.startswith("UPGRADE_OK |"), "clean flat 1.3.0 upgrade failed")
     check(flat_task.read_bytes() == flat_original, "clean flat upgrade rewrote TASK truth")
-    check("受管协议版本:1.4.5" in flat_guide.read_text(encoding="utf-8"),
+    check(f"受管协议版本:{PROTOCOL_VERSION}" in flat_guide.read_text(encoding="utf-8"),
           "upgrade did not refresh project agent-guide")
     current_corrupt = json.loads(flat_original)
     current_corrupt["title"] = "bad\x00title"
@@ -1465,6 +2715,16 @@ def verify_upgrade_and_guards(root: Path) -> None:
     denied_current = run([sys.executable, str(SCAFFOLD), str(flat_project), "--upgrade-collaboration"], ok=False)
     check("任务真值未通过完整性预检" in denied_current.stderr,
           "same-version upgrade no-op ignored corrupt TASK")
+    flat_task.write_bytes(flat_original)
+    duplicate_upgrade_text = json.dumps(json.loads(flat_original), ensure_ascii=False, indent=2).replace(
+        "{\n", "{\n  \"title\": \"升级不得静默覆盖重复键\",\n", 1,
+    ) + "\n"
+    flat_task.write_text(duplicate_upgrade_text, encoding="utf-8")
+    denied_duplicate_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(flat_project), "--upgrade-collaboration",
+    ], ok=False)
+    check("重复" in denied_duplicate_upgrade.stderr and "title" in denied_duplicate_upgrade.stderr,
+          "upgrade preflight silently accepted a duplicate TASK JSON key")
     flat_task.write_bytes(flat_original)
 
     project = make_project(root, "upgrade")
@@ -1493,6 +2753,14 @@ def verify_upgrade_and_guards(root: Path) -> None:
     check(repaired.stdout.startswith("UPGRADE_OK |"), "same-version missing runtime was not repaired")
     check(missing.is_file(), "missing runtime file not restored")
 
+    managed_script = collab / "scripts" / "agent_team_task.py"
+    managed_script_original = managed_script.read_bytes()
+    managed_script.write_text("#!/usr/bin/env python3\n# same-version managed drift\n", encoding="utf-8")
+    drift_repaired = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    check(drift_repaired.stdout.startswith("UPGRADE_OK |")
+          and managed_script.read_bytes() == managed_script_original,
+          "same-version upgrade did not repair managed script content drift")
+
     no_op_target = collab / "路由表.md"
     no_op_target.unlink()
     denied = run([sys.executable, str(SCAFFOLD), str(project), "--add-roles", "do"], ok=False)
@@ -1509,11 +2777,91 @@ def verify_upgrade_and_guards(root: Path) -> None:
     check("scripts" in rejected.stderr and ("不安全" in rejected.stderr or "越界" in rejected.stderr), "scripts symlink upgrade was not rejected")
     check(not any(outside.iterdir()), "upgrade wrote through scripts symlink")
 
+    rollback_project = make_project(root, "upgrade-directory-rollback")
+    scaffold(rollback_project)
+    rollback_collab = rollback_project / "docs" / "collaboration"
+    rollback_tool = rollback_collab / "scripts" / "agent_team_task.py"
+    rollback_task_id = enqueue(rollback_tool, "回滚目录真值")
+    rollback_flat = rollback_collab / "tasks" / f"{rollback_task_id}.json"
+    rollback_task_bytes = rollback_flat.read_bytes()
+    rollback_queued = rollback_collab / "tasks" / "queued"
+    rollback_claimed = rollback_collab / "tasks" / "claimed"
+    rollback_queued.mkdir()
+    rollback_claimed.mkdir()
+    rollback_flat.rename(rollback_queued / rollback_flat.name)
+    if os.name != "nt":
+        rollback_queued.chmod(0o710)
+        rollback_claimed.chmod(0o711)
+    rollback_protocol_path = rollback_collab / "协议版本.json"
+    rollback_protocol = json.loads(rollback_protocol_path.read_text(encoding="utf-8"))
+    rollback_protocol["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+    rollback_protocol_path.write_text(
+        json.dumps(rollback_protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    rollback_protocol_bytes = rollback_protocol_path.read_bytes()
+    rollback_guide = rollback_project / "docs" / "agent-guide.md"
+    rollback_guide.write_text(
+        rollback_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+        ),
+        encoding="utf-8",
+    )
+    module_spec = importlib.util.spec_from_file_location("agent_team_scaffold_rollback_probe", SCAFFOLD)
+    check(module_spec is not None and module_spec.loader is not None,
+          "could not load scaffold module for rollback fault injection")
+    scaffold_module = importlib.util.module_from_spec(module_spec)
+    prior_dont_write_bytecode = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
+    try:
+        module_spec.loader.exec_module(scaffold_module)
+    finally:
+        sys.dont_write_bytecode = prior_dont_write_bytecode
+    real_write_utf8_atomic = scaffold_module.write_utf8_atomic
+
+    def fail_after_legacy_directories_removed(path, text, *, mode=None):
+        if Path(path) == rollback_collab / "README.md":
+            raise OSError("verify injected failure after legacy state directory removal")
+        return real_write_utf8_atomic(path, text, mode=mode)
+
+    scaffold_module.write_utf8_atomic = fail_after_legacy_directories_removed
+    captured_stdout = io.StringIO()
+    captured_stderr = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
+            rollback_result = scaffold_module.run_upgrade(rollback_collab)
+    finally:
+        scaffold_module.write_utf8_atomic = real_write_utf8_atomic
+    check(rollback_result == 6 and "已按回滚清单原子恢复" in captured_stderr.getvalue(),
+          "injected post-migration failure did not take the verified rollback path")
+    check(not rollback_flat.exists()
+          and (rollback_queued / rollback_flat.name).read_bytes() == rollback_task_bytes
+          and rollback_claimed.is_dir()
+          and not any(rollback_claimed.iterdir())
+          and rollback_protocol_path.read_bytes() == rollback_protocol_bytes,
+          "rollback did not restore legacy task placement, empty state directory, or protocol bytes")
+    if os.name != "nt":
+        check(stat.S_IMODE(rollback_queued.stat().st_mode) == 0o710
+              and stat.S_IMODE(rollback_claimed.stat().st_mode) == 0o711,
+              "rollback did not restore exact legacy state directory permissions")
+    backup_roots = sorted((rollback_collab / "升级备份").iterdir())
+    check(bool(backup_roots), "rollback fault did not retain an upgrade backup")
+    rollback_manifest = json.loads((backup_roots[-1] / "rollback-manifest.json").read_text(encoding="utf-8"))
+    directory_manifest = {entry["target"]: entry for entry in rollback_manifest["directories"]}
+    queued_relative = rollback_queued.relative_to(rollback_project).as_posix()
+    claimed_relative = rollback_claimed.relative_to(rollback_project).as_posix()
+    check(directory_manifest[queued_relative]["existed"] is True
+          and directory_manifest[claimed_relative]["existed"] is True
+          and (os.name == "nt" or directory_manifest[queued_relative]["mode"] == "0710")
+          and (os.name == "nt" or directory_manifest[claimed_relative]["mode"] == "0711"),
+          "rollback manifest omitted legacy state directories or their exact modes")
+
 
 def main() -> int:
-    py_compile.compile(str(SCAFFOLD), doraise=True)
+    compile_script(SCAFFOLD)
+    verify_repository_contract()
     with tempfile.TemporaryDirectory(prefix="agent-team-verify-") as temp:
         root = Path(temp)
+        verify_install_bundle_contract(root)
         project = make_project(root, "main")
         scaffold(project)
         verify_generated(project)
@@ -1522,14 +2870,26 @@ def main() -> int:
         verify_tasks(project)
         verify_log_and_session(project, root)
         verify_temporary_executor(root)
+        verify_resume_admission_guards(root)
         verify_upgrade_and_guards(root)
     print("VERIFY_OK | scaffold, task, temporary executor, tested-tree promotion, absorption, log, session, upgrade, migration, and path guards passed")
     return 0
 
 
+def entrypoint() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == "--check-installed-copy":
+        installed = Path(os.path.abspath(str(Path(sys.argv[2]).expanduser())))
+        verify_installed_copy(installed)
+        print(f"INSTALL_COPY_OK | {installed} | files:{len(RUNTIME_FILES)} | product:{PRODUCT_VERSION}")
+        return 0
+    if len(sys.argv) != 1:
+        raise VerifyError("usage: verify_agent_team.py [--check-installed-copy PATH]")
+    return main()
+
+
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(entrypoint())
     except VerifyError as exc:
         print(f"VERIFY_ERROR | {exc}", file=sys.stderr)
         raise SystemExit(1)

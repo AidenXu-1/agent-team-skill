@@ -1,11 +1,23 @@
 ---
 title: Agent Team 单 TASK 临时外包协议
-status: accepted_design
-version: 0.2.0
-date: 2026-07-12
+status: implemented
+version: 0.3.0
+product_version: 2.0.1
+runtime_protocol_version: 1.4.6
+date: 2026-07-16
 ---
 
 # Agent Team 单 TASK 临时外包协议
+
+## 0. 版本关系与实现状态
+
+本文描述的临时外包链路已经进入实现态。三个版本号承担不同职责，不能互相替代：
+
+- 产品与发布版本 `2.0.1`：用户安装、Git 标签和 Release 使用的稳定产品标识。本轮安全加固不改变公开产品线。
+- 运行协议 `1.4.6`：写入项目 `docs/collaboration/协议版本.json` 的内部数据与工具契约。它从 `1.4.5` 升级，用于严格 JSON、影响范围双向冲突、会话 ID 唯一性、受管文件内容校验和待归档查询等机械真相。
+- 文档修订号 `0.3.0`：只表示本文的表述与验收清单修订，不代表新的产品发布，也不能代替项目内运行协议号。
+
+因此，一个安装包可以继续叫 `2.0.1`，由它生成或升级的协作层使用运行协议 `1.4.6`，而本文单独以 `0.3.0` 记录协议说明的修订进度。
 
 ## 1. 产品定义
 
@@ -204,6 +216,10 @@ worktree 只提供协作隔离和晋升检测。首轮禁止临时执行者接�
 
 每次返工或实质 amend 增加明确 attempt，并生成新的 `candidate_revision`。任何修改都必须清空旧 candidate、review、delivery 和 integration，退回 `not_submitted`，重生成临时规则并要求会话重新确认。已完成的前置清点和吸收收据同时从当前证据中失效，只保留带旧 attempt 的历史快照供倒查。工具不能自动把旧用户确认、审查、测试或吸收证据套到新成果上。
 
+`blocked / waiting_input` 只是暂停状态，不是对旧准入结论的保鲜。临时 `resume / rework` 和正式 `resume` 都必须在共享任务锁内重做当前写路径、共享契约和外部影响检查。冲突仍在时保持阻断，`rework` 不增加 attempt，两条路径都不能只靠状态转换回到 claimed。
+
+临时会话一旦登记真实 thread ID，后续 failed 重试、规则重建、amend 或 rework 后重新 active 都必须继续使用原始字符串完全相同的 ID，不能用新 ID 覆盖未归档会话。ID 必须不含空白、不以 `=` 开头且不超过 300 字符，保证它能无歧义地放进归档回执。workspace 创建事务 verified 后，temporary session 仍处于 provisioning、真实会话已经创建但后续上岗失败时，failed 状态必须登记该 ID，最终清理不能误判为从未创建会话；创建事务尚未 verified 时必须先 reconcile，不能提前登记会话。外部 `session-mark --state cancelled` 一律拒绝；`cancelled` 只由无真实 thread ID 的 abandoned cleanup 在资源已验证清理后内部写入。
+
 ## 12. 候选成果与可选独立审查
 
 - 用户可见成果默认需要用户确认；纯内部任务可以由用户明确选择 `delegated`，确实不适用时记录 `not_applicable` 和理由。
@@ -212,6 +228,8 @@ worktree 只提供协作隔离和晋升检测。首轮禁止临时执行者接�
 - 审查输入限定为 TASK、验收标准、相关项目事实、候选版本、变化范围和验证入口。
 - 审查者只提交结论和证据，不直接修改成果。
 - 修复由临时执行者完成，并形成新候选。
+
+`submit` 是候选生成阶段的单向边界。提交后不再允许 `candidate` 或 `review` 改写交付证据；需要修改时必须显式 `rework`。正式集成记录只能在统筹已接管且尚未 integrated 时写入。`integrated`、资源已清理和会话已归档都是不可回退的机械真值；重试 reconcile 只返回幂等收据，不重开旧状态。
 
 ## 13. Delivery、候选集成态与正式验证
 
@@ -272,7 +290,7 @@ delivery 是临时执行者的正式交付版本。代码类 delivery 必须使�
 - ownership marker
 - 失败阶段和 reconcile 结果
 
-重试前先核对现有资源，不能因客户端超时重复创建会话，也不能根据名称猜测并删除已有 branch、workspace 或文件。幂等 key 必须绑定规范化请求 digest；同 key 不同请求直接冲突。Git 已改变但 TASK 尚未更新时，必须通过 promotion/cleanup reconcile 根据 expected ref、ownership 和实际资源状态恢复。
+重试前先核对现有资源，不能因客户端超时重复创建会话，也不能根据名称猜测并删除已有 branch、workspace 或文件。幂等 key 必须绑定规范化请求 digest；同 key 不同请求直接冲突。Git 已改变但 TASK 尚未更新时，必须通过 promotion/cleanup reconcile 根据 expected ref、ownership 和实际资源状态恢复。provision operation 未 verified 时，resume、rework、abandon 等常规生命周期全部冻结；promotion operation 未经 reconcile 收口时，重新测试、晋升、返工、放弃和 preflight 吸收同样冻结；cleanup operation 一旦开始，知识吸收等其他写操作也冻结，只能先 reconcile 或完成受控重试。
 
 用户取消只停止继续投入，不自动等于放弃。长期无回复进入 standby，换班继续绑定同一 TASK 和 workspace。
 
@@ -296,11 +314,11 @@ delivery 是临时执行者的正式交付版本。代码类 delivery 必须使�
 
 用户没有回复时，AI 只保留“待归档”的事实，不需要阻断整个项目。两条路径仍把“临时资源已经收走”和“侧边栏会话已经归档”分成两张独立收据。
 
-从旧协议升级时，升级事务必须先备份 TASK。1.4.3 和 1.4.4 中已经绑定真实 thread ID、`archived=true` 与真实来源的有效收据继续保留；更早版本或缺少可信回执的 `temporary_session=archived` 退回 `standby`，并返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`。已经完成资源清理但仍在 `standby` 的旧任务也会重新返回该归档动作，避免遗留会话继续沉默。
+从旧协议升级时，升级事务必须先备份 TASK。只要旧记录能够通过当前严格解析，按原始字符串精确绑定真实 thread ID、独立的 `archived=true` 与 host 或 user confirmation 来源，就继续保留，大小写不同的 ID 必须拒绝，也不因版本号较早而抹掉真实证据；缺失、冲突或无法验证的 `temporary_session=archived` 才退回 `standby`，并返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`。资源已清理、会话仍 standby 但 thread ID 为空时，它既不是可提醒的会话，也不是“从未创建”的 cancelled，必须在升级和 `pending-archives` 阶段显式拒绝。`1.4.5 → 1.4.6` 升级保留会话的 created、onboarded、registered、previous thread、证据和进行中的换班 operation 真相。已经完成资源清理但仍在 `standby` 的任务，无论是否刚发生跨版本升级，重复运行升级或只读 `pending-archives` 都会再次返回归档动作，避免遗留会话继续沉默。升级故障的回滚清单同时记录旧任务状态子目录的存在性与权限；回滚必须恢复空目录和原 mode，才能声称逐项校验成功。
 
-## 16. 首轮实现边界
+## 16. 当前实现边界
 
-首轮用单个临时开发外包验证完整通路，但通用模型从第一天包含 `temporary_executor + parent_department`。
+当前版本已用单个临时开发外包实现并验证完整通路，通用模型包含 `temporary_executor + parent_department`。
 
 必须覆盖：
 
@@ -315,4 +333,4 @@ delivery 是临时执行者的正式交付版本。代码类 delivery 必须使�
 - 创建半失败、返工、长期无回复、换班、取消、放弃和安全清理。
 - 容量为 1 且未启用临时外包时，正式部门原有热路径和阅读成本不增加。
 
-首轮不做多外包自动调度、所有部门的专业适配、真实外部副作用和 OS 沙箱。
+当前不做多外包自动调度、所有部门的专业适配、真实外部副作用和 OS 沙箱。

@@ -159,15 +159,15 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * workspace 内只生成一份 `.agent-team/临时执行规则.md`，作为临时会话的身份、权限、日志和收口入口。它按 TASK 指针读 Spec、相关 ADR、conventions、代码和测试，默认不读父部门完整岗位说明、收件箱、交接、progress 和长期报告。专业标准可以继承，组织身份和正式权限必须重写。
 
-* 需求实质变化使用带 expected brief revision 的 `amend`，同一事务重新判断并行条件、增加 attempt、清空旧候选 / delivery / integration，并重生成临时规则。临时会话重新确认新 digest 前不能固定候选或 submit。已 submit 或被统筹接管时先走显式 `rework`，不能直接 amend。
+* 需求实质变化使用带 expected brief revision 的 `amend`，同一事务重新判断并行条件、增加 attempt、清空旧候选 / delivery / integration，并重生成临时规则。临时会话重新确认新 digest 前不能固定候选或 submit。已 submit 或被统筹接管时先走显式 `rework`，不能直接 amend。任何 blocked / waiting 任务在 `resume` 或 `rework` 前都重做当前影响准入；冲突仍在时保持阻断，不能靠状态指令绕过。
 
-* 先固定可复查候选，再把用户确认、明确委托或不适用记录绑定到该候选 revision 和 tree digest。workspace 产生新 commit 后必须固定新候选并重新确认，工具不能把旧确认自动套到新版本。独立子 Agent 审查只在用户要求时调用，只给结论和证据；修复形成新候选。delivery submit 后使用受保护 ref 留证，临时会话进入 standby，不能自称已集成。
+* 先固定可复查候选，再把用户确认、明确委托或不适用记录绑定到该候选 revision 和 tree digest。workspace 产生新 commit 后必须固定新候选并重新确认，工具不能把旧确认自动套到新版本。独立子 Agent 审查只在用户要求时调用，只给结论和证据；修复形成新候选。delivery submit 后使用受保护 ref 留证，临时会话进入 standby，不能自称已集成。submit 之后的候选、审查和集成阶段只能按正向状态机推进；已 integrated 或已清理的真值不能被补录命令退回 ready/reviewing。
 
-* 正式体系只验证一次“准备成为正式结果的完整候选”。delivery 与未来正式 tree 相同时直接验证 delivery；main 前进、存在冲突或有集成修改时才按需形成候选集成态。正式通过必须绑定已完成并由统筹核收的审核层 TASK、本地正式报告、tested commit/tree 和未覆盖项，不能只填一段“测试通过”文字。进入 main 的 tree 必须等于已测试 tree，main 漂移或测试后修改都要求重测。
+* 正式体系只验证一次“准备成为正式结果的完整候选”。delivery 与未来正式 tree 相同时直接验证 delivery；main 前进、存在冲突或有集成修改时才按需形成候选集成态。正式通过必须绑定已完成并由统筹核收的审核层 TASK、本地正式报告、tested commit/tree 和未覆盖项，不能只填一段“测试通过”文字。报告的 tested commit、tested tree 和 result 必须写在文档开头的 YAML frontmatter 并与当前候选精确一致，正文中的相似子串不能充当证据。进入 main 的 tree 必须等于已测试 tree，main 漂移或测试后修改都要求重测。
 
 * 清理前同时通过成果吸收和知识吸收，并验证 delivery 保护 ref 仍指向正确 commit/tree。知识默认只回到所属正式部门与项目全局 Spec、ADR、conventions、progress 或错题集；其他部门只有明确受影响时才介入。未集成或用户未明确放弃时不得清理，长期无回复只进入 standby。创建、晋升和清理的半失败必须先运行对应 reconcile，不能根据名称猜测重做或删除。
 
-* `cleanup` 只清理受控 workspace / branch；存在真实临时会话时返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`，不能把 TASK 内部状态冒充成真实会话已经归档。统筹部直接看当前可用工具：有真实归档工具时立即调用，成功后运行 `session-mark --state archived --evidence "host=<真实工具> thread_id=<真实ID> archived=true"` 并继续；没有时提醒用户：“我目前无法自动归档这个会话。请你手动归档临时外包会话「<会话名称>」（会话 ID：<真实ID>），归档完成后告诉我一声。”这条提醒不形成脚本硬闸；用户未确认前保持 `temporary_session=standby`，不得声称已经归档，其他不依赖归档结果的安全工作可以继续。用户之后明确表示已完成时，运行 `session-mark --state archived --evidence "user_confirmation=<用户确认指针> thread_id=<真实ID> archived=true"`。自动调用失败也使用同一句人工提醒。若创建阶段就已放弃、从未产生真实 thread ID，则返回 `NO_THREAD_ARCHIVE_REQUIRED` 并把会话状态收口为 `cancelled`。旧协议升级时，缺少可信收据的 `archived` 会话退回 `standby`，已有可信收据继续保留；已经完成资源清理但仍在 `standby` 的会话会重新返回归档动作，避免升级后继续沉默。
+* `cleanup` 只清理受控 workspace / branch；存在真实临时会话时返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`，不能把 TASK 内部状态冒充成真实会话已经归档。统筹部直接看当前可用工具：有真实归档工具时立即调用，成功后运行 `session-mark --state archived --evidence "host=<真实工具> thread_id=<真实ID> archived=true"` 并继续；没有时提醒用户：“我目前无法自动归档这个会话。请你手动归档临时外包会话「<会话名称>」（会话 ID：<真实ID>），归档完成后告诉我一声。”这条提醒不形成脚本硬闸；用户未确认前保持 `temporary_session=standby`，不得声称已经归档，其他不依赖归档结果的安全工作可以继续。用户之后明确表示已完成时，运行 `session-mark --state archived --evidence "user_confirmation=<用户确认指针> thread_id=<真实ID> archived=true"`。自动调用失败也使用同一句人工提醒。若创建阶段就已放弃、从未产生真实 thread ID，则返回 `NO_THREAD_ARCHIVE_REQUIRED` 并把会话状态收口为 `cancelled`。已清理且 standby 却缺少 thread ID 是损坏真值，必须显式拒绝，不能沉默当成无待办。旧协议升级时，缺少可信收据的 `archived` 会话退回 `standby`；凡能通过当前严格解析并按原始字符串精确绑定 thread ID、`archived=true` 与 host 或 user confirmation 的可信收据都继续保留，大小写不同的 ID 不视为同一会话，也不能只因旧版本号而抹掉真实证据。已经完成资源清理但仍在 `standby` 的会话会重新返回归档动作，避免升级后继续沉默。需要重新查看这些动作时运行 `agent_team_temporary.py pending-archives`；它是可重复调用的只读查询，不改变 TASK 真相。
 
 * 所有临时生命周期机械操作使用 `agent_team_temporary.py`。普通任务继续走原有三个工具；临时功能未启用时，正式部门不增加必读文件或状态步骤。
 
@@ -183,6 +183,8 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 用户说“换会话 / 切换会话 / 换班”即授权同部门换班：旧会话先更新交接与必要事实日志，再创建同项目新会话，发送四文档路径。新会话确认接班并登记新 ID 后，最后归档旧会话。
 
+* `begin-switch` 后新旧 ID 必须同时保留到其中一个会话取得精确归档回执。新 ID 尚未产生时可直接 `restore-old`；新 ID 已登记时，只有先归档新会话并把该 ID 绑定到回执，才能恢复旧会话。旧会话归档失败时保持当前换班真值并提醒用户，不覆盖任一 thread ID。正式与临时 thread ID 都必须是可放入结构化回执的单一 token：不含空白、不以 `=` 开头且不超过 300 字符；换班收口后的归档收据保存在 evidence，修改通知模式不能覆盖它。
+
 * 不使用会复制旧历史的 fork。创建、发送、接班、登记或归档失败时保留旧会话。
 
 ## 用户常用口令
@@ -197,9 +199,9 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 ## 维护与验证
 
-* 增加部门：`scaffold_team.py <项目> --add-roles "<ids>"`；脚本同一事务更新部门表、路由表、会话启动状态和部门目录。
+* 增加部门：`scaffold_team.py <项目> --add-roles "<ids>"`；脚本同一事务更新部门表、路由表、会话启动清单、会话状态和部门目录。派生文档从会话状态真值整体重建，不追加另一份“待登记”副本；重复新增已存在部门保持幂等。
 
-* 旧协作层升级：`scaffold_team.py <项目> --upgrade-collaboration`。如旧收件箱存在待办/回报正文，脚本拒绝猜测迁移，要求先处理清楚；升级成功前保留带时间戳备份。
+* 当前运行协议为 `1.4.6`。旧协作层升级：`scaffold_team.py <项目> --upgrade-collaboration`。如旧收件箱存在待办/回报正文，脚本拒绝猜测迁移，要求先处理清楚；升级成功前保留带时间戳备份。
 
 * 减少或合并部门：先把在办事项和历史指针交代清楚，再调整部门表与岗位边界，不删除历史。
 

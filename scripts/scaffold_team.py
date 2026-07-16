@@ -26,7 +26,7 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.4.5"
+PROTOCOL_VERSION = "1.4.6"
 PROTOCOL_FILE = "协议版本.json"
 ADD_TRANSACTION_FILE = ".add-roles-transaction.json"
 
@@ -56,21 +56,37 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
+def reject_duplicate_json_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    """Reject ambiguous JSON instead of silently accepting the last duplicate key."""
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 含重复键: {key}")
+        result[key] = value
+    return result
+
+
+def strict_json_loads(text: str, *, source: str) -> object:
+    try:
+        return json.loads(text, object_pairs_hook=reject_duplicate_json_pairs)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{source} JSON 无效: {exc}") from exc
+
+
 def archive_receipt_fields(evidence: str) -> dict[str, set[str]]:
     fields: dict[str, set[str]] = {}
     for token in evidence.split():
         key, separator, value = token.partition("=")
-        normalized_value = value.casefold()
-        if separator and key and normalized_value and not normalized_value.startswith("="):
-            fields.setdefault(key.casefold(), set()).add(normalized_value)
+        if separator and key and value and not value.startswith("="):
+            fields.setdefault(key.casefold(), set()).add(value)
     return fields
 
 
 def valid_archive_receipt(evidence: str, thread_id: str) -> bool:
     fields = archive_receipt_fields(evidence)
     return (
-        fields.get("thread_id") == {thread_id.casefold()}
-        and fields.get("archived") == {"true"}
+        fields.get("thread_id") == {thread_id}
+        and {value.casefold() for value in fields.get("archived", set())} == {"true"}
         and bool(fields.get("host") or fields.get("user_confirmation"))
     )
 
@@ -82,13 +98,28 @@ class CollaborationBusyError(RuntimeError):
 @contextmanager
 def project_lock(target: Path):
     """Use an OS-managed lock so concurrent scaffold transactions cannot overwrite each other."""
-    home = Path.home().resolve(strict=True)
-    lock_root = home / ".cache" / "agent-team" / "locks"
-    lock_root.mkdir(mode=0o700, parents=True, exist_ok=True)
     try:
-        lock_root.resolve(strict=True).relative_to(home)
+        temporary_root = Path(tempfile.gettempdir()).resolve(strict=True)
+    except OSError as exc:
+        raise CollaborationBusyError(f"无法解析当前可写临时目录: {exc}") from exc
+    if not temporary_root.is_dir():
+        raise CollaborationBusyError("当前临时目录不可用。")
+    if hasattr(os, "getuid"):
+        owner_suffix = f"uid-{os.getuid()}"
+    else:
+        owner_hint = os.environ.get("USERNAME", "current").encode("utf-8", errors="surrogatepass")
+        owner_suffix = "user-" + hashlib.sha256(owner_hint).hexdigest()[:16]
+    lock_root = temporary_root / f"agent-team-scaffold-locks-{owner_suffix}"
+    if lock_root.is_symlink():
+        raise CollaborationBusyError("agent-team 锁目录不能是符号链接。")
+    try:
+        lock_root.mkdir(mode=0o700, exist_ok=True)
+    except OSError as exc:
+        raise CollaborationBusyError(f"无法创建 agent-team 私有锁目录: {exc}") from exc
+    try:
+        lock_root.resolve(strict=True).relative_to(temporary_root)
     except (OSError, ValueError) as exc:
-        raise CollaborationBusyError("agent-team 私有锁目录越出用户主目录。") from exc
+        raise CollaborationBusyError("agent-team 私有锁目录越出当前临时目录。") from exc
     if lock_root.is_symlink() or not lock_root.is_dir():
         raise CollaborationBusyError("agent-team 私有锁目录不安全。")
     root_stat = lock_root.stat()
@@ -105,8 +136,8 @@ def project_lock(target: Path):
     try:
         fd = os.open(lock_path, flags, 0o600)
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode):
-            raise CollaborationBusyError("agent-team 锁文件不是普通文件。")
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise CollaborationBusyError("agent-team 锁文件不是单链接普通文件。")
         if hasattr(os, "getuid") and info.st_uid != os.getuid():
             raise CollaborationBusyError("agent-team 锁文件不属于当前用户。")
         if hasattr(os, "fchmod"):
@@ -193,12 +224,107 @@ def plain_path_within(path: Path, root: Path, *, kind: str) -> bool:
     raise ValueError(f"unknown path kind: {kind}")
 
 
-def protocol_payload(date: str) -> str:
+MANAGED_BASE_FILES = (
+    "README.md",
+    "路由表.md",
+    "会话启动清单.md",
+    "任务交接模板.md",
+    "模板/工作报告.md",
+    "模板/审核报告.md",
+    "模板/专项结论.md",
+    "scripts/agent_team_log.py",
+    "scripts/agent_team_task.py",
+    "scripts/agent_team_session.py",
+    "scripts/agent_team_temporary.py",
+)
+
+
+def managed_relative_paths(roles: list[str]) -> list[str]:
+    paths = list(MANAGED_BASE_FILES)
+    for key in roles:
+        department = ROLE_DEFS[key]["name"]
+        paths.extend((f"部门/{department}/岗位说明.md", f"部门/{department}/上岗引导.md"))
+    return sorted(paths)
+
+
+CURRENT_SESSION_ITEM_FIELDS = {
+    "role_id", "notification_mode", "step", "thread_id", "previous_thread_id",
+    "failed_from", "evidence", "operation_id", "note", "updated_at",
+}
+CURRENT_SESSION_STEPS = {"pending", "created", "onboarded", "registered", "failed"}
+
+
+def validate_session_item_lifecycle(item: dict, department: str) -> None:
+    current_thread = item["thread_id"]
+    previous_thread = item["previous_thread_id"]
+    operation_id = item["operation_id"]
+    failed_from = item["failed_from"]
+    for label, thread_id in (("thread_id", current_thread), ("previous_thread_id", previous_thread)):
+        if thread_id and (
+            len(thread_id) > 300
+            or thread_id.startswith("=")
+            or any(char.isspace() for char in thread_id)
+        ):
+            raise ValueError(f"会话启动状态 {label} 不可表示为归档回执: {department}")
+    if not operation_id:
+        raise ValueError(f"会话启动状态 operation_id 无效: {department}")
+    if previous_thread and not operation_id.startswith("SWITCH-"):
+        raise ValueError(f"待收口旧会话缺少 SWITCH 事务: {department}")
+    if operation_id.startswith("SWITCH-") and not previous_thread:
+        raise ValueError(f"SWITCH 事务缺少 previous_thread_id: {department}")
+    if item["step"] == "pending" and current_thread:
+        raise ValueError(f"pending 会话不得预先占用 thread_id: {department}")
+    if item["step"] in {"created", "onboarded", "registered"} and not current_thread:
+        raise ValueError(f"会话启动状态 {item['step']} 缺少 thread_id: {department}")
+    if item["step"] == "failed":
+        if failed_from not in {"pending", "created", "onboarded"}:
+            raise ValueError(f"failed 会话缺少可恢复的 failed_from: {department}")
+        if (failed_from == "pending") == bool(current_thread):
+            raise ValueError(f"failed 会话的 thread_id 与 failed_from 矛盾: {department}")
+    elif failed_from:
+        raise ValueError(f"非 failed 会话不得保留 failed_from: {department}")
+
+
+def validate_current_session_payload(payload: object) -> list[str]:
+    """Validate the exact current session-state schema and return configured role IDs."""
+    root_fields = {"schema_version", "protocol_version", "updated_at", "departments"}
+    if not isinstance(payload, dict) or set(payload) != root_fields:
+        raise ValueError("会话启动状态根结构无效")
+    if payload["schema_version"] != 1 or payload["protocol_version"] != PROTOCOL_VERSION:
+        raise ValueError("会话启动状态版本无效")
+    if not isinstance(payload["updated_at"], str) or not payload["updated_at"]:
+        raise ValueError("会话启动状态 updated_at 无效")
+    departments = payload["departments"]
+    if not isinstance(departments, dict) or not departments:
+        raise ValueError("会话启动状态未登记部门")
+    roles: list[str] = []
+    for department, item in departments.items():
+        if not isinstance(department, str) or not isinstance(item, dict) or set(item) != CURRENT_SESSION_ITEM_FIELDS:
+            raise ValueError(f"会话启动状态部门条目无效: {department}")
+        role_id = item["role_id"]
+        if role_id not in ROLE_DEFS or ROLE_DEFS[role_id]["name"] != department:
+            raise ValueError(f"会话启动状态角色无效: {department}")
+        if item["notification_mode"] not in {"auto", "manual"}:
+            raise ValueError(f"会话通知模式无效: {department}")
+        if item["step"] not in CURRENT_SESSION_STEPS:
+            raise ValueError(f"会话启动状态 step 无效: {department}")
+        for field in CURRENT_SESSION_ITEM_FIELDS - {"role_id", "notification_mode", "step"}:
+            if not isinstance(item[field], str):
+                raise ValueError(f"会话启动状态 {field} 类型无效: {department}")
+        validate_session_item_lifecycle(item, department)
+        roles.append(role_id)
+    if len(roles) != len(set(roles)):
+        raise ValueError("会话启动状态含重复 role_id")
+    return roles
+
+
+def protocol_payload(date: str, managed_files: dict[str, dict[str, str]] | None = None) -> str:
     return json.dumps(
         {
             "protocol_version": PROTOCOL_VERSION,
             "generator": "agent-team",
             "generated_on": date,
+            "managed_files": managed_files or {},
         },
         ensure_ascii=False,
         indent=2,
@@ -206,38 +332,115 @@ def protocol_payload(date: str) -> str:
     ) + "\n"
 
 
+def managed_manifest_from_disk(collab: Path, roles: list[str]) -> dict[str, dict[str, str]]:
+    manifest: dict[str, dict[str, str]] = {}
+    for relative in managed_relative_paths(roles):
+        path = collab / relative
+        if not plain_path_within(path, collab, kind="file"):
+            raise ValueError(f"受管文件缺失或不安全: {relative}")
+        info = path.stat()
+        manifest[relative] = {
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "mode": f"{stat.S_IMODE(info.st_mode):04o}",
+        }
+    return manifest
+
+
 def read_protocol_version(collab: Path) -> str | None:
     path = collab / PROTOCOL_FILE
     if not plain_path_within(path, collab, kind="file"):
         return None
     try:
-        payload = json.loads(read_utf8(path))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+        payload = strict_json_loads(read_utf8(path), source=str(path))
+    except (OSError, UnicodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
         return None
     value = payload.get("protocol_version")
     return value if isinstance(value, str) else None
 
 
+def read_protocol_version_for_upgrade(collab: Path) -> str | None:
+    path = collab / PROTOCOL_FILE
+    if path.is_symlink():
+        raise ValueError("协议版本文件不能是符号链接")
+    if not path.exists():
+        return None
+    if not plain_path_within(path, collab, kind="file"):
+        raise ValueError("协议版本文件路径不安全")
+    payload = strict_json_loads(read_utf8(path), source=str(path))
+    if not isinstance(payload, dict):
+        raise ValueError("协议版本 JSON 根节点必须是对象")
+    value = payload.get("protocol_version")
+    if not isinstance(value, str) or not value:
+        raise ValueError("协议版本字段缺失或无效")
+    return value
+
+
 def current_runtime_complete(collab: Path) -> bool:
-    files = (
-        "README.md", "部门表.md", "路由表.md", "会话启动清单.md", "会话启动状态.json",
-        "任务交接模板.md", "scripts/agent_team_log.py", "scripts/agent_team_task.py",
-        "scripts/agent_team_session.py", "scripts/agent_team_temporary.py",
-        "模板/工作报告.md", "模板/审核报告.md", "模板/专项结论.md",
-    )
-    directories = (
-        "部门", ".locks", "tasks", "scripts",
-    )
+    directories = ("部门", ".locks", "tasks", "scripts", "模板", "专项结论")
     project = collab.parents[1]
     guide = collab.parent / "agent-guide.md"
     try:
+        protocol_path = collab / PROTOCOL_FILE
+        if not plain_path_within(protocol_path, collab, kind="file"):
+            return False
+        protocol = strict_json_loads(read_utf8(protocol_path), source=str(protocol_path))
+        if not isinstance(protocol, dict) or protocol.get("protocol_version") != PROTOCOL_VERSION:
+            return False
+        state_path = collab / "会话启动状态.json"
+        if not plain_path_within(state_path, collab, kind="file"):
+            return False
+        state_payload = strict_json_loads(read_utf8(state_path), source=str(state_path))
+        roles = validate_current_session_payload(state_payload)
+        registry_path = collab / "部门表.md"
+        for variable_file in ("部门表.md", "错题集.md"):
+            if not plain_path_within(collab / variable_file, collab, kind="file"):
+                return False
+        registry_text = read_utf8(registry_path)
+        registry_roles = registered_role_ids(registry_text)
+        if len(registry_roles) != len(set(registry_roles)) or set(registry_roles) != set(roles):
+            return False
+        if registry_session_data(registry_text) != registry_data_from_session_state(state_payload):
+            return False
+        preflight_upgrade_tasks(collab, roles)
+        tasks_root = collab / "tasks"
+        if any(entry.is_dir() for entry in tasks_root.iterdir()):
+            return False
+        validate_session_thread_identities(state_payload, iter_upgrade_task_payloads(collab))
+        expected_paths = managed_relative_paths(roles)
+        manifest = protocol.get("managed_files")
+        if not isinstance(manifest, dict) or sorted(manifest) != expected_paths:
+            return False
+        for relative in expected_paths:
+            record = manifest.get(relative)
+            path = collab / relative
+            if (
+                not isinstance(record, dict)
+                or set(record) != {"sha256", "mode"}
+                or not isinstance(record.get("sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", record["sha256"])
+                or not isinstance(record.get("mode"), str)
+                or not re.fullmatch(r"[0-7]{4}", record["mode"])
+                or not plain_path_within(path, collab, kind="file")
+                or hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]
+                or (os.name != "nt" and f"{stat.S_IMODE(path.stat().st_mode):04o}" != record["mode"])
+            ):
+                return False
+        for department in state_payload["departments"]:
+            root = collab / "部门" / department
+            if not plain_path_within(root, collab, kind="dir"):
+                return False
+            for name in ("上岗引导.md", "岗位说明.md", "交接班文档.md", "收件箱.md"):
+                if not plain_path_within(root / name, collab, kind="file"):
+                    return False
         guide_current = (
             plain_path_within(guide, project, kind="file")
             and f"受管协议版本:{PROTOCOL_VERSION}" in read_utf8(guide)
         )
-    except (OSError, UnicodeError):
+    except (OSError, UnicodeError, ValueError):
         guide_current = False
-    return guide_current and all(plain_path_within(collab / name, collab, kind="file") for name in files) and all(
+    return guide_current and all(
         plain_path_within(collab / name, collab, kind="dir") for name in directories
     )
 
@@ -464,6 +667,36 @@ def write_utf8_atomic(path: Path, text: str, *, mode: int | None = None) -> None
             Path(temp_name).unlink(missing_ok=True)
 
 
+def write_bytes_atomic(path: Path, data: bytes, *, mode: int) -> None:
+    """Atomically restore exact bytes and permissions; used by verified rollback."""
+    if path.parent.is_symlink():
+        raise ValueError(f"恢复目标父目录不能是符号链接: {path.parent}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_name: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "wb", dir=path.parent, prefix=f".{path.name}.", suffix=".restore.tmp", delete=False,
+        ) as handle:
+            temp_name = handle.name
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, mode)
+        os.replace(temp_name, path)
+        temp_name = None
+        try:
+            directory_fd = os.open(path.parent, os.O_RDONLY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError:
+            pass
+    finally:
+        if temp_name is not None:
+            Path(temp_name).unlink(missing_ok=True)
+
+
 def log_writer_script() -> str:
     return r'''#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
@@ -528,6 +761,22 @@ ensure_utf8_filesystem_runtime()
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+
+def reject_duplicate_json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 含重复键: {key}")
+        result[key] = value
+    return result
+
+
+def strict_json_loads(text, source):
+    try:
+        return json.loads(text, object_pairs_hook=reject_duplicate_json_pairs)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{source} JSON 无效: {exc}") from exc
 
 
 def discover_control_root() -> Path:
@@ -821,10 +1070,12 @@ def append_event(args: argparse.Namespace) -> int:
             raise ValueError("临时外包日志必须绑定具体 TASK")
         if parent_department != department:
             raise ValueError("临时外包日志必须写入父部门周日志")
+        if TASKS.is_symlink() or not TASKS.is_dir():
+            raise ValueError("tasks 目录缺失或为符号链接")
         task_path = TASKS / f"{task_id}.json"
         if task_path.is_symlink() or not task_path.is_file():
             raise ValueError("临时外包日志绑定的权威 TASK 不存在或不安全")
-        task_payload = json.loads(task_path.read_text(encoding="utf-8"))
+        task_payload = strict_json_loads(task_path.read_text(encoding="utf-8"), str(task_path))
         temporary = task_payload.get("temporary_executor")
         if not isinstance(temporary, dict):
             raise ValueError("TASK 未绑定临时执行者，拒绝写临时日志")
@@ -969,6 +1220,22 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
+def reject_duplicate_json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 含重复键: {key}")
+        result[key] = value
+    return result
+
+
+def strict_json_loads(text, source):
+    try:
+        return json.loads(text, object_pairs_hook=reject_duplicate_json_pairs)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{source} JSON 无效: {exc}") from exc
+
+
 def discover_control_root() -> Path:
     local = Path(__file__).resolve().parents[1]
     project = local.parents[1]
@@ -998,7 +1265,7 @@ LOCKS = COLLAB / ".locks"
 SESSION_STATE = COLLAB / "会话启动状态.json"
 INDEX_MARKER = "<!-- agent-team task index; use scripts/agent_team_task.py -->"
 SCHEMA_VERSION = 1
-PROTOCOL_VERSION = "1.4.5"
+PROTOCOL_VERSION = "1.4.6"
 STATES = ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged")
 BUSY_STATES = {"claimed"}
 VISIBLE_ACTIVE_STATES = {"claimed", "blocked", "waiting_input"}
@@ -1196,6 +1463,47 @@ def parse_task_timestamp(payload: dict, field: str) -> dt.datetime:
     return parsed
 
 
+def impact_path(raw: str) -> str:
+    value = clean("write-path", raw, max_chars=500).replace("\\", "/")
+    path = Path(value)
+    if path.is_absolute() or value in {".", ".."} or ".." in path.parts:
+        raise ValueError("write-path 必须是项目内相对路径")
+    forbidden = (".git", ".agent-team", "docs/collaboration")
+    if any(value == prefix or value.startswith(prefix + "/") for prefix in forbidden):
+        raise ValueError(f"write-path 禁止授权控制根、Git 元数据或临时系统目录: {value}")
+    return path.as_posix().rstrip("/")
+
+
+def validate_impact_declaration(value: object, source: Path, *, task_id: str | None = None) -> dict:
+    required = {"write_paths", "shared_contracts", "external_effects", "base_revision", "owner_task", "admission"}
+    if not isinstance(value, dict) or set(value) != required:
+        raise ValueError(f"任务影响声明结构无效: {source.name}")
+    for field in ("write_paths", "shared_contracts", "external_effects"):
+        items = value.get(field)
+        if not isinstance(items, list) or any(
+            not isinstance(item, str) or not item.strip() or item != item.strip() or len(item) > 500
+            or any(ord(char) < 32 for char in item)
+            for item in items
+        ) or len(items) != len(set(items)):
+            raise ValueError(f"任务影响声明列表无效: {field}")
+    if not value["write_paths"] or not value["external_effects"]:
+        raise ValueError("任务影响声明必须包含 write_paths 和 external_effects")
+    normalized_paths = [impact_path(item) for item in value["write_paths"]]
+    if normalized_paths != value["write_paths"]:
+        raise ValueError("任务影响声明 write_paths 未规范化")
+    if "none" in value["external_effects"] and value["external_effects"] != ["none"]:
+        raise ValueError("external_effects 中 none 不能与其他副作用并存")
+    for field in ("base_revision", "owner_task"):
+        field_value = value.get(field)
+        if not isinstance(field_value, str) or not field_value.strip() or field_value != field_value.strip():
+            raise ValueError(f"任务影响声明 {field} 无效")
+    if task_id is not None and value["owner_task"] != task_id:
+        raise ValueError(f"任务影响声明 owner_task 与 TASK 不一致: {source.name}")
+    if value.get("admission") not in {"safe", "manual", "unsafe", "waiting_base"}:
+        raise ValueError(f"任务影响声明 admission 无效: {source.name}")
+    return value
+
+
 def validate_task_payload(payload: object, path: Path) -> dict:
     if not isinstance(payload, dict):
         raise ValueError(f"任务根节点必须是 JSON 对象: {path.name}")
@@ -1207,19 +1515,17 @@ def validate_task_payload(payload: object, path: Path) -> dict:
         raise ValueError("任务含当前 schema 未定义字段: " + ", ".join(unknown_fields))
     impact = payload.get("impact_declaration")
     if impact is not None:
-        required_impact = {"write_paths", "shared_contracts", "external_effects", "base_revision", "owner_task", "admission"}
-        if not isinstance(impact, dict) or set(impact) != required_impact:
-            raise ValueError(f"任务影响声明结构无效: {path.name}")
-        if impact.get("admission") not in {"safe", "manual", "unsafe", "waiting_base"}:
-            raise ValueError(f"任务影响声明 admission 无效: {path.name}")
-        if any(not isinstance(impact.get(field), list) for field in ("write_paths", "shared_contracts", "external_effects")):
-            raise ValueError(f"任务影响声明列表无效: {path.name}")
+        validate_impact_declaration(impact, path)
     temporary = payload.get("temporary_executor")
     if temporary is not None:
         if not isinstance(temporary, dict) or temporary.get("executor_type") != "temporary":
             raise ValueError(f"temporary_executor 结构无效: {path.name}")
         if temporary.get("parent_department") != payload.get("department"):
             raise ValueError(f"temporary_executor 父部门不匹配: {path.name}")
+        nested_impact = temporary.get("impact")
+        validate_impact_declaration(nested_impact, path, task_id=payload.get("task_id"))
+        if impact is None or nested_impact != impact:
+            raise ValueError(f"temporary_executor 的 impact 与 TASK impact_declaration 不一致: {path.name}")
         if temporary.get("promotion_state") not in {
             "not_submitted", "submitted", "reviewing", "waiting_base", "ready", "integrated",
             "archived", "cancelled", "abandoned",
@@ -1232,6 +1538,8 @@ def validate_task_payload(payload: object, path: Path) -> dict:
     task_id = require_task_text(payload, "task_id")
     if task_id != path.stem or not TASK_ID_RE.fullmatch(task_id):
         raise ValueError(f"任务 ID 与文件名不一致或格式无效: {path.name}")
+    if impact is not None:
+        validate_impact_declaration(impact, path, task_id=task_id)
 
     department = require_task_text(payload, "department")
     from_department = require_task_text(payload, "from_department")
@@ -1343,7 +1651,7 @@ def validate_task_payload(payload: object, path: Path) -> dict:
 def load_task_at(path: Path) -> dict:
     if path.is_symlink() or not path.is_file():
         raise ValueError(f"任务文件不安全: {path}")
-    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload = strict_json_loads(path.read_text(encoding="utf-8"), str(path))
     return validate_task_payload(payload, path)
 
 
@@ -1364,7 +1672,7 @@ def all_tasks() -> list[tuple[str, Path, dict]]:
 def configured_departments() -> dict[str, str]:
     if SESSION_STATE.is_symlink() or not SESSION_STATE.is_file():
         raise ValueError("会话启动状态缺失或不安全")
-    payload = json.loads(SESSION_STATE.read_text(encoding="utf-8"))
+    payload = strict_json_loads(SESSION_STATE.read_text(encoding="utf-8"), str(SESSION_STATE))
     if not isinstance(payload, dict) or payload.get("schema_version") != 1 or payload.get("protocol_version") != PROTOCOL_VERSION:
         raise ValueError("会话启动状态版本无效")
     departments = payload.get("departments")
@@ -1447,7 +1755,10 @@ def audit_report(raw: str, department: str, task_id: str) -> str:
     for line in header.splitlines():
         if ":" in line:
             key, value = line.split(":", 1)
-            fields[key.strip()] = value.strip()
+            normalized_key = key.strip()
+            if normalized_key in fields:
+                raise ValueError(f"审核报告 YAML 含重复字段: {normalized_key}")
+            fields[normalized_key] = value.strip()
     required = {"type", "department", "target", "status", "date", "related_task", "decision", "tags", "summary"}
     missing = sorted(key for key in required if not fields.get(key))
     if missing:
@@ -1460,7 +1771,7 @@ def audit_report(raw: str, department: str, task_id: str) -> str:
 def registered_lead_actor() -> str:
     if SESSION_STATE.is_symlink() or not SESSION_STATE.is_file():
         raise ValueError("会话状态缺失或不安全,不能核收")
-    payload = json.loads(SESSION_STATE.read_text(encoding="utf-8"))
+    payload = strict_json_loads(SESSION_STATE.read_text(encoding="utf-8"), str(SESSION_STATE))
     item = payload.get("departments", {}).get("统筹部", {})
     thread_id = item.get("thread_id", "")
     if item.get("step") != "registered" or not thread_id:
@@ -1583,6 +1894,93 @@ def busy_for(department: str, *, excluding: str | None = None) -> list[str]:
     return result
 
 
+def paths_overlap(left: str, right: str) -> bool:
+    return left == right or left.startswith(right + "/") or right.startswith(left + "/")
+
+
+def active_temporary_impacts(task_id: str) -> list[tuple[str, dict]]:
+    active: list[tuple[str, dict]] = []
+    for _, path, other in all_tasks():
+        if other["task_id"] == task_id:
+            continue
+        temporary = other.get("temporary_executor")
+        if not isinstance(temporary, dict) or temporary.get("promotion_state") in {"archived", "abandoned", "cancelled"}:
+            continue
+        declared = other.get("impact_declaration")
+        nested = temporary.get("impact")
+        validate_impact_declaration(declared, path, task_id=other["task_id"])
+        validate_impact_declaration(nested, path, task_id=other["task_id"])
+        if declared != nested:
+            raise ValueError(f"临时外包 {other['task_id']} 的影响声明真值冲突")
+        active.append((other["task_id"], declared))
+    return active
+
+
+def require_formal_temporary_compatibility(task: dict, path: Path) -> None:
+    temporary_impacts = active_temporary_impacts(task["task_id"])
+    if not temporary_impacts:
+        return
+    impact = task.get("impact_declaration")
+    if impact is None:
+        raise ValueError(
+            "存在未收口临时外包，正式任务 claim 前必须先用 declare-impact 明确声明影响范围"
+        )
+    validate_impact_declaration(impact, path, task_id=task["task_id"])
+    if impact["external_effects"] != ["none"]:
+        raise ValueError("正式任务存在外部副作用，无法自动证明与临时外包并行安全")
+    for other_task_id, other in temporary_impacts:
+        if other["external_effects"] != ["none"]:
+            raise ValueError(f"临时外包 {other_task_id} 存在外部副作用，拒绝并行 claim")
+        if any(paths_overlap(left, right) for left in impact["write_paths"] for right in other["write_paths"]):
+            raise ValueError(f"正式任务写路径与临时外包冲突: {other_task_id}")
+        shared = sorted(set(impact["shared_contracts"]) & set(other["shared_contracts"]))
+        if shared:
+            raise ValueError(f"正式任务共享契约与临时外包冲突: {other_task_id}: {', '.join(shared)}")
+
+
+def cmd_declare_impact(args) -> int:
+    state, path, current = locate(args.task_id)
+    if current.get("temporary_executor"):
+        raise ValueError("临时外包影响声明只能通过 agent_team_temporary.py 修改")
+    if state != "queued":
+        raise ValueError("正式任务只能在 queued 状态声明 impact")
+    if current["revision"] != args.expected_revision:
+        raise ValueError("expected-revision 与 TASK 当前 revision 不一致")
+    write_paths = [impact_path(item) for item in args.write_path]
+    if len(write_paths) != len(set(write_paths)):
+        raise ValueError("write-path 不能重复")
+    shared_contracts = [clean("shared-contract", item, max_chars=500) for item in args.shared_contract]
+    if len(shared_contracts) != len(set(shared_contracts)):
+        raise ValueError("shared-contract 不能重复")
+    external_effects = [clean("external-effect", item, max_chars=500) for item in (args.external_effect or ["none"])]
+    if len(external_effects) != len(set(external_effects)):
+        raise ValueError("external-effect 不能重复")
+    if "none" in external_effects and external_effects != ["none"]:
+        raise ValueError("external-effect=none 不能与其他副作用并存")
+    declaration = {
+        "write_paths": write_paths,
+        "shared_contracts": shared_contracts,
+        "external_effects": external_effects,
+        "base_revision": clean("base-revision", args.base_revision, max_chars=300),
+        "owner_task": current["task_id"],
+        "admission": "manual",
+    }
+    validate_impact_declaration(declaration, path, task_id=current["task_id"])
+    candidate = dict(current)
+    candidate["impact_declaration"] = declaration
+    active_temporaries = active_temporary_impacts(current["task_id"])
+    require_formal_temporary_compatibility(candidate, path)
+    if active_temporaries:
+        declaration["admission"] = "safe"
+
+    def mutate(item: dict) -> None:
+        item["impact_declaration"] = declaration
+
+    task, updated_path = update_task(args.task_id, mutate, allowed_states={"queued"})
+    print(f"TASK_IMPACT_OK | {task['task_id']} | revision:{task['revision']} | {updated_path.relative_to(PROJECT)}")
+    return 0
+
+
 def cmd_enqueue(args) -> int:
     require_department(args.department)
     require_department(args.from_department)
@@ -1638,7 +2036,7 @@ def cmd_enqueue(args) -> int:
 
 
 def cmd_claim(args) -> int:
-    _, _, current = locate(args.task_id)
+    _, current_path, current = locate(args.task_id)
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
     authorization = current["authorization_state"]
@@ -1649,6 +2047,7 @@ def cmd_claim(args) -> int:
     other = busy_for(current["department"], excluding=args.task_id)
     if other:
         raise ValueError("本部门已有在办任务: " + ", ".join(other))
+    require_formal_temporary_compatibility(current, current_path)
     task, path = transition(args.task_id, "claim", lambda item: item.update(claimed_by=clean("claimed-by", args.claimed_by, max_chars=200)))
     refresh_inboxes()
     print(f"TASK_CLAIMED | {task['task_id']} | {path.relative_to(PROJECT)}")
@@ -1676,7 +2075,7 @@ def cmd_wait(args) -> int:
 
 
 def cmd_resume(args) -> int:
-    _, _, current = locate(args.task_id)
+    _, current_path, current = locate(args.task_id)
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
     authorization = current["authorization_state"]
@@ -1685,6 +2084,7 @@ def cmd_resume(args) -> int:
     other = busy_for(current["department"], excluding=args.task_id)
     if other:
         raise ValueError("本部门已有其他在办任务: " + ", ".join(other))
+    require_formal_temporary_compatibility(current, current_path)
     task, path = transition(args.task_id, "resume", lambda item: item.update(block_reason=""))
     refresh_inboxes()
     print(f"TASK_RESUMED | {task['task_id']} | {path.relative_to(PROJECT)}")
@@ -1805,6 +2205,14 @@ def parser() -> argparse.ArgumentParser:
     enqueue.add_argument("--authorization-evidence", default="")
     enqueue.add_argument("--pointer", action="append", default=[])
     enqueue.set_defaults(func=cmd_enqueue)
+    declare = sub.add_parser("declare-impact")
+    declare.add_argument("--task-id", required=True)
+    declare.add_argument("--expected-revision", required=True, type=int)
+    declare.add_argument("--write-path", action="append", required=True)
+    declare.add_argument("--shared-contract", action="append", default=[])
+    declare.add_argument("--external-effect", action="append", default=[])
+    declare.add_argument("--base-revision", required=True)
+    declare.set_defaults(func=cmd_declare_impact)
     claim = sub.add_parser("claim")
     claim.add_argument("--task-id", required=True)
     claim.add_argument("--claimed-by", required=True)
@@ -1873,6 +2281,7 @@ import argparse
 import datetime as dt
 import json
 import os
+import stat
 import subprocess
 import sys
 import uuid
@@ -1907,6 +2316,40 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
 
+def reject_duplicate_json_pairs(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"JSON 含重复键: {key}")
+        result[key] = value
+    return result
+
+
+def strict_json_loads(text, source):
+    try:
+        return json.loads(text, object_pairs_hook=reject_duplicate_json_pairs)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"{source} JSON 无效: {exc}") from exc
+
+
+def archive_receipt_fields(evidence: str) -> dict[str, set[str]]:
+    fields: dict[str, set[str]] = {}
+    for token in evidence.split():
+        key, separator, value = token.partition("=")
+        if separator and key and value and not value.startswith("="):
+            fields.setdefault(key.casefold(), set()).add(value)
+    return fields
+
+
+def valid_archive_receipt(evidence: str, thread_id: str) -> bool:
+    fields = archive_receipt_fields(evidence)
+    return (
+        fields.get("thread_id") == {thread_id}
+        and {value.casefold() for value in fields.get("archived", set())} == {"true"}
+        and bool(fields.get("host") or fields.get("user_confirmation"))
+    )
+
+
 def discover_control_root() -> Path:
     local = Path(__file__).resolve().parents[1]
     project = local.parents[1]
@@ -1932,6 +2375,7 @@ COLLAB = discover_control_root()
 STATE_FILE = COLLAB / "会话启动状态.json"
 REGISTRY_FILE = COLLAB / "部门表.md"
 LOCKS = COLLAB / ".locks"
+TASKS = COLLAB / "tasks"
 STEPS = {"pending", "created", "onboarded", "registered", "failed"}
 ALLOWED = {
     "pending": {"created", "failed"},
@@ -1956,13 +2400,36 @@ def clean(name: str, value: str, max_chars: int = 500) -> str:
     return result
 
 
+def clean_thread_id(value: str) -> str:
+    result = clean("thread-id", value, max_chars=300)
+    if any(char.isspace() for char in result):
+        raise ValueError("thread-id 不能包含空格、换行或制表符")
+    if result.startswith("="):
+        raise ValueError("thread-id 不能以等号开头")
+    return result
+
+
 @contextmanager
 def state_lock():
     if LOCKS.exists() and (LOCKS.is_symlink() or not LOCKS.is_dir()):
         raise ValueError("锁目录不安全")
     LOCKS.mkdir(mode=0o700, exist_ok=True)
-    path = LOCKS / "sessions.lock"
+    lock_info = LOCKS.stat()
+    if not stat.S_ISDIR(lock_info.st_mode) or (hasattr(os, "getuid") and lock_info.st_uid != os.getuid()):
+        raise ValueError("锁目录不安全或不属于当前用户")
+    if hasattr(os, "chmod"):
+        os.chmod(LOCKS, 0o700)
+    path = LOCKS / "identity.lock"
     fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+    file_info = os.fstat(fd)
+    if not stat.S_ISREG(file_info.st_mode) or file_info.st_nlink != 1:
+        os.close(fd)
+        raise ValueError("身份锁不是单链接普通文件")
+    if hasattr(os, "getuid") and file_info.st_uid != os.getuid():
+        os.close(fd)
+        raise ValueError("身份锁不属于当前用户")
+    if hasattr(os, "fchmod"):
+        os.fchmod(fd, 0o600)
     handle = os.fdopen(fd, "a+b", buffering=0)
     try:
         if os.name == "nt":
@@ -1987,10 +2454,84 @@ def state_lock():
 def load() -> dict:
     if STATE_FILE.is_symlink() or not STATE_FILE.is_file():
         raise ValueError("会话启动状态文件缺失或不安全")
-    payload = json.loads(STATE_FILE.read_text(encoding="utf-8"))
+    payload = strict_json_loads(STATE_FILE.read_text(encoding="utf-8"), str(STATE_FILE))
     if payload.get("schema_version") != 1 or not isinstance(payload.get("departments"), dict):
         raise ValueError("会话启动状态版本无效")
+    validate_identity_registry(payload)
     return payload
+
+
+def validate_identity_registry(payload: dict) -> None:
+    departments = payload.get("departments")
+    if not isinstance(departments, dict) or not departments:
+        raise ValueError("会话启动状态未登记部门")
+    owners: dict[str, str] = {}
+
+    def register(raw: object, owner: str) -> None:
+        if not isinstance(raw, str):
+            raise ValueError(f"thread_id 类型无效: {owner}")
+        if not raw:
+            return
+        if len(raw) > 300 or raw.startswith("=") or any(char.isspace() for char in raw):
+            raise ValueError(f"thread_id 不可表示为归档回执: {owner}")
+        previous = owners.get(raw)
+        if previous is not None:
+            raise ValueError(f"thread_id 全局冲突: {raw}: {previous} / {owner}")
+        owners[raw] = owner
+
+    for department, item in departments.items():
+        if not isinstance(department, str) or not isinstance(item, dict) or item.get("step") not in STEPS:
+            raise ValueError(f"会话启动状态部门条目无效: {department}")
+        current_thread = item.get("thread_id", "")
+        previous_thread = item.get("previous_thread_id", "")
+        operation_id = item.get("operation_id", "")
+        failed_from = item.get("failed_from", "")
+        for label, thread_id in (("thread_id", current_thread), ("previous_thread_id", previous_thread)):
+            if isinstance(thread_id, str) and thread_id and (
+                len(thread_id) > 300
+                or thread_id.startswith("=")
+                or any(char.isspace() for char in thread_id)
+            ):
+                raise ValueError(f"会话 {label} 不可表示为归档回执: {department}")
+        if not isinstance(operation_id, str) or not operation_id:
+            raise ValueError(f"会话 operation_id 无效: {department}")
+        if previous_thread and not operation_id.startswith("SWITCH-"):
+            raise ValueError(f"待收口旧会话缺少 SWITCH 事务: {department}")
+        if operation_id.startswith("SWITCH-") and not previous_thread:
+            raise ValueError(f"SWITCH 事务缺少 previous_thread_id: {department}")
+        if item["step"] == "pending" and current_thread:
+            raise ValueError(f"pending 会话不得预先占用 thread_id: {department}")
+        if item["step"] in {"created", "onboarded", "registered"} and not current_thread:
+            raise ValueError(f"{item['step']} 会话缺少 thread_id: {department}")
+        if item["step"] == "failed":
+            if failed_from not in {"pending", "created", "onboarded"}:
+                raise ValueError(f"failed 会话缺少可恢复的 failed_from: {department}")
+            if (failed_from == "pending") == bool(current_thread):
+                raise ValueError(f"failed 会话的 thread_id 与 failed_from 矛盾: {department}")
+        elif failed_from:
+            raise ValueError(f"非 failed 会话不得保留 failed_from: {department}")
+        register(current_thread, f"正式部门:{department}:current")
+        register(previous_thread, f"正式部门:{department}:previous")
+
+    if TASKS.is_symlink():
+        raise ValueError("tasks 目录不能是符号链接")
+    if not TASKS.exists():
+        return
+    if not TASKS.is_dir():
+        raise ValueError("tasks 路径不是普通目录")
+    for path in sorted(TASKS.glob("TASK-*.json")):
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"TASK 路径不安全: {path.name}")
+        task = strict_json_loads(path.read_text(encoding="utf-8"), str(path))
+        if not isinstance(task, dict):
+            raise ValueError(f"TASK 根节点无效: {path.name}")
+        temporary = task.get("temporary_executor")
+        if not isinstance(temporary, dict):
+            continue
+        session = temporary.get("temporary_session")
+        if not isinstance(session, dict):
+            raise ValueError(f"临时会话登记结构无效: {path.name}")
+        register(session.get("thread_id", ""), f"临时外包:{task.get('task_id', path.stem)}")
 
 
 def write_atomic(path: Path, data: bytes, mode: int) -> None:
@@ -2041,6 +2582,7 @@ def refresh_registry(payload: dict) -> None:
 
 
 def save(payload: dict) -> None:
+    validate_identity_registry(payload)
     data = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     write_atomic(STATE_FILE, data, 0o600)
     try:
@@ -2083,7 +2625,9 @@ def cmd_mark(args) -> int:
         raise ValueError(f"非法会话状态转换: {current} -> {args.step}")
     evidence = clean("evidence", args.evidence)
     if args.step == "created":
-        item["thread_id"] = clean("thread-id", args.thread_id)
+        if item.get("thread_id"):
+            raise ValueError("created 不能覆盖已登记的 thread-id")
+        item["thread_id"] = clean_thread_id(args.thread_id)
     elif args.step in {"onboarded", "registered"}:
         if not args.thread_id or args.thread_id != item.get("thread_id"):
             raise ValueError("onboarded / registered 必须提供与已记录值一致的 thread-id")
@@ -2107,6 +2651,8 @@ def cmd_begin_switch(args) -> int:
     item = entry(payload, args.department)
     if item["step"] != "registered" or item.get("thread_id") != args.old_thread_id:
         raise ValueError("只能从已登记且 ID 匹配的旧会话开始换班")
+    if item.get("previous_thread_id") or item.get("operation_id", "").startswith("SWITCH-"):
+        raise ValueError("上一次换班尚未收口，不能覆盖 previous_thread_id")
     item["previous_thread_id"] = item["thread_id"]
     item["thread_id"] = ""
     item["step"] = "pending"
@@ -2125,10 +2671,28 @@ def cmd_restore_old(args) -> int:
         raise ValueError("当前不是换班操作")
     if not item.get("previous_thread_id") or item["step"] not in {"pending", "failed", "created", "onboarded", "registered"}:
         raise ValueError("没有可恢复的旧会话")
+    note = clean("note", args.note)
+    new_thread_id = item.get("thread_id", "")
+    archive_evidence = args.evidence.strip()
+    if new_thread_id:
+        if not archive_evidence or not valid_archive_receipt(archive_evidence, new_thread_id):
+            raise ValueError(
+                "restore-old 在新会话已创建后，必须提供精确绑定新 thread_id 的归档回执"
+            )
+        evidence = clean("evidence", archive_evidence)
+    else:
+        if item["step"] not in {"pending", "failed"}:
+            raise ValueError("无新 thread_id 时只能从创建前失败恢复旧会话")
+        if item["step"] == "failed" and item.get("failed_from") != "pending":
+            raise ValueError("当前失败阶段已应存在新 thread_id，拒绝猜测恢复")
+        evidence = note
     item["thread_id"] = item["previous_thread_id"]
     item["previous_thread_id"] = ""
     item["step"] = "registered"
-    item["note"] = clean("note", args.note)
+    item["failed_from"] = ""
+    item["operation_id"] = "ACTIVE-" + uuid.uuid4().hex[:10].upper()
+    item["note"] = note
+    item["evidence"] = evidence
     item["updated_at"] = now_iso()
     save(payload)
     print(f"SESSION_RESTORED | {args.department} | {item['thread_id']}")
@@ -2142,9 +2706,16 @@ def cmd_finish_switch(args) -> int:
         raise ValueError("当前不是换班操作")
     if item["step"] != "registered" or item.get("thread_id") != args.new_thread_id or not item.get("previous_thread_id"):
         raise ValueError("新会话尚未登记或换班状态不完整")
+    evidence = clean("evidence", args.evidence)
+    if not valid_archive_receipt(evidence, item["previous_thread_id"]):
+        raise ValueError(
+            "finish-switch 归档回执必须精确绑定 previous_thread_id、包含 archived=true，"
+            "并注明 host 或 user_confirmation"
+        )
     item["previous_thread_id"] = ""
     item["operation_id"] = "ACTIVE-" + uuid.uuid4().hex[:10].upper()
-    item["note"] = clean("evidence", args.evidence)
+    item["note"] = evidence
+    item["evidence"] = evidence
     item["updated_at"] = now_iso()
     save(payload)
     print(f"SESSION_SWITCH_DONE | {args.department} | {item['thread_id']}")
@@ -2182,6 +2753,7 @@ def main() -> int:
     restore = sub.add_parser("restore-old")
     restore.add_argument("--department", required=True)
     restore.add_argument("--note", required=True)
+    restore.add_argument("--evidence", default="")
     restore.set_defaults(func=cmd_restore_old)
     finish = sub.add_parser("finish-switch")
     finish.add_argument("--department", required=True)
@@ -2714,7 +3286,7 @@ def session_startup_markdown(roles: list[str], session_mode: str, date: str) -> 
 - 用户授权后先执行 `agent_team_session.py begin-switch --department ... --old-thread-id ...`;旧会话再更新 `交接班文档.md` 和必要日志。没有已登记旧 ID 时不得自动归档。
 - 使用当前宿主提供的会话管理能力创建同项目新会话并发送接班消息;具体工具由 Agent 按当前环境选择。不要用复制旧聊天历史的 fork。
 - 新会话接班消息必须带部门名、新旧会话 ID 和四文档路径;读取成功后依次用 `mark --step created / onboarded / registered --evidence ...` 登记同一新 thread ID。
-- 旧会话归档必须最后执行。归档成功后运行 `finish-switch --department ... --new-thread-id ... --evidence "归档收据"` 清理旧 ID。创建、发消息、接班、登记或归档失败时执行 `restore-old --department ... --note "真实错误"`,保留旧会话并明确回报。
+- 旧会话归档必须最后执行。归档成功后运行 `finish-switch --department ... --new-thread-id ... --evidence "归档收据"` 清理旧 ID。新会话尚未创建时，失败可直接执行 `restore-old --department ... --note "真实错误"`。一旦已登记新 thread ID，不得直接覆盖；若确定放弃新会话并恢复旧会话，先归档新会话，再用 `restore-old ... --evidence "host=<真实工具> thread_id=<新ID> archived=true"` 登记收据；无归档能力时保留新旧两个 ID 并提醒用户，不得让任一会话从真值中消失。新会话已 registered 而只是旧会话归档失败时，保持当前换班状态并重试 `finish-switch`。
 
 ## 部门会话清单
 
@@ -2818,8 +3390,9 @@ docs/collaboration/
 7. 设计意图预览仅在用户明确提出或任务列为交付物时制作。触发后必须让用户直接看到，并说明与最终实现的保真差距。
 8. 会话变重时只说明具体症状、风险和当前任务，询问用户是否换班；用户未授权时不自动创建、登记或归档。
 9. 已有授权清楚的 `claimed` 任务且无冲突时，新会话短报接班状态后同一轮续做。
-10. 临时外包最终清理后直接看当前可用工具。有归档工具时立即调用,成功后用 `agent_team_temporary.py session-mark --state archived --evidence "host=<真实工具> thread_id=<真实ID> archived=true"` 登记;调用失败或没有工具时提醒用户:“我目前无法自动归档这个会话。请你手动归档临时外包会话「<会话名称>」（会话 ID：<真实ID>）,归档完成后告诉我一声。”提醒不阻断其他安全工作;用户未确认前保持 `temporary_session=standby`,之后收到明确确认再用 `user_confirmation=<确认指针> thread_id=<真实ID> archived=true` 登记。
-11. `LOG_OK` 只用于 `MILESTONE / CHANGE / CORRECTION / DECISION / INCIDENT`，普通任务不凑日志。
+10. 换班中一旦已登记新 thread ID，`restore-old` 必须带精确绑定新 ID 的归档回执；否则保留新旧两个 ID。执行中的 SWITCH 未收口前不得再次 `begin-switch`。
+11. 临时外包最终清理后直接看当前可用工具。有归档工具时立即调用,成功后用 `agent_team_temporary.py session-mark --state archived --evidence "host=<真实工具> thread_id=<真实ID> archived=true"` 登记;调用失败或没有工具时提醒用户:“我目前无法自动归档这个会话。请你手动归档临时外包会话「<会话名称>」（会话 ID：<真实ID>）,归档完成后告诉我一声。”提醒不阻断其他安全工作;用户未确认前保持 `temporary_session=standby`,之后收到明确确认再用 `user_confirmation=<确认指针> thread_id=<真实ID> archived=true` 登记。
+12. `LOG_OK` 只用于 `MILESTONE / CHANGE / CORRECTION / DECISION / INCIDENT`，普通任务不凑日志。
 
 ## 报告
 
@@ -3226,12 +3799,14 @@ def recover_add_roles_transaction(collab: Path, *, announce: bool = True) -> boo
         return False
     if marker.is_symlink() or not marker.is_file():
         raise ValueError(f"{ADD_TRANSACTION_FILE} 不是安全的普通文件")
-    payload = json.loads(read_utf8(marker))
+    payload = strict_json_loads(read_utf8(marker), source=str(marker))
     if payload.get("schema_version") != 1 or payload.get("kind") != "add_roles":
         raise ValueError("新增部门事务标记版本无效")
     originals = payload.get("originals")
     created_roles = payload.get("created_roles")
-    allowed_files = {"部门表.md", "会话启动清单.md", "路由表.md", "会话启动状态.json"}
+    allowed_files = {
+        PROTOCOL_FILE, "部门表.md", "会话启动清单.md", "路由表.md", "会话启动状态.json",
+    }
     if not isinstance(originals, dict) or set(originals) != allowed_files:
         raise ValueError("新增部门事务备份不完整")
     if not isinstance(created_roles, list) or any(role not in ROLE_DEFS for role in created_roles):
@@ -3239,7 +3814,11 @@ def recover_add_roles_transaction(collab: Path, *, announce: bool = True) -> boo
     for name, content in originals.items():
         if not isinstance(content, str):
             raise ValueError("新增部门事务备份内容无效")
-        write_utf8_atomic(collab / name, content, mode=0o600 if name == "会话启动状态.json" else None)
+        write_utf8_atomic(
+            collab / name,
+            content,
+            mode=0o600 if name in {"会话启动状态.json", PROTOCOL_FILE} else None,
+        )
     depts_root = collab / "部门"
     if not plain_path_within(depts_root, collab, kind="dir"):
         raise ValueError("恢复时发现部门目录不安全")
@@ -3320,6 +3899,18 @@ def validate_upgrade_impact(value: object, source: Path) -> None:
         raise ValueError(f"任务影响声明结构无效: {source}")
     for field in ("write_paths", "shared_contracts", "external_effects"):
         validate_upgrade_task_list(value[field], f"impact.{field}", min_items=1 if field != "shared_contracts" else 0, max_chars=500)
+    for raw in value["write_paths"]:
+        normalized = raw.replace("\\", "/")
+        path = Path(normalized)
+        forbidden = (".git", ".agent-team", "docs/collaboration")
+        if (
+            path.is_absolute() or normalized in {".", ".."} or ".." in path.parts
+            or path.as_posix().rstrip("/") != raw
+            or any(raw == prefix or raw.startswith(prefix + "/") for prefix in forbidden)
+        ):
+            raise ValueError(f"任务影响声明 write_paths 无效: {source}")
+    if "none" in value["external_effects"] and value["external_effects"] != ["none"]:
+        raise ValueError(f"任务影响声明 external_effects 无效: {source}")
     validate_upgrade_task_text(value["base_revision"], "impact.base_revision", max_chars=300)
     validate_upgrade_task_text(value["owner_task"], "impact.owner_task", max_chars=100)
     if value["admission"] not in {"safe", "manual", "unsafe", "waiting_base"}:
@@ -3377,6 +3968,12 @@ def validate_upgrade_temporary(value: object, source: Path, department: str) -> 
         "provisioning", "awaiting_rule_confirmation", "active", "standby", "archived", "failed", "cancelled",
     }:
         raise ValueError(f"temporary_executor 会话状态无效: {source}")
+    if session["thread_id"] and (
+        len(session["thread_id"]) > 300
+        or session["thread_id"].startswith("=")
+        or any(char.isspace() for char in session["thread_id"])
+    ):
+        raise ValueError(f"temporary_executor thread_id 不可表示为归档回执: {source}")
     workspace = value["workspace"]
     if not isinstance(workspace, dict) or not all(isinstance(workspace.get(key), str) for key in ("path", "branch", "base_revision", "state")):
         raise ValueError(f"temporary_executor workspace 无效: {source}")
@@ -3484,6 +4081,29 @@ def validate_upgrade_temporary(value: object, source: Path, department: str) -> 
             or cleanup.get("state") != "verified"
         ):
             raise ValueError(f"temporary_executor archived 会话缺少真实收据或清理证据: {source}")
+    cleanup = value.get("cleanup_operation")
+    cleanup_state = cleanup.get("state") if isinstance(cleanup, dict) else None
+    cleanup_terminal = (
+        value["promotion_state"] == "archived"
+        and workspace.get("state") == "removed"
+        and cleanup_state == "verified"
+    )
+    if any((value["promotion_state"] == "archived", workspace.get("state") == "removed", cleanup_state == "verified")) and not cleanup_terminal:
+        raise ValueError(f"temporary_executor 资源终态不一致: {source}")
+    promotion_operation = value.get("promotion_operation")
+    if (
+        isinstance(promotion_operation, dict)
+        and promotion_operation.get("state") == "verified"
+        and value["promotion_state"] not in {"integrated", "archived"}
+    ):
+        raise ValueError(f"temporary_executor 已验证晋升事务与晋升状态不一致: {source}")
+    if cleanup_terminal:
+        if session.get("thread_id") and session.get("state") not in {"standby", "archived"}:
+            raise ValueError(f"temporary_executor 清理后真实会话状态无效: {source}")
+        if not session.get("thread_id") and session.get("state") != "cancelled":
+            raise ValueError(f"temporary_executor 清理后缺少 thread_id 且未标记 cancelled: {source}")
+    if session.get("state") == "cancelled" and (session.get("thread_id") or not cleanup_terminal):
+        raise ValueError(f"temporary_executor cancelled 只允许无真实会话且资源已清理: {source}")
 
 
 def validate_upgrade_task_payload(payload: object, source: Path, departments: set[str], expected_state: str | None) -> None:
@@ -3505,6 +4125,12 @@ def validate_upgrade_task_payload(payload: object, source: Path, departments: se
     task_id = validate_upgrade_task_text(payload["task_id"], "task_id")
     if task_id != source.stem or not UPGRADE_TASK_ID_RE.fullmatch(task_id):
         raise ValueError(f"任务 ID 与文件名不一致或格式无效: {source}")
+    impact = payload.get("impact_declaration")
+    if isinstance(impact, dict) and impact.get("owner_task") != task_id:
+        raise ValueError(f"任务影响声明 owner_task 与 TASK 不一致: {source}")
+    temporary = payload.get("temporary_executor")
+    if isinstance(temporary, dict) and (impact is None or temporary.get("impact") != impact):
+        raise ValueError(f"temporary_executor impact 与 TASK impact_declaration 不一致: {source}")
     department = validate_upgrade_task_text(payload["department"], "department")
     from_department = validate_upgrade_task_text(payload["from_department"], "from_department")
     if department not in departments or from_department not in departments:
@@ -3609,6 +4235,8 @@ def validate_upgrade_task_payload(payload: object, source: Path, departments: se
 
 def preflight_upgrade_tasks(collab: Path, roles: list[str]) -> None:
     tasks = collab / "tasks"
+    if tasks.is_symlink():
+        raise ValueError("tasks 路径不能是符号链接")
     if not tasks.exists():
         return
     if not plain_path_within(tasks, collab, kind="dir"):
@@ -3635,10 +4263,312 @@ def preflight_upgrade_tasks(collab: Path, roles: list[str]) -> None:
                 raise ValueError(f"任务迁移目标重复: {source.name}")
             seen_destinations.add(source.name)
             try:
-                payload = json.loads(read_utf8(source))
+                payload = strict_json_loads(read_utf8(source), source=str(source))
             except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                 raise ValueError(f"任务 JSON 损坏: {source}: {exc}") from exc
             validate_upgrade_task_payload(payload, source, departments, expected_state)
+
+
+def iter_upgrade_task_payloads(collab: Path) -> list[tuple[Path, dict]]:
+    tasks = collab / "tasks"
+    if tasks.is_symlink():
+        raise ValueError("tasks 路径不能是符号链接")
+    if not tasks.exists():
+        return []
+    if not plain_path_within(tasks, collab, kind="dir"):
+        raise ValueError("tasks 路径不安全")
+    result: list[tuple[Path, dict]] = []
+    for entry in sorted(tasks.iterdir()):
+        candidates = sorted(entry.iterdir()) if entry.is_dir() else [entry]
+        for source in candidates:
+            if source.is_symlink() or not source.is_file() or not source.name.startswith("TASK-") or source.suffix != ".json":
+                raise ValueError(f"任务路径不安全: {source}")
+            payload = strict_json_loads(read_utf8(source), source=str(source))
+            if not isinstance(payload, dict):
+                raise ValueError(f"任务根节点必须是 JSON 对象: {source}")
+            result.append((source, payload))
+    return result
+
+
+def validate_session_thread_identities(state_payload: dict, task_payloads: list[tuple[Path, dict]]) -> None:
+    owners: dict[str, str] = {}
+
+    def register(value: object, owner: str) -> None:
+        if not isinstance(value, str):
+            raise ValueError(f"thread_id 类型无效: {owner}")
+        if not value:
+            return
+        if len(value) > 300 or value.startswith("=") or any(char.isspace() for char in value):
+            raise ValueError(f"thread_id 不可表示为归档回执: {owner}")
+        previous = owners.get(value)
+        if previous is not None:
+            raise ValueError(f"thread_id 全局冲突: {value}: {previous} / {owner}")
+        owners[value] = owner
+
+    for department, item in state_payload["departments"].items():
+        register(item.get("thread_id", ""), f"正式部门:{department}:current")
+        register(item.get("previous_thread_id", ""), f"正式部门:{department}:previous")
+    for source, task in task_payloads:
+        temporary = task.get("temporary_executor")
+        if not isinstance(temporary, dict):
+            continue
+        session = temporary.get("temporary_session")
+        if not isinstance(session, dict):
+            raise ValueError(f"临时会话结构无效: {source}")
+        register(session.get("thread_id", ""), f"临时外包:{task.get('task_id', source.stem)}")
+
+
+def migrated_session_state(
+    collab: Path,
+    roles: list[str],
+    registry_text: str,
+    date: str,
+    session_mode: str,
+    task_payloads: list[tuple[Path, dict]],
+) -> dict:
+    state_path = collab / "会话启动状态.json"
+    if state_path.is_symlink():
+        raise ValueError("会话启动状态不能是符号链接")
+    expected_departments = {ROLE_DEFS[key]["name"]: key for key in roles}
+    if state_path.exists():
+        if not plain_path_within(state_path, collab, kind="file"):
+            raise ValueError("会话启动状态路径不安全")
+        source_payload = strict_json_loads(read_utf8(state_path), source=str(state_path))
+        if not isinstance(source_payload, dict) or source_payload.get("schema_version") != 1:
+            raise ValueError("会话启动状态版本无效")
+        source_departments = source_payload.get("departments")
+        if not isinstance(source_departments, dict) or set(source_departments) != set(expected_departments):
+            raise ValueError("会话启动状态与部门表的部门集合不一致")
+        departments: dict[str, dict[str, str]] = {}
+        for department, role_id in expected_departments.items():
+            item = source_departments[department]
+            if not isinstance(item, dict) or item.get("role_id") != role_id:
+                raise ValueError(f"会话启动状态角色无效: {department}")
+            step = item.get("step")
+            if step not in {"pending", "created", "onboarded", "registered", "failed"}:
+                raise ValueError(f"会话启动状态 step 无效: {department}")
+            notification_mode = item.get("notification_mode", session_mode)
+            if notification_mode not in {"auto", "manual"}:
+                raise ValueError(f"会话通知模式无效: {department}")
+            migrated: dict[str, str] = {
+                "role_id": role_id,
+                "notification_mode": notification_mode,
+                "step": step,
+            }
+            defaults = {
+                "thread_id": "",
+                "previous_thread_id": "",
+                "failed_from": "",
+                "evidence": "",
+                "operation_id": "MIGRATE-" + hashlib.sha256(f"{department}:{date}".encode("utf-8")).hexdigest()[:10].upper(),
+                "note": "",
+                "updated_at": date,
+            }
+            for field, default in defaults.items():
+                value = item.get(field, default)
+                if not isinstance(value, str):
+                    raise ValueError(f"会话启动状态 {field} 类型无效: {department}")
+                migrated[field] = value
+            if migrated["previous_thread_id"] and "operation_id" not in item:
+                migrated["operation_id"] = (
+                    "SWITCH-MIGRATE-"
+                    + hashlib.sha256(f"{department}:{date}:switch".encode("utf-8")).hexdigest()[:10].upper()
+                )
+            validate_session_item_lifecycle(migrated, department)
+            departments[department] = migrated
+        payload = {
+            "schema_version": 1,
+            "protocol_version": PROTOCOL_VERSION,
+            "updated_at": source_payload.get("updated_at") if isinstance(source_payload.get("updated_at"), str) else date,
+            "departments": departments,
+        }
+    else:
+        payload = strict_json_loads(
+            session_state_payload(roles, date, session_mode), source="generated legacy fallback session state",
+        )
+        if not isinstance(payload, dict):
+            raise ValueError("生成的会话状态无效")
+        session_data = registry_session_data(registry_text)
+        notification_map = {"自动": "auto", "人工": "manual"}
+        for key, saved in session_data.items():
+            item = payload["departments"].get(ROLE_DEFS[key]["name"])
+            if item is None:
+                continue
+            saved_notification = saved.get("notification", "")
+            if saved_notification not in {"", "待登记", "-"}:
+                notification = notification_map.get(saved_notification, saved_notification)
+                if notification not in {"auto", "manual"}:
+                    raise ValueError(f"旧部门表通知模式无效: {key}")
+                item["notification_mode"] = notification
+            session_id = saved.get("session_id", "")
+            if session_id and session_id not in {"待登记", "-"}:
+                item["thread_id"] = session_id
+                item["step"] = "registered"
+                item["note"] = "仅因旧协议确实缺失会话状态文件，从部门表降级恢复"
+    validate_session_thread_identities(payload, task_payloads)
+    return payload
+
+
+def registry_data_from_session_state(payload: dict) -> dict[str, dict[str, str]]:
+    status_labels = {
+        "pending": "待启用",
+        "created": "上岗中",
+        "onboarded": "上岗中",
+        "registered": "已启用",
+        "failed": "失败",
+    }
+    result: dict[str, dict[str, str]] = {}
+    for department, item in payload["departments"].items():
+        result[item["role_id"]] = {
+            "session_id": item.get("thread_id") or "待登记",
+            "notification": item["notification_mode"],
+            "status": status_labels[item["step"]],
+        }
+    return result
+
+
+def scan_archive_recovery_actions(
+    task_payloads: list[tuple[Path, dict]], previous_protocol_version: str | None,
+) -> tuple[list[tuple[Path, str, str]], list[tuple[str, str]]]:
+    repairs: list[tuple[Path, str, str]] = []
+    pending: list[tuple[str, str]] = []
+    for source, payload in task_payloads:
+        temporary = payload.get("temporary_executor")
+        if not isinstance(temporary, dict):
+            continue
+        session = temporary.get("temporary_session")
+        if not isinstance(session, dict):
+            continue
+        thread_id = session.get("thread_id", "")
+        if session.get("state") == "archived":
+            if thread_id and valid_archive_receipt(session.get("evidence", ""), thread_id):
+                continue
+            if previous_protocol_version == PROTOCOL_VERSION:
+                raise ValueError(f"当前协议 archived 会话缺少精确归档回执: {payload.get('task_id', source.stem)}")
+            repairs.append((source, payload["task_id"], thread_id))
+        elif (
+            session.get("state") == "standby"
+            and thread_id
+            and temporary.get("promotion_state") == "archived"
+            and isinstance(temporary.get("workspace"), dict)
+            and temporary["workspace"].get("state") == "removed"
+            and isinstance(temporary.get("cleanup_operation"), dict)
+            and temporary["cleanup_operation"].get("state") == "verified"
+        ):
+            pending.append((payload["task_id"], thread_id))
+    return repairs, pending
+
+
+def emit_pending_archive_actions(actions: list[tuple[str, str]]) -> None:
+    for task_id, thread_id in actions:
+        print(
+            f"ARCHIVE_THREAD_REQUIRED:{thread_id} | task:{task_id}"
+            f" | reason:existing-standby-archive"
+        )
+
+
+def upgrade_backup_record(path: Path, backup: Path | None) -> dict[str, object]:
+    if backup is None:
+        return {"backup": None, "sha256": None, "mode": None}
+    data = backup.read_bytes()
+    return {
+        "backup": backup,
+        "sha256": hashlib.sha256(data).hexdigest(),
+        "mode": stat.S_IMODE(backup.stat().st_mode),
+    }
+
+
+def write_upgrade_rollback_manifest(
+    backup_root: Path,
+    project: Path,
+    originals: dict[Path, dict[str, object]],
+    directory_modes: dict[Path, int | None],
+) -> None:
+    entries = []
+    for path, record in sorted(originals.items(), key=lambda item: str(item[0])):
+        backup = record["backup"]
+        entries.append({
+            "target": path.relative_to(project).as_posix(),
+            "existed": backup is not None,
+            "backup": backup.relative_to(backup_root).as_posix() if isinstance(backup, Path) else None,
+            "sha256": record["sha256"],
+            "mode": f"{record['mode']:04o}" if isinstance(record["mode"], int) else None,
+        })
+    directories = [
+        {
+            "target": path.relative_to(project).as_posix(),
+            "existed": mode is not None,
+            "mode": f"{mode:04o}" if mode is not None else None,
+        }
+        for path, mode in sorted(directory_modes.items(), key=lambda item: str(item[0]))
+    ]
+    payload = {"schema_version": 1, "files": entries, "directories": directories}
+    write_utf8_atomic(
+        backup_root / "rollback-manifest.json",
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        mode=0o600,
+    )
+
+
+def restore_upgrade_originals(
+    originals: dict[Path, dict[str, object]], directory_modes: dict[Path, int | None],
+) -> None:
+    failures: list[str] = []
+    for path, record in sorted(originals.items(), key=lambda item: len(item[0].parts), reverse=True):
+        backup = record["backup"]
+        try:
+            if backup is None:
+                if path.exists() or path.is_symlink():
+                    if path.is_dir() and not path.is_symlink():
+                        raise ValueError("本应不存在的恢复目标变成了目录")
+                    path.unlink()
+            else:
+                if not isinstance(backup, Path) or backup.is_symlink() or not backup.is_file():
+                    raise ValueError("备份文件缺失或不安全")
+                data = backup.read_bytes()
+                expected_sha = record["sha256"]
+                mode = record["mode"]
+                if hashlib.sha256(data).hexdigest() != expected_sha or not isinstance(mode, int):
+                    raise ValueError("备份哈希或权限记录不一致")
+                write_bytes_atomic(path, data, mode=mode)
+            if backup is None:
+                if path.exists() or path.is_symlink():
+                    raise ValueError("未能恢复为不存在")
+            else:
+                if not path.is_file() or path.is_symlink():
+                    raise ValueError("恢复目标不是普通文件")
+                if hashlib.sha256(path.read_bytes()).hexdigest() != record["sha256"]:
+                    raise ValueError("恢复后哈希不一致")
+                if os.name != "nt" and stat.S_IMODE(path.stat().st_mode) != record["mode"]:
+                    raise ValueError("恢复后权限不一致")
+        except (OSError, ValueError) as exc:
+            failures.append(f"{path}: {exc}")
+    for path, expected_mode in sorted(directory_modes.items(), key=lambda item: len(item[0].parts), reverse=True):
+        try:
+            if path.is_symlink():
+                raise ValueError("恢复目录变成了符号链接")
+            if expected_mode is None:
+                if path.exists():
+                    if not path.is_dir():
+                        raise ValueError("本应不存在的目录恢复目标不是目录")
+                    path.rmdir()
+                if path.exists() or path.is_symlink():
+                    raise ValueError("未能移除升级新建目录")
+                continue
+            if not path.exists():
+                if path.parent.is_symlink():
+                    raise ValueError("恢复目录的父路径不能是符号链接")
+                path.mkdir(parents=True, exist_ok=True)
+            if not path.is_dir() or path.is_symlink():
+                raise ValueError("恢复目标不是普通目录")
+            if os.name != "nt":
+                os.chmod(path, expected_mode)
+                if stat.S_IMODE(path.stat().st_mode) != expected_mode:
+                    raise ValueError("恢复后目录权限不一致")
+        except (OSError, ValueError) as exc:
+            failures.append(f"{path}: {exc}")
+    if failures:
+        raise RuntimeError("回滚逐项校验失败: " + " | ".join(failures))
 
 
 def run_upgrade(collab: Path) -> int:
@@ -3651,53 +4581,43 @@ def run_upgrade(collab: Path) -> int:
     except ValueError as exc:
         print(f"升级已停止:任务真值未通过完整性预检: {exc}", file=sys.stderr)
         return 9
-    previous_protocol_version = read_protocol_version(collab)
+    try:
+        previous_protocol_version = read_protocol_version_for_upgrade(collab)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"升级已停止:协议版本真值无效: {exc}", file=sys.stderr)
+        return 9
+    date = dt.date.today().isoformat()
+    profile = registry_value(registry_text, "项目类型", "已有项目")
+    session_mode = registry_value(registry_text, "会话创建模式", "manual")
+    if session_mode not in {"auto", "manual"}:
+        session_mode = "manual"
+    try:
+        task_payloads = iter_upgrade_task_payloads(collab)
+        state_payload = migrated_session_state(
+            collab, roles, registry_text, date, session_mode, task_payloads,
+        )
+        legacy_archive_repairs, pending_archive_actions = scan_archive_recovery_actions(
+            task_payloads, previous_protocol_version,
+        )
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"升级已停止:会话或归档真值未通过预检: {exc}", file=sys.stderr)
+        return 9
     if previous_protocol_version == PROTOCOL_VERSION and current_runtime_complete(collab):
         print(f"UPGRADE_NOT_NEEDED | protocol:{PROTOCOL_VERSION}")
+        emit_pending_archive_actions(pending_archive_actions)
         return 0
-    legacy_archive_repairs: list[tuple[Path, str, str]] = []
-    pending_archive_actions: list[tuple[str, str]] = []
-    tasks_root = collab / "tasks"
-    if previous_protocol_version != PROTOCOL_VERSION and tasks_root.exists():
-        for entry in tasks_root.iterdir():
-            candidates = list(entry.iterdir()) if entry.is_dir() else [entry]
-            for source in candidates:
-                if not source.is_file() or not source.name.startswith("TASK-") or source.suffix != ".json":
-                    continue
-                payload = json.loads(read_utf8(source))
-                temporary = payload.get("temporary_executor")
-                if not isinstance(temporary, dict):
-                    continue
-                session = temporary.get("temporary_session")
-                if isinstance(session, dict) and session.get("state") == "archived":
-                    thread_id = session.get("thread_id", "")
-                    verified_recent_receipt = (
-                        previous_protocol_version in {"1.4.3", "1.4.4"}
-                        and bool(thread_id)
-                        and valid_archive_receipt(session.get("evidence", ""), thread_id)
-                    )
-                    if not verified_recent_receipt:
-                        legacy_archive_repairs.append((source, payload["task_id"], thread_id))
-                elif (
-                    isinstance(session, dict)
-                    and session.get("state") == "standby"
-                    and session.get("thread_id")
-                    and temporary.get("promotion_state") == "archived"
-                    and isinstance(temporary.get("workspace"), dict)
-                    and temporary["workspace"].get("state") == "removed"
-                    and isinstance(temporary.get("cleanup_operation"), dict)
-                    and temporary["cleanup_operation"].get("state") == "verified"
-                ):
-                    pending_archive_actions.append((payload["task_id"], session["thread_id"]))
-    date = dt.date.today().isoformat()
-    session_data = registry_session_data(registry_text)
+
     pending_legacy = []
     for key in roles:
-        inbox = collab / "部门" / ROLE_DEFS[key]["name"] / "收件箱.md"
-        if not plain_path_within(inbox, collab, kind="file"):
-            print(f"收件箱缺失或路径不安全: {inbox}", file=sys.stderr)
+        department = collab / "部门" / ROLE_DEFS[key]["name"]
+        if not plain_path_within(department, collab, kind="dir"):
+            print(f"部门目录缺失或不安全: {department}", file=sys.stderr)
             return 3
-        if legacy_inbox_has_tasks(read_utf8(inbox)):
+        inbox = department / "收件箱.md"
+        if inbox.is_symlink() or (inbox.exists() and not plain_path_within(inbox, collab, kind="file")):
+            print(f"收件箱路径不安全: {inbox}", file=sys.stderr)
+            return 3
+        if inbox.exists() and legacy_inbox_has_tasks(read_utf8(inbox)):
             pending_legacy.append(ROLE_DEFS[key]["name"])
     if pending_legacy:
         print(
@@ -3708,28 +4628,19 @@ def run_upgrade(collab: Path) -> int:
         )
         return 9
 
-    profile = registry_value(registry_text, "项目类型", "已有项目")
-    session_mode = registry_value(registry_text, "会话创建模式", "manual")
-    if session_mode not in {"auto", "manual"}:
-        session_mode = "manual"
-    state_payload = json.loads(session_state_payload(roles, date, session_mode))
-    for key, saved in session_data.items():
-        item = state_payload["departments"].get(ROLE_DEFS[key]["name"])
-        if item is None:
-            continue
-        session_id = saved.get("session_id", "")
-        saved_notification = saved.get("notification", "")
-        notification_map = {"自动": "auto", "人工": "manual"}
-        if saved_notification not in {"", "待登记", "-"}:
-            item["notification_mode"] = notification_map.get(saved_notification, saved_notification)
-        if session_id and session_id not in {"待登记", "-"}:
-            item["thread_id"] = session_id
-            item["step"] = "registered"
-            item["note"] = "从升级前部门表恢复"
+    session_data = registry_data_from_session_state(state_payload)
     scripts_root = collab / "scripts"
     backup_parent = collab / "升级备份"
-    for directory, label in ((scripts_root, "scripts"), (backup_parent, "升级备份")):
-        if directory.exists() and not plain_path_within(directory, collab, kind="dir"):
+    guarded_directories = (
+        (scripts_root, "scripts"),
+        (backup_parent, "升级备份"),
+        (collab / ".locks", ".locks"),
+        (collab / "tasks", "tasks"),
+        (collab / "模板", "模板"),
+        (collab / "专项结论", "专项结论"),
+    )
+    for directory, label in guarded_directories:
+        if directory.is_symlink() or (directory.exists() and not plain_path_within(directory, collab, kind="dir")):
             print(f"{label} 目录越界、经过符号链接或不是普通目录,已拒绝升级。", file=sys.stderr)
             return 3
     managed: dict[Path, tuple[str, int | None]] = {
@@ -3748,6 +4659,12 @@ def run_upgrade(collab: Path) -> int:
         collab / "scripts" / "agent_team_session.py": (session_state_script(), 0o755),
         collab / "scripts" / "agent_team_temporary.py": (temporary_executor_script(), 0o755),
     }
+    mistakes = collab / "错题集.md"
+    if mistakes.is_symlink() or (mistakes.exists() and not plain_path_within(mistakes, collab, kind="file")):
+        print("错题集路径不安全，已拒绝升级。", file=sys.stderr)
+        return 3
+    if not mistakes.exists():
+        managed[mistakes] = (cuoti_markdown(date), None)
     obsolete = [collab / "读取路由规则.md", collab / "scripts" / "agent_team_read.py"]
     for key in roles:
         role = ROLE_DEFS[key]
@@ -3757,8 +4674,14 @@ def run_upgrade(collab: Path) -> int:
             return 3
         managed[department / "岗位说明.md"] = (role_markdown(key, role, date), None)
         managed[department / "上岗引导.md"] = (bootstrap_markdown(key, role), None)
+        handoff = department / "交接班文档.md"
+        if handoff.is_symlink() or (handoff.exists() and not plain_path_within(handoff, collab, kind="file")):
+            print(f"交接班文档路径不安全: {handoff}", file=sys.stderr)
+            return 3
+        if not handoff.exists():
+            managed[handoff] = (state_markdown(key, role, date), None)
         inbox = department / "收件箱.md"
-        if "<!-- agent-team task index; use scripts/agent_team_task.py -->" not in read_utf8(inbox):
+        if not inbox.exists() or "<!-- agent-team task index; use scripts/agent_team_task.py -->" not in read_utf8(inbox):
             managed[inbox] = (inbox_markdown(key, role, date), None)
 
     operation_id = "UPGRADE-" + dt.datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8].upper()
@@ -3776,25 +4699,40 @@ def run_upgrade(collab: Path) -> int:
     except OSError as exc:
         print(f"无法创建升级备份: {exc}", file=sys.stderr)
         return 6
-    originals: dict[Path, Path | None] = {}
+    originals: dict[Path, dict[str, object]] = {}
+    rollback_directories = (
+        collab / "tasks",
+        collab / ".locks",
+        collab / "scripts",
+        collab / "模板",
+        collab / "专项结论",
+    )
+    directory_modes: dict[Path, int | None] = {
+        path: stat.S_IMODE(path.stat().st_mode) if path.exists() else None
+        for path in rollback_directories
+    }
     migrated_task_destinations: list[Path] = []
     try:
         tasks = collab / "tasks"
         legacy_tasks: list[tuple[Path, Path]] = []
+        if tasks.is_symlink():
+            raise ValueError("tasks 路径不能是符号链接")
         if tasks.exists():
             if tasks.is_symlink() or not tasks.is_dir() or not plain_path_within(tasks, collab, kind="dir"):
                 raise ValueError("tasks 路径不安全")
             for state in ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged"):
                 state_dir = tasks / state
                 if not state_dir.exists():
+                    directory_modes[state_dir] = None
                     continue
                 if state_dir.is_symlink() or not state_dir.is_dir() or not plain_path_within(state_dir, collab, kind="dir"):
                     raise ValueError(f"任务状态目录不安全: {state}")
+                directory_modes[state_dir] = stat.S_IMODE(state_dir.stat().st_mode)
                 for source in state_dir.iterdir():
                     if source.is_symlink() or not source.is_file() or not source.name.startswith("TASK-") or source.suffix != ".json":
                         raise ValueError(f"旧任务目录含非标准文件: {source}")
                     try:
-                        payload = json.loads(read_utf8(source))
+                        payload = strict_json_loads(read_utf8(source), source=str(source))
                     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
                         raise ValueError(f"旧任务 JSON 损坏: {source}: {exc}") from exc
                     if not isinstance(payload, dict) or payload.get("task_id") != source.stem:
@@ -3808,9 +4746,9 @@ def run_upgrade(collab: Path) -> int:
         if project_guide.exists():
             guide_backup = backup_root / "project-docs-agent-guide.md"
             shutil.copy2(project_guide, guide_backup)
-            originals[project_guide] = guide_backup
+            originals[project_guide] = upgrade_backup_record(project_guide, guide_backup)
         else:
-            originals[project_guide] = None
+            originals[project_guide] = upgrade_backup_record(project_guide, None)
         for path in [*managed, *obsolete]:
             if path.exists():
                 if path.is_symlink() or not path.is_file():
@@ -3819,15 +4757,16 @@ def run_upgrade(collab: Path) -> int:
                 backup = backup_root / relative
                 backup.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(path, backup)
-                originals[path] = backup
+                originals[path] = upgrade_backup_record(path, backup)
             else:
-                originals[path] = None
-        for source, _ in legacy_tasks:
+                originals[path] = upgrade_backup_record(path, None)
+        for source, destination in legacy_tasks:
             relative = source.relative_to(collab)
             backup = backup_root / relative
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, backup)
-            originals[source] = backup
+            originals[source] = upgrade_backup_record(source, backup)
+            originals[destination] = upgrade_backup_record(destination, None)
         legacy_sources = {source for source, _ in legacy_tasks}
         for source, _, _ in legacy_archive_repairs:
             if source in legacy_sources:
@@ -3836,13 +4775,16 @@ def run_upgrade(collab: Path) -> int:
             backup = backup_root / relative
             backup.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, backup)
-            originals[source] = backup
+            originals[source] = upgrade_backup_record(source, backup)
+        write_upgrade_rollback_manifest(backup_root, project, originals, directory_modes)
         locks = collab / ".locks"
         if locks.exists() and (locks.is_symlink() or not locks.is_dir()):
             raise ValueError(".locks 路径不安全")
         tasks.mkdir(exist_ok=True)
         locks.mkdir(mode=0o700, exist_ok=True)
         scripts_root.mkdir(exist_ok=True)
+        (collab / "模板").mkdir(exist_ok=True)
+        (collab / "专项结论").mkdir(exist_ok=True)
         if not plain_path_within(scripts_root, collab, kind="dir"):
             raise ValueError("scripts 目录不安全")
         for source, destination in legacy_tasks:
@@ -3855,7 +4797,7 @@ def run_upgrade(collab: Path) -> int:
         repair_time = dt.datetime.now().astimezone().isoformat(timespec="minutes")
         for source, _, thread_id in legacy_archive_repairs:
             destination = tasks / source.name
-            payload = json.loads(read_utf8(destination))
+            payload = strict_json_loads(read_utf8(destination), source=str(destination))
             session = payload["temporary_executor"]["temporary_session"]
             old_evidence = session.get("evidence", "")
             session["state"] = "standby"
@@ -3879,24 +4821,23 @@ def run_upgrade(collab: Path) -> int:
                     raise ValueError(f"废弃读取工具路径不安全: {path}")
                 path.unlink()
         append_agent_guide(project)
-        protocol_content, protocol_mode = managed[collab / PROTOCOL_FILE]
-        write_utf8_atomic(collab / PROTOCOL_FILE, protocol_content, mode=protocol_mode)
+        _, protocol_mode = managed[collab / PROTOCOL_FILE]
+        write_utf8_atomic(
+            collab / PROTOCOL_FILE,
+            protocol_payload(date, managed_manifest_from_disk(collab, roles)),
+            mode=protocol_mode,
+        )
     except Exception as exc:
-        for destination in migrated_task_destinations:
-            try:
-                destination.unlink(missing_ok=True)
-            except OSError:
-                pass
-        for path, backup in originals.items():
-            try:
-                if backup is None:
-                    path.unlink(missing_ok=True)
-                elif backup.exists():
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.copy2(backup, path)
-            except OSError:
-                pass
-        print(f"升级失败,已尝试从 {backup_root} 恢复: {exc}", file=sys.stderr)
+        try:
+            restore_upgrade_originals(originals, directory_modes)
+        except Exception as rollback_exc:
+            print(
+                f"升级失败，且回滚未完成: upgrade_error={exc}; rollback_error={rollback_exc}; "
+                f"backup={backup_root}",
+                file=sys.stderr,
+            )
+            return 10
+        print(f"升级失败，已按回滚清单原子恢复并逐项校验: {exc}; backup={backup_root}", file=sys.stderr)
         return 6
     print(f"UPGRADE_OK | {operation_id} | protocol:{PROTOCOL_VERSION} | backup:{backup_root}")
     for _, task_id, thread_id in legacy_archive_repairs:
@@ -3904,11 +4845,7 @@ def run_upgrade(collab: Path) -> int:
             f"ARCHIVE_THREAD_REQUIRED:{thread_id} | task:{task_id}"
             f" | reason:legacy-unverified-archive"
         )
-    for task_id, thread_id in pending_archive_actions:
-        print(
-            f"ARCHIVE_THREAD_REQUIRED:{thread_id} | task:{task_id}"
-            f" | reason:existing-standby-archive"
-        )
+    emit_pending_archive_actions(pending_archive_actions)
     return 0
 
 
@@ -3955,34 +4892,33 @@ def run_add_roles(collab: Path, add_roles: list[str]) -> int:
         startup = collab / "会话启动清单.md"
         routes = collab / "路由表.md"
         session_state = collab / "会话启动状态.json"
-        if not plain_path_within(routes, collab, kind="file") or not plain_path_within(session_state, collab, kind="file"):
+        protocol = collab / PROTOCOL_FILE
+        if (
+            not plain_path_within(routes, collab, kind="file")
+            or not plain_path_within(session_state, collab, kind="file")
+            or not plain_path_within(protocol, collab, kind="file")
+        ):
             print("协作层缺少当前版本的路由表或会话启动状态,请先执行升级。", file=sys.stderr)
             return 3
         try:
             startup_text = read_utf8(startup)
             routes_text = read_utf8(routes)
             session_text = read_utf8(session_state)
-            session_payload = json.loads(session_text)
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            protocol_text = read_utf8(protocol)
+            session_payload = strict_json_loads(session_text, source=str(session_state))
+        except (OSError, UnicodeError, ValueError) as exc:
             print(f"无法读取当前路由/会话状态: {exc}", file=sys.stderr)
             return 3
-        rows = registry_rows(new_roles)
-        new_block = "\n" + "\n".join(rows)
-        idx = registry_text.find(REGISTRY_RULES_MARKER)
-        updated_registry = registry_text if not new_roles else registry_text[:idx] + new_block + registry_text[idx:]
-        startup_rows = [
-            f"- {ROLE_DEFS[key]['name']} (`{key}`): `部门/{ROLE_DEFS[key]['name']}/上岗引导.md` · 会话 ID 待登记 · 通知模式待登记"
-            for key in new_roles
-        ]
-        updated_startup = startup_text
-        if startup_rows:
-            updated_startup = startup_text.rstrip() + "\n\n## 增量新增部门 · " + date + "\n\n" + "\n".join(startup_rows) + "\n"
         all_roles = existing_roles + [key for key in new_roles if key not in existing_roles]
-        updated_routes = route_table_markdown(all_roles, date)
-        departments_state = session_payload.get("departments")
-        if session_payload.get("schema_version") != 1 or not isinstance(departments_state, dict):
-            print("会话启动状态格式无效,已拒绝增量修改。", file=sys.stderr)
+        try:
+            session_roles = validate_current_session_payload(session_payload)
+        except ValueError as exc:
+            print(f"会话启动状态格式无效,已拒绝增量修改: {exc}", file=sys.stderr)
             return 3
+        if set(session_roles) != set(existing_roles):
+            print("会话启动状态与部门表的部门集合不一致,已拒绝增量修改。", file=sys.stderr)
+            return 3
+        departments_state = session_payload["departments"]
         notification_mode = registry_value(registry_text, "会话创建模式", "manual")
         if notification_mode not in {"auto", "manual"}:
             notification_mode = "manual"
@@ -4002,6 +4938,15 @@ def run_add_roles(collab: Path, add_roles: list[str]) -> int:
             }
         session_payload["protocol_version"] = PROTOCOL_VERSION
         session_payload["updated_at"] = date
+        profile = registry_value(registry_text, "项目类型", "已有项目")
+        session_data = registry_data_from_session_state(session_payload)
+        # 增量路径必须与同一天直接新建同样的团队收敛到同一份派生文档。
+        # 会话状态 JSON 才是真值，不再向部门表或启动清单追加一段“待登记”副本。
+        updated_registry = registry_markdown(
+            all_roles, profile, date, notification_mode, session_data,
+        )
+        updated_startup = session_startup_markdown(all_roles, notification_mode, date)
+        updated_routes = route_table_markdown(all_roles, date)
         updated_session = json.dumps(session_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         build_root = Path(tempfile.mkdtemp(prefix=".add-roles-build-", dir=collab))
         marker = collab / ADD_TRANSACTION_FILE
@@ -4016,6 +4961,7 @@ def run_add_roles(collab: Path, add_roles: list[str]) -> int:
                 "会话启动清单.md": startup_text,
                 "路由表.md": routes_text,
                 "会话启动状态.json": session_text,
+                PROTOCOL_FILE: protocol_text,
             },
         }
         try:
@@ -4030,6 +4976,11 @@ def run_add_roles(collab: Path, add_roles: list[str]) -> int:
             write_utf8_atomic(startup, updated_startup)
             write_utf8_atomic(routes, updated_routes)
             write_utf8_atomic(session_state, updated_session, mode=0o600)
+            write_utf8_atomic(
+                protocol,
+                protocol_payload(date, managed_manifest_from_disk(collab, all_roles)),
+                mode=0o600,
+            )
             marker.unlink()
             try:
                 directory_fd = os.open(collab, os.O_RDONLY)
@@ -4060,7 +5011,8 @@ def run_add_roles(collab: Path, add_roles: list[str]) -> int:
             print(f"- {LAYER_CN.get(role.get('layer', ''), '')} · {role['name']} ({key}) · {action}")
     if skipped:
         print(f"已存在跳过: {', '.join(skipped)}")
-    print("路由表与会话启动状态已同步;新部门保持 pending,实际上岗并登记会话 ID 后才启用。")
+    print("部门表、路由表、会话启动清单与会话状态已同步;"
+          "新部门保持 pending,实际上岗并登记会话 ID 后才启用。")
     return 0
 
 
@@ -4152,7 +5104,6 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
 
         # 先在同一文件系统的临时目录完整生成,再原子替换为 collaboration/,避免失败后留下半套协作层。
         build_collab = Path(tempfile.mkdtemp(prefix=".collaboration-build-", dir=docs_dir))
-        write_utf8_atomic(build_collab / PROTOCOL_FILE, protocol_payload(date), mode=0o600)
         write_utf8_atomic(build_collab / "README.md", readme_markdown(date))
         write_utf8_atomic(build_collab / "部门表.md", registry_markdown(roles, args.profile, date, args.session_mode))
         write_utf8_atomic(build_collab / "路由表.md", route_table_markdown(roles, date))
@@ -4185,6 +5136,11 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
         depts_root.mkdir(parents=True)
         for key in roles:
             create_department(depts_root, key, ROLE_DEFS[key], date)
+        write_utf8_atomic(
+            build_collab / PROTOCOL_FILE,
+            protocol_payload(date, managed_manifest_from_disk(build_collab, roles)),
+            mode=0o600,
+        )
         os.replace(build_collab, collab)
         build_collab = None
         collab_published = True

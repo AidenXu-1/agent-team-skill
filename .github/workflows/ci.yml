@@ -2,9 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
   pull_request:
-    branches: [main]
 
 jobs:
   verify:
@@ -22,6 +20,9 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
+      - name: Install validation dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
       - name: Compile scripts
         run: |
           python -m py_compile scripts/scaffold_team.py scripts/temporary_executor_runtime.py scripts/verify_agent_team.py
@@ -31,22 +32,34 @@ jobs:
           python - <<'PY'
           import re
           from pathlib import Path
+          import yaml
 
           text = Path("SKILL.md").read_text(encoding="utf-8")
           match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
           assert match, "SKILL.md frontmatter missing or malformed"
-          fields = {}
-          for line in match.group(1).splitlines():
-              if ":" in line and not line.startswith((" ", "\t")):
-                  key, value = line.split(":", 1)
-                  fields[key.strip()] = value.strip()
+          fields = yaml.safe_load(match.group(1))
+          assert isinstance(fields, dict), "frontmatter must be a YAML mapping"
           allowed = {"name", "description", "license", "allowed-tools", "metadata"}
           assert set(fields) <= allowed, f"unexpected frontmatter fields: {set(fields) - allowed}"
-          assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", fields.get("name", "")), "invalid skill name"
+          name = fields.get("name", "")
+          assert isinstance(name, str), "skill name must be a string"
+          assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name), "invalid skill name"
+          assert len(name) <= 64, "skill name exceeds 64 characters"
           description = fields.get("description", "")
+          assert isinstance(description, str), "skill description must be a string"
           assert description and len(description) <= 1024 and "<" not in description and ">" not in description, "invalid description"
           PY
 
       - name: Run verifier
         run: |
           python scripts/verify_agent_team.py
+
+      - name: Verify exact installed runtime bundle
+        run: |
+          install_root="${RUNNER_TEMP}/agent-team-installed"
+          mkdir -p "${install_root}/agents" "${install_root}/scripts"
+          cp SKILL.md "${install_root}/SKILL.md"
+          cp agents/openai.yaml "${install_root}/agents/openai.yaml"
+          cp scripts/scaffold_team.py "${install_root}/scripts/scaffold_team.py"
+          cp scripts/temporary_executor_runtime.py "${install_root}/scripts/temporary_executor_runtime.py"
+          python scripts/verify_agent_team.py --check-installed-copy "${install_root}"

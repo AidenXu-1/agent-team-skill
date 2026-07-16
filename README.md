@@ -1,8 +1,8 @@
 # Agent Team 2.0 Skill
 
-当前版本为 `2.0.1`。第一版继续保留在仓库的 `main` 分支；2.0 通过独立的 `v2.0.1` 标签发布，不覆盖第一版。
+当前产品与发布版本为 `2.0.1`，项目内运行协议为 `1.4.6`。前者对应安装包、Git 标签和 Release，后者对应生成协作层的数据与工具契约；协议说明文档另有自己的修订号。第一版继续保留在仓库的 `main` 分支；2.0 通过独立的 `v2.0.1` 标签发布，不覆盖第一版。
 
-`2.0.1` 修复两类临时任务收口问题：用户明确放弃后，正常清理或崩溃恢复会让普通 TASK 进入待统筹核收，同时保留“未交付、未集成、未发布”的事实边界；临时资源清理和真实会话归档改用两张独立收据。AI 当前有归档工具时直接代用户归档；没有时提醒用户归档具体会话，并请用户完成后告诉 AI 一声。
+`2.0.1` 的当前稳定性加固覆盖整条临时任务链：用户明确放弃后，正常清理或崩溃恢复会让普通 TASK 进入待统筹核收，同时保留“未交付、未集成、未发布”的事实边界；临时资源清理和真实会话归档使用两张独立收据，并可重复查询待归档动作。运行协议 `1.4.6` 还补齐正式与临时影响范围双向冲突及恢复/返工重检、thread ID 全局唯一与大小写精确绑定、归档回执可表示性、换班与临时会话重试不可覆盖已登记 ID、半完成事务先 reconcile、固定候选后新增 commit 拒绝、正式测试报告 frontmatter 精确证据、严格 JSON、增量部门收敛，以及同版本受管文件漂移、四文档缺件与升级回滚修复。AI 当前有归档工具时直接代用户归档；没有时提醒用户归档具体会话，并请用户完成后告诉 AI 一声。
 
 面向多 Agent / 多会话项目的轻量协作协议。它用项目文件保存长期真值，让会话可以安全接班，同时把管理、执行和独立审核分开。
 
@@ -114,8 +114,10 @@ docs/collaboration/
 ## 验证
 
 ```bash
+python3 -m pip install -r requirements-dev.txt
 python3 -m py_compile scripts/scaffold_team.py scripts/temporary_executor_runtime.py scripts/verify_agent_team.py
 python3 scripts/verify_agent_team.py
+python3 scripts/verify_agent_team.py --check-installed-copy "$HOME/.codex/skills/agent-team"
 python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" .
 ```
 
