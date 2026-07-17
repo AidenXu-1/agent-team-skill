@@ -260,6 +260,11 @@ def verify_repository_contract() -> None:
     check('python-version: ["3.9", "3.11"]' in workflow,
           "CI no longer verifies both Python 3.9 and 3.11")
     check(
+        workflow.count("uses: actions/checkout@v7") == 2
+        and workflow.count("uses: actions/setup-python@v6") == 2,
+        "CI uses a deprecated GitHub Actions JavaScript runtime",
+    )
+    check(
         "Publish latest verified package" in workflow
         and "github.ref == 'refs/heads/main'" in workflow
         and "needs: verify" in workflow
