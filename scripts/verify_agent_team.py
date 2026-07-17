@@ -201,6 +201,14 @@ def verify_repository_contract() -> None:
         "README omitted the stable latest pure-package or checksum URL",
     )
     check(
+        "`main` 是唯一公开主干" in readme
+        and "只有全部通过" in readme
+        and "仍是远端 `main` 的最新提交" in readme
+        and "现有 Latest 包不会被替换" in readme
+        and "build-*" in readme,
+        "README omitted the main-branch or verified-latest publication contract",
+    )
+    check(
         set(reference_frontmatter) == {"title", "status"}
         and reference_frontmatter.get("status") == "implemented"
         and f"运行协议 `{PROTOCOL_VERSION}`" in temporary_reference
@@ -251,6 +259,22 @@ def verify_repository_contract() -> None:
           "CI must run on every push and pull request without branch filters")
     check('python-version: ["3.9", "3.11"]' in workflow,
           "CI no longer verifies both Python 3.9 and 3.11")
+    check(
+        "Publish latest verified package" in workflow
+        and "github.ref == 'refs/heads/main'" in workflow
+        and "needs: verify" in workflow
+        and "contents: write" in workflow
+        and "git archive --format=zip" in workflow
+        and all(relative in workflow for relative in RUNTIME_FILES)
+        and "git/ref/heads/main" in workflow
+        and "Skip obsolete run: remote main moved" in workflow
+        and "Release creation raced with another run" in workflow
+        and "gh release create" in workflow
+        and "--latest" in workflow
+        and "published_zip_digest" in workflow
+        and "gh release delete" not in workflow,
+        "CI omitted the verified main-to-Latest publication gate",
+    )
     try:
         openai_metadata = yaml.load(openai_yaml, Loader=UniqueKeyLoader)
     except yaml.YAMLError as exc:

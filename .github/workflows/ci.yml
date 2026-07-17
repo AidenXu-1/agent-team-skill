@@ -1,5 +1,8 @@
 name: CI
 
+permissions:
+  contents: read
+
 on:
   push:
   pull_request:
@@ -64,3 +67,143 @@ jobs:
           cp scripts/scaffold_team.py "${install_root}/scripts/scaffold_team.py"
           cp scripts/temporary_executor_runtime.py "${install_root}/scripts/temporary_executor_runtime.py"
           python scripts/verify_agent_team.py --check-installed-copy "${install_root}"
+
+  publish_latest:
+    name: Publish latest verified package
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: verify
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout verified commit
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install validation dependencies
+        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
+
+      - name: Build and verify pure runtime package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="${RUNNER_TEMP}/agent-team-release"
+          extract_dir="${RUNNER_TEMP}/agent-team-extracted"
+          mkdir -p "${release_dir}" "${extract_dir}"
+          git archive --format=zip \
+            --output="${release_dir}/agent-team-2.0-pure.zip" \
+            "${GITHUB_SHA}" \
+            SKILL.md \
+            agents/openai.yaml \
+            references/temporary-executor.md \
+            scripts/scaffold_team.py \
+            scripts/temporary_executor_runtime.py
+          (
+            cd "${release_dir}"
+            sha256sum agent-team-2.0-pure.zip > agent-team-2.0-pure.zip.sha256
+          )
+          unzip -q "${release_dir}/agent-team-2.0-pure.zip" -d "${extract_dir}"
+          python scripts/verify_agent_team.py --check-installed-copy "${extract_dir}"
+          version="$(python - <<'PY'
+          import re
+          from pathlib import Path
+          import yaml
+
+          text = Path("SKILL.md").read_text(encoding="utf-8")
+          match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
+          if not match:
+              raise SystemExit("SKILL.md frontmatter missing")
+          data = yaml.safe_load(match.group(1))
+          print(data["metadata"]["version"])
+          PY
+          )"
+          printf 'release_dir=%s\n' "${release_dir}" >> "${GITHUB_OUTPUT}"
+          printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish current main as Latest
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_DIR: ${{ steps.package.outputs.release_dir }}
+          VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY}"
+          short_sha="${GITHUB_SHA:0:12}"
+          tag="build-${short_sha}"
+          remote_main="$(gh api "repos/${repo}/git/ref/heads/main" --jq .object.sha)"
+          if [[ "${remote_main}" != "${GITHUB_SHA}" ]]; then
+            echo "Skip obsolete run: remote main moved to ${remote_main}"
+            exit 0
+          fi
+
+          zip_digest="sha256:$(sha256sum "${RELEASE_DIR}/agent-team-2.0-pure.zip" | awk '{print $1}')"
+          checksum_digest="sha256:$(sha256sum "${RELEASE_DIR}/agent-team-2.0-pure.zip.sha256" | awk '{print $1}')"
+          existing_release="$(gh release view "${tag}" --repo "${repo}" --json isDraft --jq .isDraft 2>/dev/null || true)"
+
+          if [[ "${existing_release}" == "true" ]]; then
+            for attempt in {1..20}; do
+              sleep 3
+              existing_release="$(gh release view "${tag}" --repo "${repo}" --json isDraft --jq .isDraft 2>/dev/null || true)"
+              [[ "${existing_release}" == "false" ]] && break
+            done
+          fi
+
+          if [[ -z "${existing_release}" ]]; then
+            notes_file="${RUNNER_TEMP}/agent-team-release-notes.md"
+            printf '%s\n\n%s\n\n%s\n' \
+              "Agent Team ${VERSION} 的最新验证构建。" \
+              "源码提交：${GITHUB_SHA}" \
+              "该纯净包仅在 main 分支的完整 CI 通过后发布。" \
+              > "${notes_file}"
+
+            remote_main="$(gh api "repos/${repo}/git/ref/heads/main" --jq .object.sha)"
+            if [[ "${remote_main}" != "${GITHUB_SHA}" ]]; then
+              echo "Skip obsolete run: remote main moved to ${remote_main}"
+              exit 0
+            fi
+
+            if ! gh release create "${tag}" \
+                "${RELEASE_DIR}/agent-team-2.0-pure.zip" \
+                "${RELEASE_DIR}/agent-team-2.0-pure.zip.sha256" \
+                --repo "${repo}" \
+                --target "${GITHUB_SHA}" \
+                --title "Agent Team ${VERSION} · ${short_sha}" \
+                --notes-file "${notes_file}" \
+                --latest; then
+              echo "Release creation raced with another run; waiting for the same build tag"
+              for attempt in {1..20}; do
+                sleep 3
+                existing_release="$(gh release view "${tag}" --repo "${repo}" --json isDraft --jq .isDraft 2>/dev/null || true)"
+                [[ "${existing_release}" == "false" ]] && break
+              done
+              if [[ "${existing_release}" != "false" ]]; then
+                echo "The competing build release did not become public" >&2
+                exit 1
+              fi
+            fi
+          elif [[ "${existing_release}" == "true" ]]; then
+            echo "Existing build release is still a draft; refusing to publish it automatically" >&2
+            exit 1
+          else
+            remote_main="$(gh api "repos/${repo}/git/ref/heads/main" --jq .object.sha)"
+            if [[ "${remote_main}" != "${GITHUB_SHA}" ]]; then
+              echo "Skip obsolete run: remote main moved to ${remote_main}"
+              exit 0
+            fi
+            gh release edit "${tag}" --repo "${repo}" --latest
+          fi
+
+          published_tag="$(gh release view --repo "${repo}" --json tagName --jq .tagName)"
+          published_zip_digest="$(gh release view "${tag}" --repo "${repo}" --json assets --jq '.assets[] | select(.name == "agent-team-2.0-pure.zip") | .digest')"
+          published_checksum_digest="$(gh release view "${tag}" --repo "${repo}" --json assets --jq '.assets[] | select(.name == "agent-team-2.0-pure.zip.sha256") | .digest')"
+          [[ "${published_tag}" == "${tag}" ]]
+          [[ "${published_zip_digest}" == "${zip_digest}" ]]
+          [[ "${published_checksum_digest}" == "${checksum_digest}" ]]
