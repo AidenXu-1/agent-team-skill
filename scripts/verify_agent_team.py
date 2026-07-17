@@ -23,8 +23,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = Path(os.environ.get("AGENT_TEAM_SCAFFOLD", ROOT / "scripts" / "scaffold_team.py")).expanduser().resolve()
-PUBLIC_VERSION = "2.0.1"
-SOURCE_VERSION = "2.0.2-dev"
+PUBLIC_VERSION = "2.0.2"
+SOURCE_VERSION = "2.0.2"
 PROTOCOL_VERSION = "1.4.6"
 PREVIOUS_PROTOCOL_VERSION = "1.4.5"
 RUNTIME_FILES = (
@@ -194,6 +194,11 @@ def verify_repository_contract() -> None:
         and f"当前源码构建为 `{SOURCE_VERSION}`" in readme
         and f"运行协议为 `{PROTOCOL_VERSION}`" in readme,
         "README conflated or omitted public, source-build, or runtime protocol versions",
+    )
+    check(
+        "releases/latest/download/agent-team-2.0-pure.zip" in readme
+        and "releases/latest/download/agent-team-2.0-pure.zip.sha256" in readme,
+        "README omitted the stable latest pure-package or checksum URL",
     )
     check(
         set(reference_frontmatter) == {"title", "status"}

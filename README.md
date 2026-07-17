@@ -1,6 +1,6 @@
 # Agent Team 2.0 Skill
 
-当前公开发布版本为 `2.0.1`，当前源码构建为 `2.0.2-dev`，项目内运行协议为 `1.4.6`。公开版本对应 Git 标签和 Release；源码构建标识未发布的开发态；运行协议约束生成协作层的数据、工具与显式升级。第一版保留在 `main` 分支；2.0 通过独立标签发布。
+当前公开发布版本为 `2.0.2`，当前源码构建为 `2.0.2`，项目内运行协议为 `1.4.6`。公开版本对应 Git 标签和 Release；源码构建标识当前代码；运行协议约束生成协作层的数据、工具与显式升级。第一版保留在 `main` 分支；2.0 通过独立标签发布。
 
 面向多 Agent / 多会话项目的轻量协作协议。它用项目文件保存长期真值，让会话可以安全接班，同时把管理、执行和独立审核分开。
 
@@ -36,7 +36,7 @@ scripts/temporary_executor_runtime.py
 
 ## 安装
 
-公开稳定版从 [Latest Release](https://github.com/AidenXu-1/agent-team-skill/releases/latest) 获取。以下命令安装的是当前 `2.0.2-dev` 源码构建，不等于公开 `2.0.1` Release：
+公开稳定版从 [Latest Release](https://github.com/AidenXu-1/agent-team-skill/releases/latest) 获取。[固定最新纯净包](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip) 始终指向最新正式版，对应的 [SHA-256 校验文件](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip.sha256) 使用同一固定地址。以下命令从当前 `2.0.2` 源码检出安装，五个运行文件应与正式纯净包逐字节一致：
 
 ```bash
 mkdir -p ~/.codex/skills/agent-team

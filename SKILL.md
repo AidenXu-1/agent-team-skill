@@ -2,7 +2,7 @@
 name: agent-team
 description: Build and maintain low-context multi-agent or multi-session teams with durable file-based handoff, factual event logs, independent review, and explicit user gates. Use for software, AI product, content, operations, research, consulting, automation, or other projects that need separate management, execution, and review roles without relying on one long-running conversation.
 metadata:
-  version: 2.0.2-dev
+  version: 2.0.2
 ---
 
 # Agent Team
