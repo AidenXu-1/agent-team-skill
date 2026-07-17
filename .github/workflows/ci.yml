@@ -57,9 +57,10 @@ jobs:
       - name: Verify exact installed runtime bundle
         run: |
           install_root="${RUNNER_TEMP}/agent-team-installed"
-          mkdir -p "${install_root}/agents" "${install_root}/scripts"
+          mkdir -p "${install_root}/agents" "${install_root}/references" "${install_root}/scripts"
           cp SKILL.md "${install_root}/SKILL.md"
           cp agents/openai.yaml "${install_root}/agents/openai.yaml"
+          cp references/temporary-executor.md "${install_root}/references/temporary-executor.md"
           cp scripts/scaffold_team.py "${install_root}/scripts/scaffold_team.py"
           cp scripts/temporary_executor_runtime.py "${install_root}/scripts/temporary_executor_runtime.py"
           python scripts/verify_agent_team.py --check-installed-copy "${install_root}"

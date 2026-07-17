@@ -1,8 +1,6 @@
 # Agent Team 2.0 Skill
 
-当前产品与发布版本为 `2.0.1`，项目内运行协议为 `1.4.6`。前者对应安装包、Git 标签和 Release，后者对应生成协作层的数据与工具契约；协议说明文档另有自己的修订号。第一版继续保留在仓库的 `main` 分支；2.0 通过独立的 `v2.0.1` 标签发布，不覆盖第一版。
-
-`2.0.1` 的当前稳定性加固覆盖整条临时任务链：用户明确放弃后，正常清理或崩溃恢复会让普通 TASK 进入待统筹核收，同时保留“未交付、未集成、未发布”的事实边界；临时资源清理和真实会话归档使用两张独立收据，并可重复查询待归档动作。运行协议 `1.4.6` 还补齐正式与临时影响范围双向冲突及恢复/返工重检、thread ID 全局唯一与大小写精确绑定、归档回执可表示性、换班与临时会话重试不可覆盖已登记 ID、半完成事务先 reconcile、固定候选后新增 commit 拒绝、正式测试报告 frontmatter 精确证据、严格 JSON、增量部门收敛，以及同版本受管文件漂移、四文档缺件与升级回滚修复。AI 当前有归档工具时直接代用户归档；没有时提醒用户归档具体会话，并请用户完成后告诉 AI 一声。
+当前公开发布版本为 `2.0.1`，当前源码构建为 `2.0.2-dev`，项目内运行协议为 `1.4.6`。公开版本对应 Git 标签和 Release；源码构建标识未发布的开发态；运行协议约束生成协作层的数据、工具与显式升级。第一版保留在 `main` 分支；2.0 通过独立标签发布。
 
 面向多 Agent / 多会话项目的轻量协作协议。它用项目文件保存长期真值，让会话可以安全接班，同时把管理、执行和独立审核分开。
 
@@ -29,24 +27,27 @@
 ```text
 SKILL.md
 agents/openai.yaml
+references/temporary-executor.md
 scripts/scaffold_team.py
 scripts/temporary_executor_runtime.py
 ```
 
-仓库里的 `README.md`、`tests/`、`scripts/verify_agent_team.py` 和 CI 用于开发与复验，不参与日常 Skill 注入。
+仓库里的 `README.md`、`tests/semantic_review.md`、`scripts/verify_agent_team.py` 和 CI 用于开发与复验，不参与日常 Skill 注入。
 
 ## 安装
 
+公开稳定版从 [Latest Release](https://github.com/AidenXu-1/agent-team-skill/releases/latest) 获取。以下命令安装的是当前 `2.0.2-dev` 源码构建，不等于公开 `2.0.1` Release：
+
 ```bash
-git clone --branch v2.0.1 --depth 1 https://github.com/AidenXu-1/agent-team-skill.git /tmp/agent-team-skill
 mkdir -p ~/.codex/skills/agent-team
 rsync -a --delete --delete-excluded \
   --include='/SKILL.md' \
   --include='/agents/' --include='/agents/openai.yaml' \
+  --include='/references/' --include='/references/temporary-executor.md' \
   --include='/scripts/' --include='/scripts/scaffold_team.py' \
   --include='/scripts/temporary_executor_runtime.py' \
   --exclude='*' \
-  /tmp/agent-team-skill/ ~/.codex/skills/agent-team/
+  ./ ~/.codex/skills/agent-team/
 ```
 
 ## 使用
@@ -69,7 +70,7 @@ python3 scripts/scaffold_team.py "/path/to/project" \
 
 Agent 必须先阅读地基并确认它已说清目标、交付范围和验收标准，再通过 `--foundation-file` 显式声明已复核的项目内文件。脚本只负责机械路径和文件安全检查，不评判文本语义。使用 `docs/spec.md` 之外的地基时需另加 `--allow-without-foundation`。用户确认缺少适用地基且允许创建通用最小地基时，才改用 `--allow-without-foundation --create-minimal-foundation` 及六项地基参数。
 
-单 TASK 临时外包的产品边界、状态语义、候选集成态和知识吸收规则见 [`docs/temporary-executor-protocol.md`](docs/temporary-executor-protocol.md)。
+临时外包是按需旁路。只有用户主动提出时，Agent 才读取 [`references/temporary-executor.md`](references/temporary-executor.md)；普通团队搭建不加载这份冷规则。
 
 ## 生成结构
 
@@ -120,6 +121,8 @@ python3 scripts/verify_agent_team.py
 python3 scripts/verify_agent_team.py --check-installed-copy "$HOME/.codex/skills/agent-team"
 python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" .
 ```
+
+涉及授权、职责或发布边界的语义变更，还要人工执行 [`tests/semantic_review.md`](tests/semantic_review.md)；自动测试通过不能替代这一步。
 
 协议升级：
 

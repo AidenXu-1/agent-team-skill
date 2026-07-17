@@ -23,13 +23,14 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = Path(os.environ.get("AGENT_TEAM_SCAFFOLD", ROOT / "scripts" / "scaffold_team.py")).expanduser().resolve()
-PRODUCT_VERSION = "2.0.1"
+PUBLIC_VERSION = "2.0.1"
+SOURCE_VERSION = "2.0.2-dev"
 PROTOCOL_VERSION = "1.4.6"
 PREVIOUS_PROTOCOL_VERSION = "1.4.5"
-PROTOCOL_DOCUMENT_VERSION = "0.3.0"
 RUNTIME_FILES = (
     "SKILL.md",
     "agents/openai.yaml",
+    "references/temporary-executor.md",
     "scripts/scaffold_team.py",
     "scripts/temporary_executor_runtime.py",
 )
@@ -143,14 +144,14 @@ def verify_install_bundle_contract(root: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(ROOT / relative, destination)
     good = run([sys.executable, str(Path(__file__).resolve()), "--check-installed-copy", str(installed)])
-    check(good.stdout.startswith("INSTALL_COPY_OK |"), "exact four-file installed copy was rejected")
+    check(good.stdout.startswith("INSTALL_COPY_OK |"), "exact five-file installed copy was rejected")
 
     extra = installed / "README.md"
     extra.write_text("development-only\n", encoding="utf-8")
     rejected_extra = run(
         [sys.executable, str(Path(__file__).resolve()), "--check-installed-copy", str(installed)], ok=False,
     )
-    check("file list mismatch" in rejected_extra.stderr, "installed copy accepted a fifth runtime file")
+    check("file list mismatch" in rejected_extra.stderr, "installed copy accepted a sixth runtime file")
     extra.unlink()
 
     target = installed / "SKILL.md"
@@ -165,12 +166,14 @@ def verify_install_bundle_contract(root: Path) -> None:
 
 def verify_repository_contract() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
-    protocol_doc = (ROOT / "docs" / "temporary-executor-protocol.md").read_text(encoding="utf-8")
+    temporary_reference = (ROOT / "references" / "temporary-executor.md").read_text(encoding="utf-8")
+    semantic_review = (ROOT / "tests" / "semantic_review.md").read_text(encoding="utf-8")
     skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
     workflow = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     openai_yaml = (ROOT / "agents" / "openai.yaml").read_text(encoding="utf-8")
     frontmatter_fields = yaml_frontmatter(skill, label="SKILL")
-    protocol_frontmatter = yaml_frontmatter(protocol_doc, label="temporary executor protocol")
+    reference_frontmatter = yaml_frontmatter(temporary_reference, label="temporary executor reference")
+    semantic_frontmatter = yaml_frontmatter(semantic_review, label="semantic review matrix")
     allowed_frontmatter = {"name", "description", "license", "allowed-tools", "metadata"}
     check(set(frontmatter_fields) <= allowed_frontmatter,
           "SKILL frontmatter contains unsupported fields")
@@ -183,24 +186,51 @@ def verify_repository_contract() -> None:
     check(isinstance(description, str) and bool(description)
           and len(description) <= 1024 and "<" not in description and ">" not in description,
           "SKILL description violates the official metadata contract")
+    metadata = frontmatter_fields.get("metadata")
+    check(isinstance(metadata, dict) and metadata.get("version") == SOURCE_VERSION,
+          "SKILL metadata did not identify the current source build")
     check(
-        f"产品与发布版本为 `{PRODUCT_VERSION}`" in readme
+        f"公开发布版本为 `{PUBLIC_VERSION}`" in readme
+        and f"当前源码构建为 `{SOURCE_VERSION}`" in readme
         and f"运行协议为 `{PROTOCOL_VERSION}`" in readme,
-        "README conflated or omitted product and runtime protocol versions",
+        "README conflated or omitted public, source-build, or runtime protocol versions",
     )
     check(
-        protocol_frontmatter.get("status") == "implemented"
-        and protocol_frontmatter.get("version") == PROTOCOL_DOCUMENT_VERSION
-        and protocol_frontmatter.get("product_version") == PRODUCT_VERSION
-        and protocol_frontmatter.get("runtime_protocol_version") == PROTOCOL_VERSION
-        and "文档修订号" in protocol_doc,
-        "temporary executor protocol did not separate implementation, product, runtime, and document revisions",
+        set(reference_frontmatter) == {"title", "status"}
+        and reference_frontmatter.get("status") == "implemented"
+        and f"运行协议 `{PROTOCOL_VERSION}`" in temporary_reference
+        and "pending-archives" in temporary_reference
+        and "YAML frontmatter" in temporary_reference,
+        "temporary executor cold reference is missing or carries redundant version metadata",
+    )
+    check(
+        "只询问“能不能并行" in temporary_reference
+        and "如果可以就帮我开" in temporary_reference
+        and "取消 / 先停一下" in temporary_reference
+        and "不自动等于 `abandoned`" in temporary_reference
+        and "长期无回复只进入 `standby`" in temporary_reference
+        and "必须暂停并升级统筹部" in temporary_reference
+        and "不能自行把判断写成正式 Spec" in temporary_reference,
+        "temporary executor reference lost a user-intent or authority boundary",
+    )
+    check(
+        semantic_frontmatter == {
+            "title": "Agent Team 人工语义审查矩阵",
+            "status": "required-before-release",
+            "scope": "semantic-boundaries",
+        }
+        and all(f"S{index:02d}" in semantic_review for index in range(1, 17))
+        and "自动测试通过不能替代" in readme
+        and "本文件只保存稳定问题，不写某次执行结果" in semantic_review,
+        "manual semantic release gate is missing or incomplete",
     )
     check(
         f"当前运行协议为 `{PROTOCOL_VERSION}`" in skill
-        and "pending-archives" in skill
-        and "YAML frontmatter" in skill,
-        "SKILL maintenance/archive evidence contract is stale",
+        and "references/temporary-executor.md" in skill
+        and "未触发时不要读取" in skill
+        and "文档修订号" not in readme
+        and "文档修订号" not in temporary_reference,
+        "SKILL did not keep temporary-executor rules on the cold path",
     )
     workflow_lines = workflow.splitlines()
     try:
@@ -307,6 +337,16 @@ def verify_generated(project: Path) -> None:
         check(not list((root / "日志").glob("*.md")), "empty weekly log should be lazy")
     inbox = (collab / "部门" / "执行部" / "收件箱.md").read_text(encoding="utf-8")
     check("../../tasks/" in inbox, "inbox does not use stable clickable task path")
+    role_text = (collab / "部门" / "执行部" / "岗位说明.md").read_text(encoding="utf-8")
+    bootstrap_text = (collab / "部门" / "执行部" / "上岗引导.md").read_text(encoding="utf-8")
+    check(
+        "缺失时回统筹部补齐,不自行脑补" in role_text
+        and "交班只更新交接和必要日志,不等于 Git commit" in role_text
+        and "换会话 / 切换会话 / 换班" in role_text,
+        "slimmed role guide lost an escalation, commit, or switch-language guard",
+    )
+    check("换会话 / 换班" in bootstrap_text and "不 fork 旧历史" in bootstrap_text,
+          "slimmed bootstrap lost the explicit session-switch boundary")
 
 
 def verify_product_development_boundary(root: Path) -> None:
@@ -2880,7 +2920,10 @@ def entrypoint() -> int:
     if len(sys.argv) == 3 and sys.argv[1] == "--check-installed-copy":
         installed = Path(os.path.abspath(str(Path(sys.argv[2]).expanduser())))
         verify_installed_copy(installed)
-        print(f"INSTALL_COPY_OK | {installed} | files:{len(RUNTIME_FILES)} | product:{PRODUCT_VERSION}")
+        print(
+            f"INSTALL_COPY_OK | {installed} | files:{len(RUNTIME_FILES)}"
+            f" | source:{SOURCE_VERSION} | public:{PUBLIC_VERSION}"
+        )
         return 0
     if len(sys.argv) != 1:
         raise VerifyError("usage: verify_agent_team.py [--check-installed-copy PATH]")

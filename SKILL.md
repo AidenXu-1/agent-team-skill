@@ -1,6 +1,8 @@
 ---
 name: agent-team
 description: Build and maintain low-context multi-agent or multi-session teams with durable file-based handoff, factual event logs, independent review, and explicit user gates. Use for software, AI product, content, operations, research, consulting, automation, or other projects that need separate management, execution, and review roles without relying on one long-running conversation.
+metadata:
+  version: 2.0.2-dev
 ---
 
 # Agent Team
@@ -15,7 +17,7 @@ description: Build and maintain low-context multi-agent or multi-session teams w
 4. 手上只做一件；任务用唯一 ID 和原子状态工具流转，收件箱只是自动索引信息，跨会话消息只发“任务 ID + 短状态”。
 5. 节点完成后提交产出、已验证/未验证项和错题自检，以 `TASK_STATE_OK` 作为完成收据；只在真实轨迹事件发生时追加事实日志。
 6. 会话变重时说明原因并主动询问用户是否换班；只有用户明确同意或主动提出“换会话 / 换班”要求后，才创建全新会话接班。
-7. 正式部门在办时，只有用户主动提出独立需求，统筹部才判断是否创建只绑定一个 TASK 的临时外包；未启用时不增加正式部门热路径。
+7. 临时外包是低频旁路：只有用户主动提出时才读取 `references/temporary-executor.md` 并判断；未触发时不加载其流程。
 
 ## 必守边界
 
@@ -59,17 +61,7 @@ description: Build and maintain low-context multi-agent or multi-session teams w
 
 日志默认不读，只在事件发生时写入部门 ISO 周日志的身份分区。正式部门和临时外包共用一份周文件，但物理分为“正式部门日志”和“临时外包日志”；临时外包再按 TASK 分组。日志只保存可核验事实，不写“经验、启示、方法论”或完整聊天；项目复盘时再根据事实总结。
 
-必须记录五类改变项目轨迹的事件：
-
-* `MILESTONE`：可交付阶段节点完成。
-
-* `CHANGE`：已确认的需求、范围、优先级、体验或验收标准变化。
-
-* `CORRECTION`：用户明确指出 Agent 误解、遗漏、越权、误导或错误，并发生调整。
-
-* `DECISION`：关键方案被选择、否决或替换。
-
-* `INCIDENT`：值得倒查的失败、阻断、风险或异常及其处理结果。
+只记录五类改变项目轨迹的事件：`MILESTONE`（可交付节点）、`CHANGE`（已确认的需求或边界变化）、`CORRECTION`（用户纠偏）、`DECISION`（关键方案选择）和 `INCIDENT`（值得倒查的失败或风险）。
 
 普通回复、工具调用、重复确认、临时命令失败和不改变边界的措辞调整不记。`CHANGE`、`CORRECTION`、`DECISION` 发生后立即记录；`MILESTONE` 在节点完成时记录；`INCIDENT` 只记影响项目判断或进度的事件。
 
@@ -147,29 +139,11 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * `TASK_STATE_OK` 只证明状态已持久化和本地产物路径已校验，不证明业务质量。脚本参数中的领取人、核收人和授权证据只作审计记录，不冒充身份认证。
 
-## 单 TASK 临时外包
+## 单 TASK 临时外包（按需）
 
-* 内部统一模型为 `temporary_executor`，必须绑定一个 TASK 和一个 `parent_department`。用户侧按父部门称“临时开发外包”“临时设计外包”等；数据模型和 preflight 不写死开发部。当前首轮完整运行适配只开放临时开发外包，其他父部门尚未完成专业成果版本与吸收适配时只能讨论和预检，不能声称已可执行。
+只有用户主动提出临时外包、并行外包或 TASK 级临时会话时，才完整读取 `references/temporary-executor.md`，再做预检、创建或任何生命周期操作。未触发时不要读取该文件，也不要主动扩容。
 
-* 只有用户主动发起后，统筹部才能判断和创建。统筹部不能主动扩容、拆需求、自动重派或让临时执行者从共享任务池自行领取。
-
-* 正式在办、阻断、等待输入和尚未吸收完成的临时任务都用 `write_paths / shared_contracts / external_effects / base_revision / owner_task` 声明影响。声明不足只报 `manual`，写路径、共享契约或 ignored 生成物无法证明独立时必须阻断或转人工；工具不能自动 stash、reset 或 checkpoint 正式部门工作。
-
-* 临时 workspace 位于项目内 `.agent-team/workspaces/TASK-ID/`，项目根必须忽略 `/.agent-team/`。Git ignore 不能证明 watcher、构建器或同步工具也会忽略该目录；创建前由 Agent 检查这些项目配置并把证据写入创建请求。worktree 只提供协作隔离，不冒充 OS 沙箱；首轮禁止密钥、生产、付费和真实外部副作用。
-
-* workspace 内只生成一份 `.agent-team/临时执行规则.md`，作为临时会话的身份、权限、日志和收口入口。它按 TASK 指针读 Spec、相关 ADR、conventions、代码和测试，默认不读父部门完整岗位说明、收件箱、交接、progress 和长期报告。专业标准可以继承，组织身份和正式权限必须重写。
-
-* 需求实质变化使用带 expected brief revision 的 `amend`，同一事务重新判断并行条件、增加 attempt、清空旧候选 / delivery / integration，并重生成临时规则。临时会话重新确认新 digest 前不能固定候选或 submit。已 submit 或被统筹接管时先走显式 `rework`，不能直接 amend。任何 blocked / waiting 任务在 `resume` 或 `rework` 前都重做当前影响准入；冲突仍在时保持阻断，不能靠状态指令绕过。
-
-* 先固定可复查候选，再把用户确认、明确委托或不适用记录绑定到该候选 revision 和 tree digest。workspace 产生新 commit 后必须固定新候选并重新确认，工具不能把旧确认自动套到新版本。独立子 Agent 审查只在用户要求时调用，只给结论和证据；修复形成新候选。delivery submit 后使用受保护 ref 留证，临时会话进入 standby，不能自称已集成。submit 之后的候选、审查和集成阶段只能按正向状态机推进；已 integrated 或已清理的真值不能被补录命令退回 ready/reviewing。
-
-* 正式体系只验证一次“准备成为正式结果的完整候选”。delivery 与未来正式 tree 相同时直接验证 delivery；main 前进、存在冲突或有集成修改时才按需形成候选集成态。正式通过必须绑定已完成并由统筹核收的审核层 TASK、本地正式报告、tested commit/tree 和未覆盖项，不能只填一段“测试通过”文字。报告的 tested commit、tested tree 和 result 必须写在文档开头的 YAML frontmatter 并与当前候选精确一致，正文中的相似子串不能充当证据。进入 main 的 tree 必须等于已测试 tree，main 漂移或测试后修改都要求重测。
-
-* 清理前同时通过成果吸收和知识吸收，并验证 delivery 保护 ref 仍指向正确 commit/tree。知识默认只回到所属正式部门与项目全局 Spec、ADR、conventions、progress 或错题集；其他部门只有明确受影响时才介入。未集成或用户未明确放弃时不得清理，长期无回复只进入 standby。创建、晋升和清理的半失败必须先运行对应 reconcile，不能根据名称猜测重做或删除。
-
-* `cleanup` 只清理受控 workspace / branch；存在真实临时会话时返回 `ARCHIVE_THREAD_REQUIRED:<thread_id>`，不能把 TASK 内部状态冒充成真实会话已经归档。统筹部直接看当前可用工具：有真实归档工具时立即调用，成功后运行 `session-mark --state archived --evidence "host=<真实工具> thread_id=<真实ID> archived=true"` 并继续；没有时提醒用户：“我目前无法自动归档这个会话。请你手动归档临时外包会话「<会话名称>」（会话 ID：<真实ID>），归档完成后告诉我一声。”这条提醒不形成脚本硬闸；用户未确认前保持 `temporary_session=standby`，不得声称已经归档，其他不依赖归档结果的安全工作可以继续。用户之后明确表示已完成时，运行 `session-mark --state archived --evidence "user_confirmation=<用户确认指针> thread_id=<真实ID> archived=true"`。自动调用失败也使用同一句人工提醒。若创建阶段就已放弃、从未产生真实 thread ID，则返回 `NO_THREAD_ARCHIVE_REQUIRED` 并把会话状态收口为 `cancelled`。已清理且 standby 却缺少 thread ID 是损坏真值，必须显式拒绝，不能沉默当成无待办。旧协议升级时，缺少可信收据的 `archived` 会话退回 `standby`；凡能通过当前严格解析并按原始字符串精确绑定 thread ID、`archived=true` 与 host 或 user confirmation 的可信收据都继续保留，大小写不同的 ID 不视为同一会话，也不能只因旧版本号而抹掉真实证据。已经完成资源清理但仍在 `standby` 的会话会重新返回归档动作，避免升级后继续沉默。需要重新查看这些动作时运行 `agent_team_temporary.py pending-archives`；它是可重复调用的只读查询，不改变 TASK 真相。
-
-* 所有临时生命周期机械操作使用 `agent_team_temporary.py`。普通任务继续走原有三个工具；临时功能未启用时，正式部门不增加必读文件或状态步骤。
+用户只问“能不能并行 / 是否适合外包”时只做判断，通过后仍需确认创建；只有“如果可以就帮我开”等同时包含判断与创建委托的表达才可在通过后直接创建。运行边界保持很窄：统一模型是 `temporary_executor + parent_department + 单一 TASK`；当前完整执行链只开放临时开发外包，其他父部门只能做通用预检；所有机械操作只用生成的 `agent_team_temporary.py`，不能凭文字跳过候选绑定、正式验证、吸收、reconcile 或真实会话归档收据。
 
 ## 会话模式与换班
 
@@ -189,13 +163,7 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 ## 用户常用口令
 
-* `接班`：当前会话读取本部门入口、恢复当前状态；存在明确可继续的任务时可以接着做。
-
-* `先接班，不要开始任务`：只恢复职责、状态和待办，汇报后停下。
-
-* `交班`：更新交接班文档和必要事实日志，仍使用当前会话。
-
-* `换班 / 换会话`：授权同部门创建全新会话接班；新会话登记成功后才归档旧会话。
+`接班` 恢复职责与当前任务；`先接班，不要开始任务` 汇报后停下；`交班` 更新交接和必要日志；`换班 / 换会话` 授权创建同部门新会话，新会话登记成功后才归档旧会话。
 
 ## 维护与验证
 
@@ -207,4 +175,4 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 通知能力只在上岗/接班时登记一次；后续按部门表的自动/人工模式执行。
 
-* 修改本 Skill 后运行项目验证器、`quick_validate.py` 和 Python 编译检查；再同步并验证全局安装目录只包含 `SKILL.md`、`agents/openai.yaml`、`scripts/scaffold_team.py` 和 `scripts/temporary_executor_runtime.py`。
+* 修改本 Skill 后运行项目验证器、`quick_validate.py` 和 Python 编译检查；再同步并验证全局安装目录只包含 `SKILL.md`、`agents/openai.yaml`、`references/temporary-executor.md`、`scripts/scaffold_team.py` 和 `scripts/temporary_executor_runtime.py`。
