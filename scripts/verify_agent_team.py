@@ -24,7 +24,7 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = Path(os.environ.get("AGENT_TEAM_SCAFFOLD", ROOT / "scripts" / "scaffold_team.py")).expanduser().resolve()
-PUBLIC_VERSION = "2.0.2"
+PUBLIC_VERSION = "2.0.4"
 SOURCE_VERSION = "2.0.4"
 PROTOCOL_VERSION = "1.4.8"
 PREVIOUS_PROTOCOL_VERSION = "1.4.7"
