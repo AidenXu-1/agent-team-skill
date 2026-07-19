@@ -24,7 +24,7 @@ else:
     import fcntl
 
 
-PROTOCOL_VERSION = "1.4.6"
+PROTOCOL_VERSION = "1.4.8"
 TASK_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
 SAFE_STATES = {"safe", "manual", "unsafe", "waiting_base"}
 USER_ACCEPTANCE = {"pending", "confirmed", "rejected", "delegated", "not_applicable"}
@@ -1670,6 +1670,14 @@ def formal_test_evidence(args: argparse.Namespace, *, commit: str, tree: str, re
     test_task = read_task(args.test_task_id)
     if test_task.get("execution_state") != "acknowledged" or test_task.get("completion_class") != "audit":
         raise ValueError("正式测试证据必须来自已完成并由统筹核收的审核层 TASK")
+    state = read_plain_json(COLLAB / "会话启动状态.json", COLLAB, label="会话启动状态")
+    departments = state.get("departments") if isinstance(state, dict) else None
+    department_state = departments.get(test_task.get("department")) if isinstance(departments, dict) else None
+    if (
+        not isinstance(department_state, dict)
+        or department_state.get("role_id") not in {"review", "test", "security", "finance"}
+    ):
+        raise ValueError("正式测试 TASK 声称 audit，但会话真值中该部门不属于审核层")
     expected_pointer = f"docs/collaboration/tasks/{args.task_id}.json"
     if expected_pointer not in test_task.get("pointers", []):
         raise ValueError("正式测试 TASK 未指向当前临时 TASK")

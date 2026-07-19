@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import datetime as dt
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -24,9 +25,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = Path(os.environ.get("AGENT_TEAM_SCAFFOLD", ROOT / "scripts" / "scaffold_team.py")).expanduser().resolve()
 PUBLIC_VERSION = "2.0.2"
-SOURCE_VERSION = "2.0.2"
-PROTOCOL_VERSION = "1.4.6"
-PREVIOUS_PROTOCOL_VERSION = "1.4.5"
+SOURCE_VERSION = "2.0.4"
+PROTOCOL_VERSION = "1.4.8"
+PREVIOUS_PROTOCOL_VERSION = "1.4.7"
 RUNTIME_FILES = (
     "SKILL.md",
     "agents/openai.yaml",
@@ -232,7 +233,7 @@ def verify_repository_contract() -> None:
             "status": "required-before-release",
             "scope": "semantic-boundaries",
         }
-        and all(f"S{index:02d}" in semantic_review for index in range(1, 17))
+        and all(f"S{index:02d}" in semantic_review for index in range(1, 21))
         and "自动测试通过不能替代" in readme
         and "本文件只保存稳定问题，不写某次执行结果" in semantic_review,
         "manual semantic release gate is missing or incomplete",
@@ -244,6 +245,22 @@ def verify_repository_contract() -> None:
         and "文档修订号" not in readme
         and "文档修订号" not in temporary_reference,
         "SKILL did not keep temporary-executor rules on the cold path",
+    )
+    check(
+        all(term in skill for term in (
+            "系统级技术路径", "架构", "模块/数据/接口边界",
+            "开工可行性复核", "正式实现、自测与集成", "`docs/decisions/code/`",
+            "draft → proposed → accepted → superseded", "`accepted` 正文不可原地修改",
+            "安全与测试只提交独立报告",
+        )),
+        "SKILL lost the durable product/development ownership, ADR status, or independent-review contract",
+    )
+    check(len(skill.encode("utf-8")) <= 17_000, "SKILL exceeded the 17 KB hot-context budget")
+    check(
+        "技术实现方式交开发部" not in skill
+        and "开发部负责全部技术实现" not in skill
+        and skill.count("本节只保留不可被项目覆盖削弱的职责合同") == 1,
+        "SKILL reintroduced the old ownership regression or duplicated its hot responsibility contract",
     )
     workflow_lines = workflow.splitlines()
     try:
@@ -346,22 +363,20 @@ def verify_generated(project: Path) -> None:
     check(not (collab / "scripts" / "agent_team_read.py").exists(), "obsolete reader generated")
     protocol = json.loads((collab / "协议版本.json").read_text(encoding="utf-8"))
     check(protocol["protocol_version"] == PROTOCOL_VERSION, "unexpected protocol version")
+    check(protocol.get("role_policy_overlays") == {}, "fresh scaffold registered unexpected role policy overlays")
     for script in (collab / "scripts").glob("*.py"):
         compile_script(script)
     guide = (project / "docs" / "agent-guide.md").read_text(encoding="utf-8")
     check(f"受管协议版本:{PROTOCOL_VERSION}" in guide and "任务真值" in guide,
           "project guide not refreshed")
     collaboration_readme = (collab / "README.md").read_text(encoding="utf-8")
-    check("有归档工具时立即调用" in collaboration_readme
-          and "host=<真实工具>" in collaboration_readme
-          and "调用失败或没有工具时提醒用户" in collaboration_readme
-          and "我目前无法自动归档这个会话" in collaboration_readme
-          and "归档完成后告诉我一声" in collaboration_readme
-          and "user_confirmation=" in collaboration_readme
-          and "temporary_session=standby" in collaboration_readme
-          and "一旦已登记新 thread ID" in collaboration_readme
-          and "`restore-old` 必须带精确绑定新 ID 的归档回执" in collaboration_readme,
-          "generated collaboration guide omitted the automatic path or lightweight manual fallback")
+    check(
+        "references/temporary-executor.md" in collaboration_readme
+        and "agent_team_temporary.py" in collaboration_readme
+        and "session-mark" not in collaboration_readme
+        and "temporary_session=standby" not in collaboration_readme,
+        "generated collaboration guide did not keep the temporary-executor rules cold",
+    )
     check("archive-request" not in collaboration_readme and "--archive-mode" not in collaboration_readme,
           "generated collaboration guide retained the rejected hard archive gate")
     for department in ("统筹部", "执行部", "检验部"):
@@ -369,17 +384,23 @@ def verify_generated(project: Path) -> None:
         check((root / "报告").is_dir() and (root / "日志").is_dir(), "department output directories missing")
         check(not (root / "报告" / "README.md").exists(), "duplicated report README generated")
         check(not list((root / "日志").glob("*.md")), "empty weekly log should be lazy")
+        four_docs_bytes = sum(
+            (root / name).stat().st_size
+            for name in ("上岗引导.md", "岗位说明.md", "交接班文档.md", "收件箱.md")
+        )
+        check(four_docs_bytes <= 7_000, f"{department} four-document onboarding exceeded 7 KB")
     inbox = (collab / "部门" / "执行部" / "收件箱.md").read_text(encoding="utf-8")
     check("../../tasks/" in inbox, "inbox does not use stable clickable task path")
     role_text = (collab / "部门" / "执行部" / "岗位说明.md").read_text(encoding="utf-8")
     bootstrap_text = (collab / "部门" / "执行部" / "上岗引导.md").read_text(encoding="utf-8")
     check(
-        "缺失时回统筹部补齐,不自行脑补" in role_text
-        and "交班只更新交接和必要日志,不等于 Git commit" in role_text
-        and "换会话 / 切换会话 / 换班" in role_text,
-        "slimmed role guide lost an escalation, commit, or switch-language guard",
+        "../../tasks/TASK-*.json" in role_text
+        and "项目总进度由统筹部维护" in role_text
+        and "tasks/TASK-*.json" not in role_text.replace("../../tasks/TASK-*.json", ""),
+        "slimmed role guide lost task truth or retained the wrong relative task path",
     )
-    check("换会话 / 换班" in bootstrap_text and "不 fork 旧历史" in bootstrap_text,
+    check("当前消息/文件就是第 1 份上岗入口" in bootstrap_text
+          and "换会话 / 换班" in bootstrap_text and "不 fork 旧历史" in bootstrap_text,
           "slimmed bootstrap lost the explicit session-switch boundary")
 
 
@@ -390,7 +411,12 @@ def verify_product_development_boundary(root: Path) -> None:
         "--roles", "lead,product,design,dev,ai,test", "--session-mode", "manual",
         "--foundation-file", "docs/spec.md",
     ], ok=False)
-    check("已取消独立角色" in denied.stderr and "归开发部" in denied.stderr, "deprecated AI department was accepted")
+    check(
+        "已取消独立角色" in denied.stderr
+        and "系统级技术规划归产品部" in denied.stderr
+        and "代码与集成实现归开发部" in denied.stderr,
+        "deprecated AI department was accepted or its replacement boundary regressed",
+    )
     check(not (deprecated / "docs" / "collaboration").exists(), "failed deprecated-role scaffold left collaboration files")
 
     project = make_project(root, "ai-product-without-ai-department")
@@ -399,9 +425,29 @@ def verify_product_development_boundary(root: Path) -> None:
     check(not (collab / "部门" / "AI工程部").exists(), "AI department was generated")
     product = (collab / "部门" / "产品部" / "岗位说明.md").read_text(encoding="utf-8")
     development = (collab / "部门" / "开发部" / "岗位说明.md").read_text(encoding="utf-8")
-    check("整个产品规划" in product and "AI 行为验收目标" in product, "product ownership is incomplete")
+    check(
+        all(term in product for term in (
+            "整个产品规划", "产品调研", "系统级技术实现路径", "整体架构", "模块/数据/接口边界",
+            "技术选型方案", "迁移/回滚", "架构类 ADR/决策合同", "不写正式业务代码",
+            "draft→proposed→accepted→superseded", "用户确认和证据齐全后才进入 accepted",
+        )),
+        "product ownership omitted research, system architecture, ADR, or no-production-code boundaries",
+    )
     check(all(term in development for term in ("模型/API 接入", "Prompt", "RAG", "Agent 链路", "评测集")),
           "development role does not own the full AI implementation")
+    check(
+        all(term in development for term in (
+            "开工前复核", "可行性", "函数、类、算法、代码组织", "提交证据、影响与优化方案",
+            "经统筹退回产品部修订", "不静默修改", "系统级架构 ADR",
+            "不得无授权重写系统级 ADR 的正文、状态或路线",
+        )),
+        "development role omitted feasibility review, code-level ownership, or architecture-change escalation",
+    )
+    check(
+        "测试部或安全部做独立放行" in product
+        and "最终质量、安全或发布背书" in development,
+        "product or development role can still self-certify an independent gate",
+    )
 
     registry = collab / "部门表.md"
     text = registry.read_text(encoding="utf-8")
@@ -415,6 +461,147 @@ def verify_product_development_boundary(root: Path) -> None:
     check("不会自动删除或合并" in blocked_upgrade.stderr, "legacy AI department was silently migrated")
     check(json.loads(protocol_path.read_text(encoding="utf-8"))["protocol_version"] == "1.2.0",
           "blocked legacy-role upgrade mutated protocol state")
+
+
+def verify_role_policy_upgrade_guard(root: Path) -> None:
+    managed_project = make_project(root, "managed-role-policy-forward-upgrade")
+    scaffold(managed_project, "lead,product,design,dev,test")
+    managed_collab = managed_project / "docs" / "collaboration"
+    product_relative = "部门/产品部/岗位说明.md"
+    managed_product = managed_collab / product_relative
+    legacy_template = """# 产品部岗位说明
+
+## 负责什么
+
+负责整个产品规划和 AI 行为验收目标；技术实现方式交开发部。
+
+## 输出
+
+产品方案/架构。
+
+## 禁止写入
+
+docs/decisions/ 技术决策定稿。
+"""
+    managed_product.write_text(legacy_template, encoding="utf-8")
+    managed_protocol_path = managed_collab / "协议版本.json"
+    managed_protocol = json.loads(managed_protocol_path.read_text(encoding="utf-8"))
+    managed_protocol["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+    managed_protocol["managed_files"][product_relative]["sha256"] = hashlib.sha256(
+        managed_product.read_bytes()
+    ).hexdigest()
+    managed_protocol_path.write_text(
+        json.dumps(managed_protocol, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    managed_state_path = managed_collab / "会话启动状态.json"
+    managed_state = json.loads(managed_state_path.read_text(encoding="utf-8"))
+    managed_state["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+    managed_state_path.write_text(
+        json.dumps(managed_state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    managed_guide = managed_project / "docs" / "agent-guide.md"
+    managed_guide.write_text(
+        managed_guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+        ),
+        encoding="utf-8",
+    )
+    managed_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(managed_project), "--upgrade-collaboration",
+    ])
+    upgraded_product = managed_product.read_text(encoding="utf-8")
+    upgraded_protocol = json.loads(managed_protocol_path.read_text(encoding="utf-8"))
+    check(
+        managed_upgrade.stdout.startswith("UPGRADE_OK |")
+        and "系统级技术实现路径" in upgraded_product
+        and "架构类 ADR/决策合同" in upgraded_product
+        and "技术实现方式交开发部" not in upgraded_product
+        and upgraded_protocol["protocol_version"] == PROTOCOL_VERSION
+        and upgraded_protocol["role_policy_overlays"] == {},
+        "managed legacy product policy did not forward-upgrade to the corrected responsibility contract",
+    )
+
+    custom_project = make_project(root, "custom-role-policy-fail-closed")
+    scaffold(custom_project, "lead,product,design,dev,test")
+    custom_collab = custom_project / "docs" / "collaboration"
+    custom_product = custom_collab / product_relative
+    custom_product.write_text(
+        custom_product.read_text(encoding="utf-8")
+        + "\n## 项目定制职责\n\n保留本项目已经确认的产品部行业合规规划职责。\n",
+        encoding="utf-8",
+    )
+    custom_bytes = custom_product.read_bytes()
+    custom_protocol_path = custom_collab / "协议版本.json"
+    custom_protocol_bytes = custom_protocol_path.read_bytes()
+    blocked = run([
+        sys.executable, str(SCAFFOLD), str(custom_project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "不能猜测项目想保留什么" in blocked.stderr
+        and "--role-policy-overlay-file" in blocked.stderr
+        and custom_product.read_bytes() == custom_bytes
+        and custom_protocol_path.read_bytes() == custom_protocol_bytes
+        and not (custom_collab / "升级备份").exists(),
+        "custom role policy was not rejected before upgrade side effects",
+    )
+    overlay_file = root / "product-role-overlay.json"
+    overlay_payload = {
+        "product": {
+            "schema_version": 1,
+            "reviewed_base_contract_version": "product-dev-2",
+            "authorization_evidence": "用户确认保留行业合规规划职责",
+            "additions": [{
+                "id": "industry-compliance-planning",
+                "section": "mission",
+                "text": "保留本项目已经确认的产品部行业合规规划职责。",
+            }],
+        },
+    }
+    overlay_file.write_text(json.dumps(overlay_payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    preserved = run([
+        sys.executable, str(SCAFFOLD), str(custom_project), "--upgrade-collaboration",
+        "--role-policy-overlay-file", str(overlay_file),
+    ])
+    preserved_protocol = json.loads(custom_protocol_path.read_text(encoding="utf-8"))
+    rendered_with_overlay = custom_product.read_text(encoding="utf-8")
+    check(
+        preserved.stdout.startswith("UPGRADE_OK |")
+        and "ROLE_POLICY_OVERLAYS_APPLIED | product" in preserved.stdout
+        and "系统级技术实现路径" in rendered_with_overlay
+        and "行业合规规划职责" in rendered_with_overlay
+        and "项目定制职责" in rendered_with_overlay
+        and preserved_protocol["role_policy_overlays"] == overlay_payload
+        and preserved_protocol["managed_files"][product_relative]["sha256"]
+        == hashlib.sha256(custom_product.read_bytes()).hexdigest(),
+        "explicit additive role policy overlay was not rendered and registered",
+    )
+    repeated = run([
+        sys.executable, str(SCAFFOLD), str(custom_project), "--upgrade-collaboration",
+    ])
+    check(
+        repeated.stdout.startswith("UPGRADE_NOT_NEEDED |")
+        and custom_product.read_text(encoding="utf-8") == rendered_with_overlay,
+        "registered role policy overlay did not remain stable on the next upgrade",
+    )
+    run([
+        sys.executable, str(SCAFFOLD), str(custom_project), "--add-roles", "research",
+    ])
+    after_add_protocol = json.loads(custom_protocol_path.read_text(encoding="utf-8"))
+    check(
+        after_add_protocol["role_policy_overlays"] == overlay_payload
+        and custom_product.read_text(encoding="utf-8") == rendered_with_overlay,
+        "add-role transaction discarded a registered project role policy overlay",
+    )
+    custom_product.write_text(rendered_with_overlay + "\n未授权的直接修改\n", encoding="utf-8")
+    registered_drift = run([
+        sys.executable, str(SCAFFOLD), str(custom_project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "不能猜测项目想保留什么" in registered_drift.stderr,
+        "a registered overlay incorrectly allowed later direct role-policy edits",
+    )
 
 
 def verify_foundation_contract(root: Path) -> None:
@@ -812,6 +999,19 @@ def verify_log_and_session(project: Path, root: Path) -> None:
     state_path.write_text(state_text, encoding="utf-8")
     state = json.loads(state_text)
     check(state["departments"]["执行部"]["notification_mode"] == "manual", "initial notification mode missing")
+    downgraded_state = dict(state)
+    downgraded_state["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+    state_path.write_text(json.dumps(downgraded_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    downgraded_bytes = state_path.read_bytes()
+    rejected_downgrade = run([
+        sys.executable, str(session), "set-notification", "--department", "执行部",
+        "--mode", "auto", "--evidence", "must-reject-old-protocol",
+    ], ok=False)
+    check(
+        "版本无效" in rejected_downgrade.stderr and state_path.read_bytes() == downgraded_bytes,
+        "generated session tool wrote a downgraded protocol state",
+    )
+    state_path.write_text(state_text, encoding="utf-8")
     run([sys.executable, str(session), "set-notification", "--department", "执行部",
          "--mode", "auto", "--evidence", "user-approved-notification-change"])
     run([sys.executable, str(session), "begin-switch", "--department", "统筹部",
@@ -1567,6 +1767,20 @@ result: pass
 
 实际运行 Python 编译检查，候选通过。
 """, encoding="utf-8")
+    state_path = collab / "会话启动状态.json"
+    audit_state_bytes = state_path.read_bytes()
+    forged_audit_state = json.loads(audit_state_bytes)
+    forged_audit_state["departments"]["测试部"]["role_id"] = "dev"
+    state_path.write_text(json.dumps(forged_audit_state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    forged_audit_task = run([
+        sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
+        "--tested-base", tested_base, "--commit", delivery, "--test-definition", "compile and targeted regression",
+        "--environment", "temporary verifier", "--evidence", report_relative, "--result", "pass",
+        "--test-task-id", test_task, "--report", report_relative,
+    ], ok=False)
+    check("不属于审核层" in forged_audit_task.stderr,
+          "a self-reported audit completion class bypassed the registered audit-role check")
+    state_path.write_bytes(audit_state_bytes)
     run([
         sys.executable, str(temporary_tool), "record-integration-test", "--task-id", temporary,
         "--tested-base", tested_base, "--commit", delivery, "--test-definition", "compile and targeted regression",
@@ -2591,7 +2805,7 @@ def verify_upgrade_and_guards(root: Path) -> None:
     check(session_upgraded.stdout.startswith("UPGRADE_OK |")
           and upgraded_state["protocol_version"] == PROTOCOL_VERSION
           and actual_session_truth == expected_session_truth,
-          "1.4.5 -> 1.4.6 upgrade rewrote session step, evidence, previous thread, or operation truth")
+          f"{PREVIOUS_PROTOCOL_VERSION} -> {PROTOCOL_VERSION} upgrade rewrote session step, evidence, previous thread, or operation truth")
 
     fresh_roles_project = make_project(root, "fresh-add-role-parity")
     scaffold(fresh_roles_project, "lead,do,review,dev")
@@ -2930,6 +3144,228 @@ def verify_upgrade_and_guards(root: Path) -> None:
           "rollback manifest omitted legacy state directories or their exact modes")
 
 
+def verify_transaction_recovery_attacks(root: Path) -> None:
+    forged_project = make_project(root, "forged-add-role-marker")
+    scaffold(forged_project, "lead,product,design,dev,test")
+    forged_collab = forged_project / "docs" / "collaboration"
+    truth_names = ("协议版本.json", "部门表.md", "会话启动清单.md", "路由表.md", "会话启动状态.json")
+    truth_before = {name: (forged_collab / name).read_bytes() for name in truth_names}
+    product = forged_collab / "部门" / "产品部"
+    product_before = {
+        entry.relative_to(product).as_posix(): entry.read_bytes()
+        for entry in product.rglob("*") if entry.is_file()
+    }
+    operation_id = "ADD-20260719T170000-ABCDEF12"
+    generated = {
+        entry.name: hashlib.sha256(entry.read_bytes()).hexdigest()
+        for entry in product.iterdir() if entry.is_file()
+    }
+    forged_marker = {
+        "schema_version": 2,
+        "kind": "add_roles",
+        "operation_id": operation_id,
+        "phase": "applying",
+        "created_roles": ["product"],
+        "originals": {
+            name: truth_before[name].decode("utf-8") for name in truth_names
+        },
+        "generated_files": {"product": generated},
+    }
+    marker_path = forged_collab / ".add-roles-transaction.json"
+    marker_path.write_text(json.dumps(forged_marker, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    denied = run([
+        sys.executable, str(SCAFFOLD), str(forged_project), "--add-roles", "research",
+    ], ok=False)
+    check(
+        denied.returncode == 10
+        and all((forged_collab / name).read_bytes() == data for name, data in truth_before.items())
+        and {
+            entry.relative_to(product).as_posix(): entry.read_bytes()
+            for entry in product.rglob("*") if entry.is_file()
+        } == product_before
+        and marker_path.exists(),
+        "a forged add-role marker mutated truth or deleted an existing department",
+    )
+
+    crash_project = make_project(root, "durable-upgrade-crash-recovery")
+    scaffold(crash_project)
+    crash_collab = crash_project / "docs" / "collaboration"
+    protocol_path = crash_collab / "协议版本.json"
+    state_path = crash_collab / "会话启动状态.json"
+    protocol = json.loads(protocol_path.read_text(encoding="utf-8"))
+    protocol["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+    protocol_path.write_text(json.dumps(protocol, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    guide = crash_project / "docs" / "agent-guide.md"
+    guide.write_text(guide.read_text(encoding="utf-8").replace(
+        f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+    ), encoding="utf-8")
+    module_spec = importlib.util.spec_from_file_location("agent_team_scaffold_crash_probe", SCAFFOLD)
+    check(module_spec is not None and module_spec.loader is not None, "could not load scaffold for crash probe")
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+    real_write = module.write_utf8_atomic
+
+    def terminate_after_marker(path, text, *, mode=None):
+        if Path(path) == crash_collab / "README.md":
+            raise SystemExit(99)
+        return real_write(path, text, mode=mode)
+
+    module.write_utf8_atomic = terminate_after_marker
+    try:
+        try:
+            module.run_upgrade(crash_collab)
+        except SystemExit as exc:
+            check(exc.code == 99, "crash probe exited unexpectedly")
+    finally:
+        module.write_utf8_atomic = real_write
+    check((crash_collab / ".upgrade-transaction.json").is_file(),
+          "upgrade crash did not leave a durable recovery marker")
+    recovered = run([sys.executable, str(SCAFFOLD), str(crash_project), "--upgrade-collaboration"])
+    check(
+        "UPGRADE_RECOVERY_OK" in recovered.stdout
+        and "UPGRADE_OK" in recovered.stdout
+        and not (crash_collab / ".upgrade-transaction.json").exists()
+        and json.loads(protocol_path.read_text(encoding="utf-8"))["protocol_version"] == PROTOCOL_VERSION,
+        "next invocation did not recover the interrupted upgrade before retrying",
+    )
+
+
+def verify_task_supersede(root: Path) -> None:
+    project = make_project(root, "queued-task-supersede")
+    scaffold(project)
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    session_tool = collab / "scripts" / "agent_team_session.py"
+    for step, extra in (
+        ("created", ["--thread-id", "lead-thread"]),
+        ("onboarded", ["--thread-id", "lead-thread"]),
+        ("registered", ["--thread-id", "lead-thread"]),
+    ):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", "统筹部",
+            "--step", step, "--evidence", f"verify-{step}", *extra,
+        ])
+    old_id = enqueue(task_tool, "已被后续主链取代的 queued 任务")
+    queued_replacement = enqueue(task_tool, "尚未形成后续事实")
+    replacement_id = enqueue(task_tool, "已形成的后续主链")
+    run([sys.executable, str(task_tool), "claim", "--task-id", replacement_id, "--claimed-by", "do-thread"])
+    old_path = collab / "tasks" / f"{old_id}.json"
+    replacement_path = collab / "tasks" / f"{replacement_id}.json"
+    old_before = json.loads(old_path.read_text(encoding="utf-8"))
+    replacement_before = replacement_path.read_bytes()
+    inbox_paths = sorted((collab / "部门").glob("*/收件箱.md"))
+
+    def snapshot() -> tuple[bytes, bytes, dict[Path, bytes]]:
+        return old_path.read_bytes(), replacement_path.read_bytes(), {path: path.read_bytes() for path in inbox_paths}
+
+    def denied(extra: list[str], expected: str) -> None:
+        before = snapshot()
+        result = run([
+            sys.executable, str(task_tool), "supersede", "--task-id", old_id,
+            "--replacement-task", replacement_id, "--expected-revision", "1",
+            "--expected-replacement-revision", "2", "--actor", "统筹部/lead-thread",
+            "--reason", "被后续主链取代", "--evidence", "后续 TASK 已领取",
+            *extra,
+        ], ok=False)
+        check(expected in result.stderr and snapshot() == before,
+              f"supersede failure path mutated truth: {expected}")
+
+    denied(["--replacement-task", "TASK-20990101-NOTFND"], "任务不存在")
+    denied(["--actor", "开发部/dev-thread"], "actor 必须匹配")
+    denied(["--expected-revision", "99"], "expected-revision")
+    denied(["--expected-replacement-revision", "99"], "expected-replacement-revision")
+    denied(["--replacement-task", queued_replacement, "--expected-replacement-revision", "1"], "未形成可审计后续事实")
+
+    receipt = run([
+        sys.executable, str(task_tool), "supersede", "--task-id", old_id,
+        "--replacement-task", replacement_id, "--expected-revision", "1",
+        "--expected-replacement-revision", "2", "--actor", "统筹部/lead-thread",
+        "--reason", "被后续主链取代", "--evidence", "后续 TASK 已领取并形成执行事实",
+    ])
+    resolved = json.loads(old_path.read_text(encoding="utf-8"))
+    preserved_fields = set(old_before) - {"resolution", "updated_at", "revision"}
+    check(
+        receipt.stdout.startswith("TASK_RESOLUTION_OK | state=superseded")
+        and resolved["execution_state"] == "queued"
+        and resolved["resolution"]["replacement_task_id"] == replacement_id
+        and all(resolved[field] == old_before[field] for field in preserved_fields)
+        and replacement_path.read_bytes() == replacement_before
+        and old_id not in (collab / "部门" / "执行部" / "收件箱.md").read_text(encoding="utf-8"),
+        "happy-path supersede did not preserve source truth, replacement bytes, or inbox semantics",
+    )
+    listed = run([sys.executable, str(task_tool), "list"])
+    check(f"{old_id} | 已取代" in listed.stdout, "resolved queued task was not auditable in list output")
+    for command in (
+        ["claim", "--claimed-by", "do-thread"],
+        ["authorize", "--state", "user_confirmed", "--evidence", "late-change"],
+        ["declare-impact", "--expected-revision", "2", "--write-path", "app/x.py", "--base-revision", "HEAD"],
+    ):
+        rejected = run([sys.executable, str(task_tool), command[0], "--task-id", old_id, *command[1:]], ok=False)
+        check("已收口" in rejected.stderr,
+              f"resolved task re-entered {command[0]}: {rejected.stderr.strip()}")
+
+    stale_inbox = collab / "部门" / "执行部" / "收件箱.md"
+    stale_inbox.write_text(stale_inbox.read_text(encoding="utf-8") + f"\n- stale {old_id}\n", encoding="utf-8")
+    wal = collab / ".locks" / "task-index-transaction.json"
+    wal.write_text(json.dumps({
+        "schema_version": 1, "kind": "task-index-refresh",
+        "operation_id": "IDX-20260719T170000-ABCDEF12", "task_id": old_id,
+    }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    recovered = run([sys.executable, str(task_tool), "list"])
+    check(
+        "TASK_INDEX_RECOVERY_OK" in recovered.stdout
+        and old_id not in stale_inbox.read_text(encoding="utf-8")
+        and not wal.exists(),
+        "task-index WAL did not rebuild a stale inbox from TASK truth",
+    )
+
+    legacy_project = make_project(root, "legacy-task-without-resolution")
+    scaffold(legacy_project)
+    legacy_collab = legacy_project / "docs" / "collaboration"
+    legacy_tool = legacy_collab / "scripts" / "agent_team_task.py"
+    legacy_id = enqueue(legacy_tool, "1.4.7 无 resolution 任务")
+    legacy_path = legacy_collab / "tasks" / f"{legacy_id}.json"
+    legacy_payload = json.loads(legacy_path.read_text(encoding="utf-8"))
+    legacy_payload.pop("resolution", None)
+    legacy_path.write_text(json.dumps(legacy_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    legacy_bytes = legacy_path.read_bytes()
+    for name in ("协议版本.json", "会话启动状态.json"):
+        path = legacy_collab / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    guide = legacy_project / "docs" / "agent-guide.md"
+    guide.write_text(guide.read_text(encoding="utf-8").replace(
+        f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+    ), encoding="utf-8")
+    upgraded = run([sys.executable, str(SCAFFOLD), str(legacy_project), "--upgrade-collaboration"])
+    check(upgraded.stdout.startswith("UPGRADE_OK |") and legacy_path.read_bytes() == legacy_bytes,
+          "1.4.7 task without resolution was rewritten or blocked during forward upgrade")
+    malformed = json.loads(legacy_path.read_text(encoding="utf-8"))
+    malformed["resolution"] = {"state": "superseded"}
+    legacy_path.write_text(json.dumps(malformed, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    malformed_bytes = legacy_path.read_bytes()
+    for name in ("协议版本.json", "会话启动状态.json"):
+        path = legacy_collab / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    guide.write_text(guide.read_text(encoding="utf-8").replace(
+        f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+    ), encoding="utf-8")
+    backups_before = len(list((legacy_collab / "升级备份").iterdir()))
+    malformed_denied = run([sys.executable, str(SCAFFOLD), str(legacy_project), "--upgrade-collaboration"], ok=False)
+    check(
+        "收口轴结构无效" in malformed_denied.stderr
+        and legacy_path.read_bytes() == malformed_bytes
+        and len(list((legacy_collab / "升级备份").iterdir())) == backups_before,
+        "malformed resolution passed upgrade preflight or caused side effects",
+    )
+
+
 def main() -> int:
     compile_script(SCAFFOLD)
     verify_repository_contract()
@@ -2941,11 +3377,14 @@ def main() -> int:
         verify_generated(project)
         verify_foundation_contract(root)
         verify_product_development_boundary(root)
+        verify_role_policy_upgrade_guard(root)
         verify_tasks(project)
         verify_log_and_session(project, root)
         verify_temporary_executor(root)
         verify_resume_admission_guards(root)
         verify_upgrade_and_guards(root)
+        verify_transaction_recovery_attacks(root)
+        verify_task_supersede(root)
     print("VERIFY_OK | scaffold, task, temporary executor, tested-tree promotion, absorption, log, session, upgrade, migration, and path guards passed")
     return 0
 

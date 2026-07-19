@@ -2,7 +2,7 @@
 name: agent-team
 description: Build and maintain low-context multi-agent or multi-session teams with durable file-based handoff, factual event logs, independent review, and explicit user gates. Use for software, AI product, content, operations, research, consulting, automation, or other projects that need separate management, execution, and review roles without relying on one long-running conversation.
 metadata:
-  version: 2.0.2
+  version: 2.0.4
 ---
 
 # Agent Team
@@ -98,7 +98,11 @@ python3 docs/collaboration/scripts/agent_team_log.py append \
 
 非软件项目不要硬套产品、设计、开发、测试。缺少专用地基时，先问清目标、交付物、对象、验收、资源和风险，再由用户确认是否创建最小业务地基。
 
-AI 产品不单独创建 AI 部门：产品部负责完整产品规划和 AI 行为验收目标；开发部负责包括模型接入、Prompt、RAG、Agent、评测、成本、延迟与降级在内的全部技术实现。只有存在真正独立的长期决策权和交付边界时才拆新部门，不能按技术名词拆部门。
+AI 产品不单独创建 AI 部门，也不按技术名词拆部门。生成岗位的操作真值是 `scaffold_team.py` 中的 `ROLE_DEFS`；本节只保留不可被项目覆盖削弱的职责合同：
+
+* 产品部以用户需求、研究证据、资源约束和开发可行性建议为输入，负责完整产品规划及系统级技术路径、架构、模块/数据/接口边界、选型实验、依赖、迁移/回滚和实施阶段；输出 Spec、验收目标与系统 ADR，只写 `docs/decisions/system/` 等规划区，不写正式业务代码。产品选型实验必须是不可直接合并或发布的 disposable spike，采纳后由开发部重新实现和测试。
+* 开发部以已确认 Spec、系统 ADR、设计和实施规划为输入，负责开工可行性复核、代码级决定、正式实现、自测与集成；只在 `docs/decisions/code/` 维护代码 ADR。发现系统合同不合理时提交证据与建议，经统筹退回产品部修订，不得静默改合同或路线。
+* 系统 ADR 由产品部维护 `draft → proposed → accepted → superseded`；`accepted` 正文不可原地修改，实质变化必须新建 draft、重新评审确认，再把旧 ADR 标为 superseded。安全与测试只提交独立报告，不能直接改 Spec/ADR 或自证放行。
 
 ## 创建协作层
 
@@ -137,6 +141,8 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 统筹部只能核收 `completed` 任务；`acknowledged-by` 必须精确匹配会话状态中当前已登记的 `统筹部/会话ID`，用于防止普通部门误操作，核收后状态为 `acknowledged`。
 
+* `queued` 任务被后续主链取代时，只能由已登记统筹会话调用 `supersede`；必须绑定已进入执行生命周期的 replacement TASK、双方 revision、reason 和 evidence。原正文与 `queued` 态保留，只新增 `resolution=superseded`；不开放无替代证据的 cancel。
+
 * `TASK_STATE_OK` 只证明状态已持久化和本地产物路径已校验，不证明业务质量。脚本参数中的领取人、核收人和授权证据只作审计记录，不冒充身份认证。
 
 ## 单 TASK 临时外包（按需）
@@ -169,7 +175,7 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 增加部门：`scaffold_team.py <项目> --add-roles "<ids>"`；脚本同一事务更新部门表、路由表、会话启动清单、会话状态和部门目录。派生文档从会话状态真值整体重建，不追加另一份“待登记”副本；重复新增已存在部门保持幂等。
 
-* 当前运行协议为 `1.4.6`。旧协作层升级：`scaffold_team.py <项目> --upgrade-collaboration`。如旧收件箱存在待办/回报正文，脚本拒绝猜测迁移，要求先处理清楚；升级成功前保留带时间戳备份。
+* 当前运行协议为 `1.4.8`。旧协作层升级：`scaffold_team.py <项目> --upgrade-collaboration`。如旧收件箱存在待办/回报正文，脚本拒绝猜测迁移，要求先处理清楚；升级在任何真值变更前写持久回滚标记，成功前保留带时间戳备份。岗位说明相对受管基线发生变化时默认 fail-closed；用户确认项目新增职责后，将其迁移为只追加 JSON，再传 `--role-policy-overlay-file`。标准职责继续升级，项目补充合并到同一份岗位说明，不冻结整份旧模板。
 
 * 减少或合并部门：先把在办事项和历史指针交代清楚，再调整部门表与岗位边界，不删除历史。
 
