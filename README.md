@@ -1,13 +1,13 @@
 # Agent Team 2.0 Skill
 
-当前公开发布版本为 `2.0.2`，当前源码构建为 `2.0.2`，项目内运行协议为 `1.4.6`。`main` 是唯一公开主干，保存最新且已验证的源码；版本标签和正式 Release 保留里程碑；运行协议约束生成协作层的数据、工具与显式升级。
+当前公开发布版本为 `2.0.2`，当前源码构建为 `2.0.4`，项目内运行协议为 `1.4.8`。`main` 是唯一公开主干，保存最新且已验证的源码；版本标签和正式 Release 保留里程碑；运行协议约束生成协作层的数据、工具与显式升级。本地源码构建高于公开版时，表示修复尚未发布，不能把本地安装状态说成 GitHub Release 已更新。
 
 面向多 Agent / 多会话项目的轻量协作协议。它用项目文件保存长期真值，让会话可以安全接班，同时把管理、执行和独立审核分开。
 
 ## 核心设计
 
 - 任务真值只有一份：`tasks/TASK-*.json`。状态变化不移动文件。
-- 部门按长期决策权和交付边界划分，不按技术名词划分；AI 产品仍由产品部规划、开发部完整实现。
+- 部门按长期决策权和交付边界划分，不按技术名词划分；产品部拥有需求、体验和系统级技术规划，开发部依据已确认合同完成代码与集成实现。
 - 收件箱只是任务工具生成的活动索引，不保存任务正文。
 - 交接班文档只写做到哪里、下一步、临时证据和已知坑，不保存任务状态。
 - 新部门会话首次读四个入口文件；任务正文只在交接或收件箱指向时读取。
@@ -36,7 +36,7 @@ scripts/temporary_executor_runtime.py
 
 ## 安装
 
-公开稳定版从 [Latest Release](https://github.com/AidenXu-1/agent-team-skill/releases/latest) 获取。每次 `main` 推送都先运行完整 CI；只有全部通过，且该提交仍是远端 `main` 的最新提交，才会自动更新 [固定最新纯净包](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip) 和 [SHA-256 校验文件](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip.sha256)；源码或打包验证在发布前失败时，现有 Latest 包不会被替换。以下命令从当前 `2.0.2` 源码检出安装，五个运行文件应与最新纯净包逐字节一致：
+公开稳定版从 [Latest Release](https://github.com/AidenXu-1/agent-team-skill/releases/latest) 获取。每次 `main` 推送都先运行完整 CI；只有全部通过，且该提交仍是远端 `main` 的最新提交，才会自动更新 [固定最新纯净包](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip) 和 [SHA-256 校验文件](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip.sha256)；源码或打包验证在发布前失败时，现有 Latest 包不会被替换。以下命令从当前 `2.0.4` 源码检出安装；在 `2.0.4` 尚未正式发布前，本地安装副本应与本地源码五个运行文件逐字节一致，不能据此宣称它与公开 Latest 纯净包一致：
 
 ```bash
 mkdir -p ~/.codex/skills/agent-team
@@ -132,7 +132,14 @@ python3 "$HOME/.codex/skills/.system/skill-creator/scripts/quick_validate.py" .
 python3 scripts/scaffold_team.py "/path/to/project" --upgrade-collaboration
 ```
 
-升级会备份受管文件，并把旧版按状态分目录的 TASK JSON 迁移为稳定的平铺路径。遇到损坏 JSON、路径越界或符号链接时先停止，不猜测修复。
+升级会备份受管文件，并把旧版按状态分目录的 TASK JSON 迁移为稳定的平铺路径。遇到损坏 JSON、路径越界或符号链接时先停止，不猜测修复。若任一 `岗位说明.md` 相对上次受管清单有变化，升级默认停止，避免模板静默缩窄项目定制职责；用户确认要保留这些项目覆盖后，再运行：
+
+```bash
+python3 scripts/scaffold_team.py "/path/to/project" \
+  --upgrade-collaboration --role-policy-overlay-file "/safe/path/role-overlays.json"
+```
+
+追加层 JSON 只允许 `additions`，每项需有稳定 ID、所属职责段、项目补充文本和用户确认依据。脚本在 `协议版本.json` 的 `role_policy_overlays` 中登记，每次用当前标准模板重建岗位说明，再追加项目补充。直接编辑受管岗位说明仍会停止升级。
 
 ## License
 
