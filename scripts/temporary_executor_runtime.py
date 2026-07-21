@@ -24,7 +24,7 @@ else:
     import fcntl
 
 
-PROTOCOL_VERSION = "1.4.8"
+PROTOCOL_VERSION = "1.4.9"
 TASK_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
 SAFE_STATES = {"safe", "manual", "unsafe", "waiting_base"}
 USER_ACCEPTANCE = {"pending", "confirmed", "rejected", "delegated", "not_applicable"}
@@ -151,11 +151,20 @@ def main_project() -> Path:
     return root
 
 
-PROJECT = main_project()
+PROJECT = local_project()
 COLLAB = PROJECT / "docs" / "collaboration"
 TASKS = COLLAB / "tasks"
 LOCKS = COLLAB / ".locks"
 SESSION_STATE = COLLAB / "会话启动状态.json"
+
+
+def configure_project(*, require_git: bool) -> None:
+    global PROJECT, COLLAB, TASKS, LOCKS, SESSION_STATE
+    PROJECT = main_project() if require_git else local_project()
+    COLLAB = PROJECT / "docs" / "collaboration"
+    TASKS = COLLAB / "tasks"
+    LOCKS = COLLAB / ".locks"
+    SESSION_STATE = COLLAB / "会话启动状态.json"
 
 
 def secure_collaboration_root() -> Path:
@@ -2221,6 +2230,7 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        configure_project(require_git=not getattr(args, "read_only", False))
         if getattr(args, "read_only", False):
             return args.func(args)
         with task_lock():

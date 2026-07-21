@@ -26,9 +26,10 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.4.8"
+PROTOCOL_VERSION = "1.4.9"
 PROTOCOL_FILE = "协议版本.json"
 ADD_TRANSACTION_FILE = ".add-roles-transaction.json"
+DEACTIVATE_TRANSACTION_FILE = ".deactivate-roles-transaction.json"
 UPGRADE_TRANSACTION_FILE = ".upgrade-transaction.json"
 ADD_ROLE_SENTINEL = ".agent-team-add-role-owner.json"
 ROLE_POLICY_OVERRIDE_FIELD = "role_policy_overlays"
@@ -256,8 +257,8 @@ def managed_relative_paths(roles: list[str]) -> list[str]:
 
 
 CURRENT_SESSION_ITEM_FIELDS = {
-    "role_id", "notification_mode", "step", "thread_id", "previous_thread_id",
-    "failed_from", "evidence", "operation_id", "note", "updated_at",
+    "role_id", "active", "notification_mode", "step", "thread_id", "previous_thread_id",
+    "failed_from", "evidence", "operation_id", "note", "updated_at", "lifecycle_history",
 }
 CURRENT_SESSION_STEPS = {"pending", "created", "onboarded", "registered", "failed"}
 
@@ -267,6 +268,10 @@ def validate_session_item_lifecycle(item: dict, department: str) -> None:
     previous_thread = item["previous_thread_id"]
     operation_id = item["operation_id"]
     failed_from = item["failed_from"]
+    if not item.get("active", False) and (
+        item["step"] != "pending" or current_thread or previous_thread
+    ):
+        raise ValueError(f"已停用部门仍保留活动会话事实: {department}")
     for label, thread_id in (("thread_id", current_thread), ("previous_thread_id", previous_thread)):
         if thread_id and (
             len(thread_id) > 300
@@ -295,13 +300,19 @@ def validate_session_item_lifecycle(item: dict, department: str) -> None:
 
 def validate_current_session_payload(payload: object) -> list[str]:
     """Validate the exact current session-state schema and return configured role IDs."""
-    root_fields = {"schema_version", "protocol_version", "updated_at", "departments"}
+    root_fields = {
+        "schema_version", "protocol_version", "created_at", "updated_at", "profile",
+        "session_mode", "role_order", "departments",
+    }
     if not isinstance(payload, dict) or set(payload) != root_fields:
         raise ValueError("会话启动状态根结构无效")
     if payload["schema_version"] != 1 or payload["protocol_version"] != PROTOCOL_VERSION:
         raise ValueError("会话启动状态版本无效")
-    if not isinstance(payload["updated_at"], str) or not payload["updated_at"]:
-        raise ValueError("会话启动状态 updated_at 无效")
+    for field in ("created_at", "updated_at", "profile"):
+        if not isinstance(payload[field], str) or not payload[field]:
+            raise ValueError(f"会话启动状态 {field} 无效")
+    if payload["session_mode"] not in {"auto", "manual"}:
+        raise ValueError("会话启动状态 session_mode 无效")
     departments = payload["departments"]
     if not isinstance(departments, dict) or not departments:
         raise ValueError("会话启动状态未登记部门")
@@ -316,14 +327,42 @@ def validate_current_session_payload(payload: object) -> list[str]:
             raise ValueError(f"会话通知模式无效: {department}")
         if item["step"] not in CURRENT_SESSION_STEPS:
             raise ValueError(f"会话启动状态 step 无效: {department}")
-        for field in CURRENT_SESSION_ITEM_FIELDS - {"role_id", "notification_mode", "step"}:
+        if not isinstance(item["active"], bool):
+            raise ValueError(f"会话启动状态 active 类型无效: {department}")
+        for field in CURRENT_SESSION_ITEM_FIELDS - {
+            "role_id", "active", "notification_mode", "step", "lifecycle_history",
+        }:
             if not isinstance(item[field], str):
                 raise ValueError(f"会话启动状态 {field} 类型无效: {department}")
+        history = item["lifecycle_history"]
+        if not isinstance(history, list):
+            raise ValueError(f"会话启动状态 lifecycle_history 无效: {department}")
+        for event in history:
+            if (
+                not isinstance(event, dict)
+                or set(event) != {"event", "at", "actor", "evidence", "thread_id"}
+                or event.get("event") not in {"retired", "deactivated", "reactivated"}
+                or any(not isinstance(event.get(field), str) or not event.get(field) for field in ("at", "actor", "evidence"))
+                or not isinstance(event.get("thread_id"), str)
+            ):
+                raise ValueError(f"会话启动状态 lifecycle_history 条目无效: {department}")
         validate_session_item_lifecycle(item, department)
         roles.append(role_id)
     if len(roles) != len(set(roles)):
         raise ValueError("会话启动状态含重复 role_id")
-    return roles
+    if (
+        not isinstance(payload["role_order"], list)
+        or any(not isinstance(role, str) for role in payload["role_order"])
+        or set(payload["role_order"]) != set(roles)
+        or len(payload["role_order"]) != len(set(payload["role_order"]))
+    ):
+        raise ValueError("会话启动状态 role_order 与部门顺序不一致")
+    active_layers = {
+        ROLE_DEFS[item["role_id"]]["layer"] for item in departments.values() if item["active"]
+    }
+    if active_layers != {"management", "execution", "audit"}:
+        raise ValueError("活跃部门未保持管理、执行、审核三层最小结构")
+    return list(payload["role_order"])
 
 
 def protocol_payload(
@@ -627,11 +666,11 @@ ROLE_DEFS = {
         "name": "开发部",
         "layer": "execution",
         "mission": "开工前复核已确认 Spec、架构类 ADR、设计和实施规划的可行性,再依据这些合同完成正式业务代码、整体集成与自测。函数、类、算法、代码组织和局部性能取舍等代码级细节由开发部负责。互联网产品和 AI 产品的代码实现均由开发部承担;涉及 AI 时,包括模型/API 接入、Prompt、RAG、Agent 链路、评测集、质量基线、推理成本与延迟、降级/重试/拒答、输出安全和可观测性。",
-        "not_responsible": "不静默修改需求、用户流程、系统级技术实现路径、整体架构合同或产品路线;不得无授权重写系统级 ADR 的正文、状态或路线;不把可行性评审变成对产品部规划权的接管;不做最终质量、安全或发布背书。发现合同不合理时提交证据、影响与优化方案,经统筹退回产品部修订后再按新合同实现。",
-        "inputs": "已确认的 docs/spec.md、docs/architecture/、架构类 docs/decisions/、实施阶段、docs/conventions.md 和 design/ 材料;产品部定义的依赖/迁移/回滚约束;AI 功能另读使用场景、数据样例、模型/API 文档和质量/成本/延迟目标",
+        "not_responsible": "不静默修改需求、用户流程、系统级技术实现路径、整体架构合同或产品路线;不得无授权重写系统级 ADR 的正文、状态或路线;不把可行性评审变成对产品规划权的接管;不做最终质量、安全或发布背书。发现合同不合理时提交证据、影响与优化方案：有产品部时经统筹退回产品部修订；未配置产品部时由统筹请用户指定规划责任人或直接确认新合同，再按新合同实现。",
+        "inputs": "已确认的 docs/spec.md、docs/architecture/、架构类 docs/decisions/、实施阶段、docs/conventions.md 和 design/ 材料;产品部定义的依赖/迁移/回滚约束，未配置产品部时使用用户已确认的项目地基与合同;AI 功能另读使用场景、数据样例、模型/API 文档和质量/成本/延迟目标",
         "outputs": "开工可行性评审, app/ 与测试代码, 自测和集成结果, 技术实现说明, commit, 技术变更建议, 代码级决策记录;AI 功能另含评测集与基线、Prompt/RAG/Agent 配置、成本与延迟证据和降级策略",
         "can_write": "app/, tests/, evals/, prompts/, docs/conventions.md, scratch/ 实现实验, docs/decisions/code/ 中不重写系统级合同的代码级决策记录",
-        "cannot_write": "未经产品部修订与用户确认的 docs/spec.md、docs/architecture/、系统级架构 ADR 或产品路线, design/ 定稿, 其他部门岗位边界, 测试部/安全部审核结论, .env 真值, 未脱敏数据或生产密钥/账号凭证",
+        "cannot_write": "未经规划责任人修订与用户确认的 docs/spec.md、docs/architecture/、系统级架构 ADR 或产品路线, design/ 定稿, 其他部门岗位边界, 测试部/安全部审核结论, .env 真值, 未脱敏数据或生产密钥/账号凭证",
         "confirm": "实现中发现需要改变系统级架构、路线、核心依赖或迁移/回滚合同,改认证/权限/支付/密钥,删除数据,大重构;AI 功能还包括更换基础模型、引入付费模型、上传用户数据、保存对话/向量或启用自动执行型 Agent",
     },
     "data": {
@@ -693,13 +732,13 @@ ROLE_DEFS = {
     "test": {
         "name": "测试部",
         "layer": "audit",
-        "mission": "质量关:只在用户明确确认“体验 OK / 可以进测试”后介入,依据 spec/方案检测执行层产出——代码相关验证、功能回归、异常场景、打包、日志和边界情况。亲自运行,出测试报告;结论回统筹部,不直接触发返工或放行;由统筹部节点卡同步后判断是否可自主派开发返工。测试必须覆盖派单验收出口和必测失败路径;凡涉及用户看到/提示/错误文案/进度/状态/弹窗/结果摘要/导出文件名/打包态窗口,必须测到 worker/UI/用户最终出口,不能只测 engine/API/helper 层。每个关键风险至少自设计一个反向探针。",
+        "mission": "质量关分两段介入。用户体验前先做最小独立冒烟与安全探针，确认候选可运行、不会在基本路径直接崩溃；用户确认体验方向后再做完整回归、异常场景、打包、日志和边界检查。没有用户界面的任务直接按验收出口进入完整质量验证。测试亲自运行并出报告，结论回统筹部，不直接触发返工或放行。正式测试必须覆盖派单验收出口和必测失败路径；凡涉及用户看到的提示、错误、进度、状态、弹窗、结果摘要、导出文件名或打包态窗口，必须测到用户最终出口，不能只测 engine/API/helper 层。每个关键风险至少自设计一个反向探针。",
         "not_responsible": "不代替用户体验功能;不判断是否顺手、是否符合用户预期;只判专业质量这一关,不碰安全合规与成本;不改代码;不采信开发部转述的“已通过”;不只沿开发部 happy path 重跑一遍;不因底层 engine/API 通过就判定用户可见出口通过。",
         "inputs": "docs/spec.md, 验收标准, 验收出口, 必测失败路径, 可运行的产出, 复现方式, 变更摘要(仅用于定位)",
         "outputs": "报告/ 测试报告(附自己跑出的证据:实际输出/测试结果/截图/复现步骤,并写明验证层级、用户可见出口、自设计反向探针、未覆盖层级、是否触发子 Agent 盲审/抽检), bug 清单, 是否通过建议",
         "can_write": "报告/",
         "cannot_write": "app/ 代码, 验收标准本身",
-        "confirm": "用户明确确认体验 OK / 可以进测试后才开始;测试结论出来后只回统筹部,不得直接返工或放行;涉及体验取舍、范围变化、成本/安全/发布、方案选择或重大事项时由统筹部请用户确认",
+        "confirm": "体验前最小冒烟无需用户先确认；完整体验方向由用户确认后再做正式回归。无用户界面的任务按验收出口直接完整验证。测试结论只回统筹部，不得直接返工或放行；涉及体验取舍、范围变化、成本、安全、发布、方案选择或重大事项时由统筹部请用户确认",
     },
     "security": {
         "name": "安全部",
@@ -822,6 +861,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import re
@@ -1377,7 +1417,7 @@ SESSION_STATE = COLLAB / "会话启动状态.json"
 INDEX_MARKER = "<!-- agent-team task index; use scripts/agent_team_task.py -->"
 INDEX_TRANSACTION = LOCKS / "task-index-transaction.json"
 SCHEMA_VERSION = 1
-PROTOCOL_VERSION = "1.4.8"
+PROTOCOL_VERSION = "1.4.9"
 STATES = ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged")
 BUSY_STATES = {"claimed"}
 VISIBLE_ACTIVE_STATES = {"claimed", "blocked", "waiting_input"}
@@ -1387,7 +1427,7 @@ STATE_CN = {
     "blocked": "阻断",
     "waiting_input": "等待输入",
     "completed": "待统筹核收",
-    "acknowledged": "已归档",
+    "acknowledged": "统筹已核收",
 }
 AUTH_STATES = {"none", "user_required", "user_confirmed", "user_rejected"}
 COMPLETION_CLASSES = {"standard", "audit"}
@@ -1428,6 +1468,7 @@ ROLE_DEPARTMENT_NAMES = {
     "finance": "财务部",
 }
 AUDIT_ROLE_IDS = {"review", "test", "security", "finance"}
+_TASK_CACHE = None
 
 
 def now_iso() -> str:
@@ -1736,35 +1777,50 @@ def validate_task_payload(payload: object, path: Path) -> dict:
     resolution = payload.get("resolution")
     resolution_state = "open" if resolution is None else resolution.get("state") if isinstance(resolution, dict) else None
     if resolution is not None:
-        resolution_fields = {
-            "state", "replacement_task_id", "reason", "evidence", "resolved_by", "resolved_at",
-            "target_revision_before", "replacement_revision", "replacement_state", "receipt_id",
+        common_fields = {
+            "state", "reason", "evidence", "resolved_by", "resolved_at",
+            "target_revision_before", "receipt_id",
         }
-        if not isinstance(resolution, dict) or set(resolution) != resolution_fields or resolution_state != "superseded":
+        superseded_fields = common_fields | {
+            "replacement_task_id", "replacement_revision", "replacement_state",
+        }
+        if not isinstance(resolution, dict) or resolution_state not in {
+            "superseded", "rejected_by_user", "abandoned",
+        }:
             raise ValueError(f"任务收口轴结构无效: {path.name}")
-        if state != "queued" or payload.get("temporary_executor") is not None:
-            raise ValueError(f"只允许未执行的普通 queued 任务标记 superseded: {path.name}")
-        if not TASK_ID_RE.fullmatch(resolution["replacement_task_id"]) or resolution["replacement_task_id"] == task_id:
-            raise ValueError(f"任务替代指针无效: {path.name}")
-        for field in ("reason", "evidence", "resolved_by", "replacement_state", "receipt_id"):
+        expected_fields = superseded_fields if resolution_state == "superseded" else common_fields
+        if set(resolution) != expected_fields or payload.get("temporary_executor") is not None:
+            raise ValueError(f"任务收口轴字段无效: {path.name}")
+        allowed_resolution_states = {"queued", "blocked", "waiting_input"}
+        if state not in allowed_resolution_states:
+            raise ValueError(f"当前执行状态不允许该收口结论: {path.name}")
+        for field in ("reason", "evidence", "resolved_by", "receipt_id"):
             if not isinstance(resolution[field], str):
-                raise ValueError(f"任务替代证据类型无效: {path.name}:{field}")
+                raise ValueError(f"任务收口证据类型无效: {path.name}:{field}")
             if not resolution[field].strip() or len(resolution[field]) > 1000:
-                raise ValueError(f"任务替代证据缺失: {path.name}:{field}")
+                raise ValueError(f"任务收口证据缺失: {path.name}:{field}")
         if (
             not resolution["resolved_by"].startswith("统筹部/")
             or any(char.isspace() for char in resolution["resolved_by"])
-            or resolution["replacement_state"] == "queued"
-            or resolution["replacement_state"] not in STATES
             or not re.fullmatch(r"RES-[0-9]{8}T[0-9]{6}-[A-F0-9]{8}", resolution["receipt_id"])
             or isinstance(resolution["target_revision_before"], bool)
             or not isinstance(resolution["target_revision_before"], int)
             or resolution["target_revision_before"] < 1
-            or isinstance(resolution["replacement_revision"], bool)
-            or not isinstance(resolution["replacement_revision"], int)
-            or resolution["replacement_revision"] < 1
         ):
-            raise ValueError(f"任务替代版本或后续状态无效: {path.name}")
+            raise ValueError(f"任务收口身份或版本无效: {path.name}")
+        if resolution_state == "superseded":
+            if (
+                not TASK_ID_RE.fullmatch(resolution["replacement_task_id"])
+                or resolution["replacement_task_id"] == task_id
+                or resolution["replacement_state"] == "queued"
+                or resolution["replacement_state"] not in STATES
+                or isinstance(resolution["replacement_revision"], bool)
+                or not isinstance(resolution["replacement_revision"], int)
+                or resolution["replacement_revision"] < 1
+            ):
+                raise ValueError(f"任务替代版本或后续状态无效: {path.name}")
+        elif resolution_state == "rejected_by_user" and authorization != "user_rejected":
+            raise ValueError(f"用户拒绝收口必须绑定 user_rejected 授权事实: {path.name}")
         parse_task_timestamp(resolution, "resolved_at")
     completion_class = payload.get("completion_class")
     if not isinstance(completion_class, str) or completion_class not in COMPLETION_CLASSES:
@@ -1775,13 +1831,13 @@ def validate_task_payload(payload: object, path: Path) -> dict:
     revision = payload.get("revision")
     if isinstance(revision, bool) or not isinstance(revision, int) or revision < 1:
         raise ValueError(f"任务 revision 无效: {path.name}")
-    if resolution_state == "superseded" and resolution["target_revision_before"] + 1 != revision:
+    if resolution_state != "open" and resolution["target_revision_before"] + 1 != revision:
         raise ValueError(f"任务收口版本与当前 revision 不连续: {path.name}")
     created_at = parse_task_timestamp(payload, "created_at")
     updated_at = parse_task_timestamp(payload, "updated_at")
     if updated_at < created_at:
         raise ValueError(f"任务 updated_at 早于 created_at: {path.name}")
-    if resolution_state == "superseded":
+    if resolution_state != "open":
         resolved_at = parse_task_timestamp(resolution, "resolved_at")
         if resolved_at != updated_at or resolved_at < created_at:
             raise ValueError(f"任务收口时间越出任务时间轴: {path.name}")
@@ -1838,11 +1894,14 @@ def locate(task_id: str) -> tuple[str, Path, dict]:
 
 
 def all_tasks() -> list[tuple[str, Path, dict]]:
+    global _TASK_CACHE
+    if _TASK_CACHE is not None:
+        return _TASK_CACHE
     tasks = [locate(path.stem) for path in sorted(TASKS.glob("TASK-*.json"))]
     by_id = {task["task_id"]: task for _, _, task in tasks}
     for _, path, task in tasks:
         resolution = task.get("resolution")
-        if resolution is None:
+        if resolution is None or resolution.get("state") != "superseded":
             continue
         replacement = by_id.get(resolution["replacement_task_id"])
         if (
@@ -1852,7 +1911,13 @@ def all_tasks() -> list[tuple[str, Path, dict]]:
             or replacement["execution_state"] == "queued"
         ):
             raise ValueError(f"任务替代证据已缺失、倒退或再次收口: {path.name}")
+    _TASK_CACHE = tasks
     return tasks
+
+
+def invalidate_task_cache() -> None:
+    global _TASK_CACHE
+    _TASK_CACHE = None
 
 
 def configured_departments() -> dict[str, str]:
@@ -1871,6 +1936,8 @@ def configured_departments() -> dict[str, str]:
         role_id = item.get("role_id")
         if not isinstance(role_id, str) or ROLE_DEPARTMENT_NAMES.get(role_id) != name:
             raise ValueError(f"会话启动状态的部门与固定角色不一致: {name}")
+        if not isinstance(item.get("active"), bool):
+            raise ValueError(f"会话启动状态 active 无效: {name}")
         department_path = DEPARTMENTS / name
         ensure_plain_dir(department_path, DEPARTMENTS)
         result[name] = role_id
@@ -1884,6 +1951,9 @@ def department_names() -> list[str]:
 def require_department(name: str) -> None:
     if name not in department_names():
         raise ValueError(f"未知部门: {name}")
+    payload = strict_json_loads(SESSION_STATE.read_text(encoding="utf-8"), str(SESSION_STATE))
+    if not payload["departments"][name]["active"]:
+        raise ValueError(f"部门已停用，不能承接新动作: {name}")
 
 
 def audit_department(name: str) -> bool:
@@ -1938,25 +2008,52 @@ def audit_report(raw: str, department: str, task_id: str) -> str:
         raise ValueError("审核报告缺少 YAML frontmatter")
     header = text.split("\n---\n", 1)[0][4:]
     fields = {}
-    for line in header.splitlines():
-        if ":" in line:
-            key, value = line.split(":", 1)
-            normalized_key = key.strip()
-            if normalized_key in fields:
-                raise ValueError(f"审核报告 YAML 含重复字段: {normalized_key}")
-            fields[normalized_key] = value.strip()
+    for line_number, line in enumerate(header.splitlines(), start=2):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if line != line.lstrip() or ":" not in line:
+            raise ValueError(f"审核报告 YAML 只允许顶层单行字段: line {line_number}")
+        key, value = line.split(":", 1)
+        normalized_key = key.strip()
+        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_-]*", normalized_key):
+            raise ValueError(f"审核报告 YAML 字段名无效: line {line_number}")
+        if normalized_key in fields:
+            raise ValueError(f"审核报告 YAML 含重复字段: {normalized_key}")
+        scalar = value.strip()
+        if scalar.startswith('"') or scalar.endswith('"'):
+            if not (scalar.startswith('"') and scalar.endswith('"')):
+                raise ValueError(f"审核报告 YAML 引号无效: {normalized_key}")
+            try:
+                scalar = json.loads(scalar)
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"审核报告 YAML 字符串无效: {normalized_key}") from exc
+        elif scalar.startswith("'") or scalar.endswith("'"):
+            if not (scalar.startswith("'") and scalar.endswith("'")):
+                raise ValueError(f"审核报告 YAML 引号无效: {normalized_key}")
+            scalar = scalar[1:-1].replace("''", "'")
+        if not isinstance(scalar, str):
+            raise ValueError(f"审核报告 YAML 字段必须是字符串: {normalized_key}")
+        fields[normalized_key] = scalar.strip()
     required = {"type", "department", "target", "status", "date", "related_task", "decision", "tags", "summary"}
     missing = sorted(key for key in required if not fields.get(key))
     if missing:
         raise ValueError("审核报告 YAML 缺少字段: " + ", ".join(missing))
     if fields["type"] != "audit_report" or fields["department"] != department or fields["related_task"] != task_id:
         raise ValueError("审核报告 YAML 的 type / department / related_task 与任务不一致")
+    if fields["status"] != "final":
+        raise ValueError("审核报告 status 必须为 final；pending 草稿不能完成审核任务")
+    if fields["decision"] not in {"pass", "fail"}:
+        raise ValueError("审核报告 decision 必须为 pass 或 fail")
+    placeholders = {"待定", "待补", "待填", "待填写", "pending", "todo", "tbd", "n/a", "-"}
+    normalized_summary = fields["summary"].strip().lower()
+    if normalized_summary in placeholders or normalized_summary.startswith(("待填", "待补", "todo", "tbd")):
+        raise ValueError("审核报告 summary 仍是占位内容")
     return relative
 
 
 def registered_lead_actor() -> str:
     if SESSION_STATE.is_symlink() or not SESSION_STATE.is_file():
-        raise ValueError("会话状态缺失或不安全,不能核收")
+        raise ValueError("会话状态缺失或不安全，不能执行统筹动作")
     payload = strict_json_loads(SESSION_STATE.read_text(encoding="utf-8"), str(SESSION_STATE))
     if (
         not isinstance(payload, dict)
@@ -1976,7 +2073,7 @@ def registered_lead_actor() -> str:
         or thread_id.startswith("=")
         or any(char.isspace() for char in thread_id)
     ):
-        raise ValueError("统筹部会话尚未登记,不能核收")
+        raise ValueError("统筹部会话尚未登记，不能执行统筹动作")
     return f"统筹部/{thread_id}"
 
 
@@ -2002,8 +2099,14 @@ def render_inboxes(*, force: bool = False) -> None:
             and t.get("resolution") is None
             and t["authorization_state"] in {"user_required", "user_rejected"}
         ]
-        active = [(s, p, t) for s, p, t in tasks if t["department"] == department and s in VISIBLE_ACTIVE_STATES]
-        review = [(s, p, t) for s, p, t in tasks if department == "统筹部" and s == "completed"]
+        active = [
+            (s, p, t) for s, p, t in tasks
+            if t["department"] == department and s in VISIBLE_ACTIVE_STATES and t.get("resolution") is None
+        ]
+        review = [
+            (s, p, t) for s, p, t in tasks
+            if department == "统筹部" and s == "completed" and t.get("resolution") is None
+        ]
         lines = [
             f"# {department} · 收件箱",
             "",
@@ -2080,6 +2183,7 @@ def save_new(task: dict) -> Path:
     validate_task_payload(task, path)
     data = json.dumps(task, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     write_atomic(path, data, 0o600)
+    invalidate_task_cache()
     return path
 
 
@@ -2099,10 +2203,13 @@ def transition(task_id: str, action: str, mutate) -> tuple[dict, Path]:
     validate_task_payload(task, source)
     data = json.dumps(task, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     write_atomic(source, data, 0o600)
+    invalidate_task_cache()
     return task, source
 
 
-def update_task(task_id: str, mutate, *, allowed_states: set[str]) -> tuple[dict, Path]:
+def update_task(
+    task_id: str, mutate, *, allowed_states: set[str], timestamp: str | None = None,
+) -> tuple[dict, Path]:
     state, path, task = locate(task_id)
     if state not in allowed_states:
         raise ValueError(f"当前状态不允许更新任务记录: {state}")
@@ -2110,11 +2217,12 @@ def update_task(task_id: str, mutate, *, allowed_states: set[str]) -> tuple[dict
         raise ValueError("已收口任务不得再更新")
     task = dict(task)
     mutate(task)
-    task["updated_at"] = now_iso()
+    task["updated_at"] = timestamp or now_iso()
     task["revision"] = int(task.get("revision", 0)) + 1
     validate_task_payload(task, path)
     data = json.dumps(task, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
     write_atomic(path, data, 0o600)
+    invalidate_task_cache()
     return task, path
 
 
@@ -2219,6 +2327,10 @@ def cmd_declare_impact(args) -> int:
 def cmd_enqueue(args) -> int:
     require_department(args.department)
     require_department(args.from_department)
+    actor = clean("actor", args.actor, max_chars=200)
+    expected_actor = registered_lead_actor()
+    if actor != expected_actor:
+        raise ValueError(f"actor 必须匹配当前已登记统筹会话: {expected_actor};该字段只作审计声明")
     failure_paths = [clean("failure-path", item, max_chars=1000) for item in args.failure_path]
     if not 1 <= len(failure_paths) <= 3:
         raise ValueError("failure-path 必须提供 1-3 项")
@@ -2277,6 +2389,7 @@ def cmd_claim(args) -> int:
         raise ValueError("已收口任务不得再领取")
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
+    require_department(current["department"])
     authorization = current["authorization_state"]
     if authorization in {"user_required", "user_rejected"}:
         raise ValueError(f"当前授权状态禁止领取: {authorization}")
@@ -2316,6 +2429,7 @@ def cmd_resume(args) -> int:
     _, current_path, current = locate(args.task_id)
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
+    require_department(current["department"])
     authorization = current["authorization_state"]
     if authorization in {"user_required", "user_rejected"}:
         raise ValueError(f"当前授权状态禁止恢复: {authorization}")
@@ -2330,6 +2444,10 @@ def cmd_resume(args) -> int:
 
 
 def cmd_authorize(args) -> int:
+    actor = clean("actor", args.actor, max_chars=200)
+    expected_actor = registered_lead_actor()
+    if actor != expected_actor:
+        raise ValueError(f"actor 必须匹配当前已登记统筹会话: {expected_actor};该字段只作审计声明")
     _, _, current = locate(args.task_id)
     if current.get("resolution") is not None:
         raise ValueError("已收口任务不得再修改授权")
@@ -2359,8 +2477,8 @@ def cmd_authorize(args) -> int:
 
 def cmd_supersede(args) -> int:
     state, path, current = locate(args.task_id)
-    if state != "queued" or current.get("resolution") is not None:
-        raise ValueError("只允许收口尚未执行的 open queued 任务")
+    if state not in {"queued", "blocked", "waiting_input"} or current.get("resolution") is not None:
+        raise ValueError("只允许收口 open queued / blocked / waiting_input 任务；claimed 任务须先 block")
     if current.get("temporary_executor") is not None:
         raise ValueError("临时外包任务必须按专用生命周期收口")
     if current["revision"] != args.expected_revision:
@@ -2421,11 +2539,13 @@ def cmd_supersede(args) -> int:
         )
         encoded = json.dumps(candidate, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
         write_atomic(path, encoded, 0o600)
+        invalidate_task_cache()
         render_inboxes()
         INDEX_TRANSACTION.unlink()
         fsync_dir(LOCKS)
     except Exception:
         write_atomic(path, original_task, 0o600)
+        invalidate_task_cache()
         for inbox, data in inboxes.items():
             write_atomic(inbox, data, 0o644)
         if INDEX_TRANSACTION.exists() and not INDEX_TRANSACTION.is_symlink() and INDEX_TRANSACTION.is_file():
@@ -2437,6 +2557,55 @@ def cmd_supersede(args) -> int:
         f"TASK_RESOLUTION_OK | state=superseded | task_id={candidate['task_id']} | "
         f"replacement={replacement['task_id']} | revision={candidate['revision']} | "
         f"receipt_id={receipt_id} | digest={digest} | path={path.relative_to(PROJECT)}"
+    )
+    return 0
+
+
+def cmd_resolve(args) -> int:
+    state, _, current = locate(args.task_id)
+    if state not in {"queued", "blocked", "waiting_input"} or current.get("resolution") is not None:
+        raise ValueError("只允许收口 open queued / blocked / waiting_input 任务；claimed 任务须先 block")
+    if current.get("temporary_executor") is not None:
+        raise ValueError("临时外包任务必须按专用生命周期收口")
+    if current["revision"] != args.expected_revision:
+        raise ValueError("expected-revision 与 TASK 当前 revision 不一致")
+    actor = clean("actor", args.actor, max_chars=200)
+    expected_actor = registered_lead_actor()
+    if actor != expected_actor:
+        raise ValueError(f"actor 必须匹配当前已登记统筹会话: {expected_actor};该字段只作审计声明")
+    resolution_state = args.state
+    timestamp = now_iso()
+    receipt_id = "RES-" + dt.datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8].upper()
+    resolution = {
+        "state": resolution_state,
+        "reason": clean("reason", args.reason, max_chars=1000),
+        "evidence": clean("evidence", args.evidence, max_chars=1000),
+        "resolved_by": actor,
+        "resolved_at": timestamp,
+        "target_revision_before": current["revision"],
+        "receipt_id": receipt_id,
+    }
+
+    def mutate(item: dict) -> None:
+        if resolution_state == "rejected_by_user" and item["authorization_state"] != "user_rejected":
+            item["authorization_state"] = "user_rejected"
+            item["authorization_evidence"] = resolution["evidence"]
+            history = list(item.get("authorization_history", []))
+            history.append({
+                "at": timestamp, "state": "user_rejected", "evidence": resolution["evidence"],
+            })
+            item["authorization_history"] = history
+        item["resolution"] = resolution
+
+    task, path = update_task(
+        args.task_id, mutate, allowed_states={"queued", "blocked", "waiting_input"}, timestamp=timestamp,
+    )
+    refresh_inboxes()
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()[:16]
+    print(
+        f"TASK_RESOLUTION_OK | state={resolution_state} | task_id={task['task_id']} | "
+        f"revision={task['revision']} | receipt_id={receipt_id} | digest={digest} | "
+        f"path={path.relative_to(PROJECT)}"
     )
     return 0
 
@@ -2501,7 +2670,17 @@ def cmd_list(args) -> int:
             continue
         if args.state and state != args.state:
             continue
-        label = "已取代" if task.get("resolution") is not None else STATE_CN[state]
+        resolution_labels = {
+            "superseded": "已取代", "rejected_by_user": "用户拒绝后收口", "abandoned": "已放弃",
+        }
+        if task.get("resolution"):
+            label = resolution_labels.get(task["resolution"].get("state"), STATE_CN[state])
+        elif state == "queued" and task["authorization_state"] == "user_required":
+            label = "待用户确认"
+        elif state == "queued" and task["authorization_state"] == "user_rejected":
+            label = "用户已拒绝，待收口"
+        else:
+            label = STATE_CN[state]
         rows.append(f"{task['task_id']} | {label} | {task['department']} | {task['title']} | {path.relative_to(PROJECT)}")
     print("\n".join(rows) if rows else "NO_TASKS")
     return 0
@@ -2513,10 +2692,17 @@ def cmd_rebuild_index(args) -> int:
     return 0
 
 
+def cmd_doctor(args) -> int:
+    tasks = all_tasks()
+    print(f"TASK_DOCTOR_OK | tasks={len(tasks)} | full_history_validated=true")
+    return 0
+
+
 def parser() -> argparse.ArgumentParser:
     root = argparse.ArgumentParser(description="agent-team 原子任务队列")
     sub = root.add_subparsers(dest="cmd", required=True)
     enqueue = sub.add_parser("enqueue")
+    enqueue.add_argument("--actor", required=True, help="当前已登记统筹会话，格式：统筹部/会话ID")
     enqueue.add_argument("--department", required=True)
     enqueue.add_argument("--from-department", required=True)
     enqueue.add_argument("--title", required=True)
@@ -2554,16 +2740,25 @@ def parser() -> argparse.ArgumentParser:
     authorize.add_argument("--task-id", required=True)
     authorize.add_argument("--state", choices=("user_required", "user_confirmed", "user_rejected"), required=True)
     authorize.add_argument("--evidence", required=True)
+    authorize.add_argument("--actor", required=True, help="当前已登记统筹会话，格式：统筹部/会话ID")
     authorize.set_defaults(func=cmd_authorize)
     supersede = sub.add_parser("supersede")
     supersede.add_argument("--task-id", required=True)
     supersede.add_argument("--replacement-task", required=True)
     supersede.add_argument("--expected-revision", required=True, type=int)
     supersede.add_argument("--expected-replacement-revision", required=True, type=int)
-    supersede.add_argument("--actor", required=True)
+    supersede.add_argument("--actor", required=True, help="当前已登记统筹会话，格式：统筹部/会话ID")
     supersede.add_argument("--reason", required=True)
     supersede.add_argument("--evidence", required=True)
     supersede.set_defaults(func=cmd_supersede)
+    resolve = sub.add_parser("resolve")
+    resolve.add_argument("--task-id", required=True)
+    resolve.add_argument("--state", choices=("rejected_by_user", "abandoned"), required=True)
+    resolve.add_argument("--expected-revision", required=True, type=int)
+    resolve.add_argument("--actor", required=True, help="当前已登记统筹会话，格式：统筹部/会话ID")
+    resolve.add_argument("--reason", required=True)
+    resolve.add_argument("--evidence", required=True)
+    resolve.set_defaults(func=cmd_resolve)
     complete = sub.add_parser("complete")
     complete.add_argument("--task-id", required=True)
     complete.add_argument("--artifact", action="append", default=[])
@@ -2576,7 +2771,10 @@ def parser() -> argparse.ArgumentParser:
     complete.set_defaults(func=cmd_complete)
     ack = sub.add_parser("ack")
     ack.add_argument("--task-id", required=True)
-    ack.add_argument("--acknowledged-by", required=True)
+    ack.add_argument(
+        "--acknowledged-by", required=True,
+        help="当前已登记统筹会话，格式：统筹部/会话ID",
+    )
     ack.set_defaults(func=cmd_ack)
     listing = sub.add_parser("list")
     listing.add_argument("--department")
@@ -2584,6 +2782,8 @@ def parser() -> argparse.ArgumentParser:
     listing.set_defaults(func=cmd_list)
     rebuild = sub.add_parser("rebuild-index")
     rebuild.set_defaults(func=cmd_rebuild_index)
+    doctor = sub.add_parser("doctor")
+    doctor.set_defaults(func=cmd_doctor)
     return root
 
 
@@ -2592,7 +2792,6 @@ def main() -> int:
     try:
         init_layout()
         with task_lock():
-            all_tasks()
             recover_index_transaction()
             return args.func(args)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
@@ -2614,6 +2813,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import stat
@@ -2630,11 +2830,14 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_SESSION_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.4.8"
-ROOT_FIELDS = {"schema_version", "protocol_version", "updated_at", "departments"}
+PROTOCOL_VERSION = "1.4.9"
+ROOT_FIELDS = {
+    "schema_version", "protocol_version", "created_at", "updated_at", "profile",
+    "session_mode", "role_order", "departments",
+}
 ITEM_FIELDS = {
-    "role_id", "notification_mode", "step", "thread_id", "previous_thread_id",
-    "failed_from", "evidence", "operation_id", "note", "updated_at",
+    "role_id", "active", "notification_mode", "step", "thread_id", "previous_thread_id",
+    "failed_from", "evidence", "operation_id", "note", "updated_at", "lifecycle_history",
 }
 
 
@@ -2801,8 +3004,9 @@ def load() -> dict:
         or set(payload) != ROOT_FIELDS
         or payload.get("schema_version") != 1
         or payload.get("protocol_version") != PROTOCOL_VERSION
-        or not isinstance(payload.get("updated_at"), str)
-        or not payload["updated_at"]
+        or any(not isinstance(payload.get(field), str) or not payload.get(field) for field in ("created_at", "updated_at", "profile"))
+        or payload.get("session_mode") not in {"auto", "manual"}
+        or not isinstance(payload.get("role_order"), list)
         or not isinstance(payload.get("departments"), dict)
         or not payload["departments"]
     ):
@@ -2810,10 +3014,40 @@ def load() -> dict:
     for department, item in payload["departments"].items():
         if not isinstance(department, str) or not isinstance(item, dict) or set(item) != ITEM_FIELDS:
             raise ValueError(f"会话启动状态部门条目无效: {department}")
-        if item.get("notification_mode") not in {"auto", "manual"} or item.get("step") not in STEPS:
+        if (
+            not isinstance(item.get("active"), bool)
+            or item.get("notification_mode") not in {"auto", "manual"}
+            or item.get("step") not in STEPS
+        ):
             raise ValueError(f"会话启动状态部门值无效: {department}")
-        if any(not isinstance(item[field], str) for field in ITEM_FIELDS):
+        if any(not isinstance(item[field], str) for field in ITEM_FIELDS - {"active", "lifecycle_history"}):
             raise ValueError(f"会话启动状态部门类型无效: {department}")
+        history = item["lifecycle_history"]
+        if not isinstance(history, list) or any(
+            not isinstance(event, dict)
+            or set(event) != {"event", "at", "actor", "evidence", "thread_id"}
+            or event.get("event") not in {"retired", "deactivated", "reactivated"}
+            or any(not isinstance(event.get(field), str) or not event.get(field) for field in ("at", "actor", "evidence"))
+            or not isinstance(event.get("thread_id"), str)
+            for event in history
+        ):
+            raise ValueError(f"会话启动状态 lifecycle_history 无效: {department}")
+    role_ids = [item["role_id"] for item in payload["departments"].values()]
+    if (
+        any(not isinstance(role, str) for role in payload["role_order"])
+        or len(payload["role_order"]) != len(set(payload["role_order"]))
+        or set(payload["role_order"]) != set(role_ids)
+    ):
+        raise ValueError("会话启动状态 role_order 无效")
+    audit_roles = {"review", "test", "security", "finance"}
+    active_layers = set()
+    for item in payload["departments"].values():
+        if not item["active"]:
+            continue
+        role_id = item["role_id"]
+        active_layers.add("management" if role_id == "lead" else "audit" if role_id in audit_roles else "execution")
+    if active_layers != {"management", "execution", "audit"}:
+        raise ValueError("活跃部门未保持管理、执行、审核三层最小结构")
     validate_identity_registry(payload)
     return payload
 
@@ -2843,6 +3077,10 @@ def validate_identity_registry(payload: dict) -> None:
         previous_thread = item.get("previous_thread_id", "")
         operation_id = item.get("operation_id", "")
         failed_from = item.get("failed_from", "")
+        if not item.get("active", False) and (
+            item.get("step") != "pending" or current_thread or previous_thread
+        ):
+            raise ValueError(f"已停用部门仍保留活动会话事实: {department}")
         for label, thread_id in (("thread_id", current_thread), ("previous_thread_id", previous_thread)):
             if isinstance(thread_id, str) and thread_id and (
                 len(thread_id) > 300
@@ -2927,7 +3165,7 @@ def refresh_registry(payload: dict) -> None:
             continue
         parts[3] = item.get("thread_id") or "待登记"
         parts[4] = item.get("notification_mode") or "待登记"
-        parts[5] = {
+        parts[5] = "已停用" if not item.get("active", False) else {
             "pending": "待启用", "created": "上岗中", "onboarded": "上岗中",
             "registered": "已启用", "failed": "失败",
         }.get(item.get("step"), "待启用")
@@ -2950,9 +3188,79 @@ def save(payload: dict) -> None:
 
 def entry(payload: dict, department: str) -> dict:
     try:
-        return payload["departments"][department]
+        item = payload["departments"][department]
+        if not item.get("active", False):
+            raise ValueError(f"部门已停用: {department}")
+        return item
     except KeyError as exc:
         raise ValueError(f"未知部门: {department}") from exc
+
+
+def registered_lead_actor(payload: dict) -> str:
+    item = payload["departments"].get("统筹部", {})
+    thread_id = item.get("thread_id", "")
+    if (
+        item.get("role_id") != "lead"
+        or not item.get("active", False)
+        or item.get("step") != "registered"
+        or not isinstance(thread_id, str)
+        or not thread_id
+    ):
+        raise ValueError("统筹部会话尚未登记")
+    return f"统筹部/{thread_id}"
+
+
+def cmd_rebuild_registry(args) -> int:
+    payload = load()
+    rows = []
+    audit_roles = {"review", "test", "security", "finance"}
+    by_role = {item["role_id"]: (department, item) for department, item in payload["departments"].items()}
+    for role_id in payload["role_order"]:
+        department, item = by_role[role_id]
+        layer = "管理层" if role_id == "lead" else "审核层" if role_id in audit_roles else "执行层"
+        status = "已停用" if not item["active"] else {
+            "pending": "待启用", "created": "上岗中", "onboarded": "上岗中",
+            "registered": "已启用", "failed": "失败",
+        }[item["step"]]
+        rows.append(
+            f"| {layer} | {department} | `{role_id}` | {item['thread_id'] or '待登记'} | "
+            f"{item['notification_mode']} | {status} |"
+        )
+    content = """# 部门表
+
+> 把岗位绑定到具体会话;没有真实会话工具收据时,会话 ID 保持待登记。
+
+## 团队摘要
+
+- 项目类型:{profile}
+- 创建日期:{created_at}
+- 协议版本:{protocol}
+- 会话创建模式:{session_mode}
+
+## 部门列表
+
+| 层 | 部门 | 角色 ID | 会话 ID | 通知模式 | 状态 |
+|----|------|---------|---------|----------|------|
+{rows}
+
+## 使用规则
+
+- 管理层、执行层、审核层必须齐全;新增、删除或替换部门前先获用户确认。
+- `manual` 只生成文件;`auto` 也必须以真实会话工具收据和状态登记为准,不得把配置写成已创建。
+- 每个新会话首次读本部门上岗引导、岗位说明、交接班文档和收件箱;同一会话后续不重复读上岗引导。
+- 任务正文和状态只认 `tasks/TASK-*.json`;收件箱是活动任务索引,通知只发任务 ID 和短状态。
+- 产品体验、范围取舍、设计方向、发布/外发、明显成本和隐私安全风险由用户确认;设计预览仅在用户提出或任务明确要求时制作。
+- 审核部门亲自验证并只回结论和证据,不直接返工、放行或修改产物。
+- 同部门换班须由用户授权;新会话登记成功后才归档旧会话,不 fork 旧历史。
+- 会话 ID 和通知模式以会话状态 JSON 为准,由会话工具刷新本表;不要手工改行。通知模式变更须经用户确认后运行 `set-notification`。
+""".format(
+        profile=payload["profile"], created_at=payload["created_at"], protocol=PROTOCOL_VERSION,
+        session_mode=payload["session_mode"], rows="\n".join(rows),
+    )
+    encoded = content.encode("utf-8")
+    write_atomic(REGISTRY_FILE, encoded, 0o644)
+    print(f"SESSION_REGISTRY_OK | departments={len(rows)}")
+    return 0
 
 
 def cmd_show(args) -> int:
@@ -3081,6 +3389,10 @@ def cmd_finish_switch(args) -> int:
 
 def cmd_set_notification(args) -> int:
     payload = load()
+    actor = clean("actor", args.actor)
+    expected_actor = registered_lead_actor(payload)
+    if actor != expected_actor:
+        raise ValueError(f"actor 必须匹配当前已登记统筹会话: {expected_actor};该字段只作审计声明")
     item = entry(payload, args.department)
     item["notification_mode"] = args.mode
     item["note"] = clean("evidence", args.evidence)
@@ -3090,11 +3402,47 @@ def cmd_set_notification(args) -> int:
     return 0
 
 
+def cmd_retire(args) -> int:
+    payload = load()
+    actor = clean("actor", args.actor)
+    expected_actor = registered_lead_actor(payload)
+    if actor != expected_actor:
+        raise ValueError(f"actor 必须匹配当前已登记统筹会话: {expected_actor};该字段只作审计声明")
+    item = entry(payload, args.department)
+    if item.get("role_id") == "lead":
+        raise ValueError("统筹部会话不能通过 retire 退役")
+    if item["step"] != "registered" or not item.get("thread_id") or item.get("previous_thread_id"):
+        raise ValueError("只允许退役无换班事务的已登记部门会话")
+    thread_id = item["thread_id"]
+    evidence = clean("evidence", args.evidence, max_chars=1000)
+    if not valid_archive_receipt(evidence, thread_id):
+        raise ValueError("retire 必须提供精确绑定当前 thread_id 的真实归档回执")
+    history = list(item["lifecycle_history"])
+    history.append({
+        "event": "retired", "at": now_iso(), "actor": actor,
+        "evidence": evidence, "thread_id": thread_id,
+    })
+    item["lifecycle_history"] = history
+    item["step"] = "pending"
+    item["thread_id"] = ""
+    item["previous_thread_id"] = ""
+    item["failed_from"] = ""
+    item["operation_id"] = "RETIRED-" + uuid.uuid4().hex[:10].upper()
+    item["note"] = evidence
+    item["evidence"] = evidence
+    item["updated_at"] = now_iso()
+    save(payload)
+    print(f"SESSION_RETIRED | {args.department} | thread_id={thread_id}")
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="agent-team 会话创建/换班恢复状态")
     sub = parser.add_subparsers(dest="cmd", required=True)
     show = sub.add_parser("show")
     show.set_defaults(func=cmd_show)
+    rebuild = sub.add_parser("rebuild-registry")
+    rebuild.set_defaults(func=cmd_rebuild_registry)
     mark = sub.add_parser("mark")
     mark.add_argument("--department", required=True)
     mark.add_argument("--step", required=True, choices=sorted(STEPS - {"pending"}))
@@ -3121,7 +3469,13 @@ def main() -> int:
     notification.add_argument("--department", required=True)
     notification.add_argument("--mode", choices=("auto", "manual"), required=True)
     notification.add_argument("--evidence", required=True)
+    notification.add_argument("--actor", required=True, help="当前已登记统筹会话，格式：统筹部/会话ID")
     notification.set_defaults(func=cmd_set_notification)
+    retire = sub.add_parser("retire")
+    retire.add_argument("--department", required=True)
+    retire.add_argument("--actor", required=True, help="当前已登记统筹会话，格式：统筹部/会话ID")
+    retire.add_argument("--evidence", required=True)
+    retire.set_defaults(func=cmd_retire)
     args = parser.parse_args()
     try:
         with state_lock():
@@ -3322,6 +3676,7 @@ summary: 待填一句话结论
 ## 结论:通过 / 不通过 + 理由
 ## 需要用户决定
 -->
+> 完成审核任务前，必须把 `status` 改为 `final`，把 `decision` 改为 `pass` 或 `fail`，并写出真实 summary；草稿不能通过任务完成闸门。
 """
 
 
@@ -3415,14 +3770,19 @@ def cuoti_markdown(date: str) -> str:
 """
 
 
-def session_state_payload(roles: list[str], date: str, notification_mode: str) -> str:
+def session_state_payload(roles: list[str], date: str, notification_mode: str, profile: str) -> str:
     payload = {
         "schema_version": 1,
         "protocol_version": PROTOCOL_VERSION,
+        "created_at": date,
         "updated_at": date,
+        "profile": profile,
+        "session_mode": notification_mode,
+        "role_order": roles,
         "departments": {
             ROLE_DEFS[key]["name"]: {
                 "role_id": key,
+                "active": True,
                 "notification_mode": notification_mode,
                 "step": "pending",
                 "thread_id": "",
@@ -3432,6 +3792,7 @@ def session_state_payload(roles: list[str], date: str, notification_mode: str) -
                 "operation_id": "INIT-" + hashlib.sha256(f"{date}:{key}".encode("utf-8")).hexdigest()[:10].upper(),
                 "note": "",
                 "updated_at": date,
+                "lifecycle_history": [],
             }
             for key in roles
         },
@@ -3556,6 +3917,7 @@ def handoff_template_markdown() -> str:
 
 ```bash
 python3 docs/collaboration/scripts/agent_team_task.py enqueue \
+  --actor "统筹部/已登记会话ID" \
   --department 开发部 --from-department 统筹部 --title "节点名" \
   --node "本次只做的节点" --details "必要背景与输出" \
   --acceptance-exit "用户最终在哪里看到什么" \
@@ -3566,7 +3928,7 @@ python3 docs/collaboration/scripts/agent_team_task.py enqueue \
 
 python3 docs/collaboration/scripts/agent_team_task.py claim --task-id TASK-YYYYMMDD-XXXXXX --claimed-by "开发部当前会话"
 python3 docs/collaboration/scripts/agent_team_task.py authorize --task-id TASK-YYYYMMDD-XXXXXX \
-  --state user_confirmed --evidence "用户确认消息或会话指针"
+  --state user_confirmed --evidence "用户确认消息或会话指针" --actor "统筹部/已登记会话ID"
 python3 docs/collaboration/scripts/agent_team_task.py complete --task-id TASK-YYYYMMDD-XXXXXX \
   --artifact "产出路径" --verified "已验证内容" --unverified "未验证项;没有则写无" \
   --mistake-check "已检查相关错题,无命中"
@@ -3638,8 +4000,9 @@ def session_startup_markdown(roles: list[str], session_mode: str, date: str) -> 
 1. 用户按下表手动创建各部门会话窗口。
 2. 给每个窗口粘贴对应 `上岗引导.md`。
 3. 部门会话先按 `上岗引导.md → 岗位说明.md → 交接班文档.md → 收件箱.md` 接班。
-4. 部门会话先短报职责、当前任务和待确认问题;已有授权清楚的 claimed 任务且无冲突时同一轮续做。
-5. 后续任务通过任务工具流转;收件箱由工具重建,会话消息只做短唤醒。
+4. 取得每个窗口可稳定引用的会话 ID 后，依次运行 `mark --step created / onboarded / registered --thread-id <同一ID> --evidence "人工创建、发送和接班记录"`。统筹部必须先完成 `registered`，否则不能派第一张任务。
+5. 部门会话先短报职责、当前任务和待确认问题;已有授权清楚的 claimed 任务且无冲突时同一轮续做。
+6. 后续任务通过任务工具流转;收件箱由工具重建,会话消息只做短唤醒。
 
 ## 同部门换班(需用户授权)
 
@@ -3649,6 +4012,10 @@ def session_startup_markdown(roles: list[str], session_mode: str, date: str) -> 
 - 使用当前宿主提供的会话管理能力创建同项目新会话并发送接班消息;具体工具由 Agent 按当前环境选择。不要用复制旧聊天历史的 fork。
 - 新会话接班消息必须带部门名、新旧会话 ID 和四文档路径;读取成功后依次用 `mark --step created / onboarded / registered --evidence ...` 登记同一新 thread ID。
 - 旧会话归档必须最后执行。归档成功后运行 `finish-switch --department ... --new-thread-id ... --evidence "归档收据"` 清理旧 ID。新会话尚未创建时，失败可直接执行 `restore-old --department ... --note "真实错误"`。一旦已登记新 thread ID，不得直接覆盖；若确定放弃新会话并恢复旧会话，先归档新会话，再用 `restore-old ... --evidence "host=<真实工具> thread_id=<新ID> archived=true"` 登记收据；无归档能力时保留新旧两个 ID 并提醒用户，不得让任一会话从真值中消失。新会话已 registered 而只是旧会话归档失败时，保持当前换班状态并重试 `finish-switch`。
+
+## 停用部门前退役会话
+
+已登记部门要先真实归档当前会话，再运行 `agent_team_session.py retire --department ... --actor "统筹部/已登记会话ID" --evidence "host=<工具> thread_id=<当前ID> archived=true"`。只有取得精确归档回执并恢复为 pending 后，脚手架才允许停用；统筹部不能 retire。
 
 ## 部门会话清单
 
@@ -3985,6 +4352,14 @@ def parse_args() -> argparse.Namespace:
         help="增量模式:在已有 docs/collaboration/ 上追加这些角色 ID(只建缺失部门并更新部门表)",
     )
     parser.add_argument(
+        "--deactivate-roles", default="",
+        help="停用已无在办任务和会话的部门；保留历史目录、TASK 与角色身份",
+    )
+    parser.add_argument(
+        "--deactivation-evidence", default="",
+        help="停用部门所依据的用户确认记录或会话指针",
+    )
+    parser.add_argument(
         "--upgrade-collaboration",
         action="store_true",
         help="将已有协作层升级到当前协议;保留交接、日志和报告,有旧待办时安全停止",
@@ -4269,6 +4644,43 @@ def recover_add_roles_transaction(collab: Path, *, announce: bool = True) -> boo
     return True
 
 
+def recover_deactivate_roles_transaction(collab: Path, *, announce: bool = True) -> bool:
+    marker = collab / DEACTIVATE_TRANSACTION_FILE
+    if not marker.exists():
+        return False
+    if marker.is_symlink() or not marker.is_file():
+        raise ValueError("停用部门事务标记不安全")
+    payload = strict_json_loads(read_utf8(marker), source=str(marker))
+    expected = {"schema_version", "kind", "operation_id", "phase", "roles", "originals"}
+    allowed_files = {PROTOCOL_FILE, "部门表.md", "会话启动清单.md", "路由表.md", "会话启动状态.json"}
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != expected
+        or payload.get("schema_version") != 1
+        or payload.get("kind") != "deactivate_roles"
+        or payload.get("phase") not in {"applying", "committed"}
+        or not isinstance(payload.get("roles"), list)
+        or any(role not in ROLE_DEFS for role in payload["roles"])
+        or not isinstance(payload.get("originals"), dict)
+        or set(payload["originals"]) != allowed_files
+    ):
+        raise ValueError("停用部门事务标记结构无效")
+    if payload["phase"] == "applying":
+        for name, content in payload["originals"].items():
+            if not isinstance(content, str):
+                raise ValueError("停用部门事务备份内容无效")
+            write_utf8_atomic(
+                collab / name, content,
+                mode=0o600 if name in {"会话启动状态.json", PROTOCOL_FILE} else None,
+            )
+    marker.unlink()
+    fsync_dir(collab)
+    if announce:
+        action = "回滚未提交" if payload["phase"] == "applying" else "收口已提交"
+        print(f"RECOVERY_OK | 已{action}的停用部门事务: {payload['operation_id']}")
+    return True
+
+
 UPGRADE_TASK_STATES = {"queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged"}
 UPGRADE_TASK_AUTH_STATES = {"none", "user_required", "user_confirmed", "user_rejected"}
 UPGRADE_TASK_REQUIRED_FIELDS = {
@@ -4541,33 +4953,45 @@ def validate_upgrade_resolution(
 ) -> None:
     if value is None:
         return
-    fields = {
-        "state", "replacement_task_id", "reason", "evidence", "resolved_by", "resolved_at",
-        "target_revision_before", "replacement_revision", "replacement_state", "receipt_id",
+    common_fields = {
+        "state", "reason", "evidence", "resolved_by", "resolved_at", "target_revision_before", "receipt_id",
     }
-    if not isinstance(value, dict) or set(value) != fields or value.get("state") != "superseded":
+    superseded_fields = common_fields | {"replacement_task_id", "replacement_revision", "replacement_state"}
+    resolution_state = value.get("state") if isinstance(value, dict) else None
+    expected_fields = superseded_fields if resolution_state == "superseded" else common_fields
+    if (
+        not isinstance(value, dict)
+        or resolution_state not in {"superseded", "rejected_by_user", "abandoned"}
+        or set(value) != expected_fields
+    ):
         raise ValueError(f"任务收口轴结构无效: {source}")
-    replacement = value.get("replacement_task_id")
-    if not isinstance(replacement, str) or not UPGRADE_TASK_ID_RE.fullmatch(replacement) or replacement == task_id:
-        raise ValueError(f"任务替代指针无效: {source}")
-    if execution_state != "queued" or has_temporary:
-        raise ValueError(f"只允许普通 queued 任务标记 superseded: {source}")
-    for field in ("reason", "evidence", "resolved_by", "replacement_state", "receipt_id"):
+    if execution_state not in {"queued", "blocked", "waiting_input"} or has_temporary:
+        raise ValueError(f"只允许普通 open queued / blocked / waiting_input 任务收口: {source}")
+    for field in ("reason", "evidence", "resolved_by", "receipt_id"):
         validate_upgrade_task_text(value.get(field), f"resolution.{field}", max_chars=1000)
     if (
         not value["resolved_by"].startswith("统筹部/")
         or any(char.isspace() for char in value["resolved_by"])
-        or value["replacement_state"] == "queued"
-        or value["replacement_state"] not in UPGRADE_TASK_STATES
         or not re.fullmatch(r"RES-[0-9]{8}T[0-9]{6}-[A-F0-9]{8}", value["receipt_id"])
         or isinstance(value.get("target_revision_before"), bool)
         or not isinstance(value.get("target_revision_before"), int)
         or value["target_revision_before"] + 1 != revision
-        or isinstance(value.get("replacement_revision"), bool)
-        or not isinstance(value.get("replacement_revision"), int)
-        or value["replacement_revision"] < 1
     ):
-        raise ValueError(f"任务替代版本或后续状态无效: {source}")
+        raise ValueError(f"任务收口身份或版本无效: {source}")
+    if resolution_state == "superseded":
+        replacement = value.get("replacement_task_id")
+        validate_upgrade_task_text(value.get("replacement_state"), "resolution.replacement_state", max_chars=1000)
+        if (
+            not isinstance(replacement, str)
+            or not UPGRADE_TASK_ID_RE.fullmatch(replacement)
+            or replacement == task_id
+            or value["replacement_state"] == "queued"
+            or value["replacement_state"] not in UPGRADE_TASK_STATES
+            or isinstance(value.get("replacement_revision"), bool)
+            or not isinstance(value.get("replacement_revision"), int)
+            or value["replacement_revision"] < 1
+        ):
+            raise ValueError(f"任务替代版本或后续状态无效: {source}")
     resolved_at = validate_upgrade_task_timestamp(value["resolved_at"], "resolution.resolved_at")
     if resolved_at != updated_at or resolved_at < created_at:
         raise ValueError(f"任务收口时间越出任务时间轴: {source}")
@@ -4811,7 +5235,7 @@ def migrated_session_state(
         source_departments = source_payload.get("departments")
         if not isinstance(source_departments, dict) or set(source_departments) != set(expected_departments):
             raise ValueError("会话启动状态与部门表的部门集合不一致")
-        departments: dict[str, dict[str, str]] = {}
+        departments: dict[str, dict[str, object]] = {}
         for department, role_id in expected_departments.items():
             item = source_departments[department]
             if not isinstance(item, dict) or item.get("role_id") != role_id:
@@ -4822,8 +5246,9 @@ def migrated_session_state(
             notification_mode = item.get("notification_mode", session_mode)
             if notification_mode not in {"auto", "manual"}:
                 raise ValueError(f"会话通知模式无效: {department}")
-            migrated: dict[str, str] = {
+            migrated: dict[str, object] = {
                 "role_id": role_id,
+                "active": item.get("active", True),
                 "notification_mode": notification_mode,
                 "step": step,
             }
@@ -4841,6 +5266,10 @@ def migrated_session_state(
                 if not isinstance(value, str):
                     raise ValueError(f"会话启动状态 {field} 类型无效: {department}")
                 migrated[field] = value
+            history = item.get("lifecycle_history", [])
+            if not isinstance(history, list):
+                raise ValueError(f"会话启动状态 lifecycle_history 类型无效: {department}")
+            migrated["lifecycle_history"] = history
             if migrated["previous_thread_id"] and "operation_id" not in item:
                 migrated["operation_id"] = (
                     "SWITCH-MIGRATE-"
@@ -4851,12 +5280,27 @@ def migrated_session_state(
         payload = {
             "schema_version": 1,
             "protocol_version": PROTOCOL_VERSION,
+            "created_at": source_payload.get("created_at")
+            if isinstance(source_payload.get("created_at"), str) and source_payload.get("created_at")
+            else registry_value(registry_text, "创建日期", date),
             "updated_at": source_payload.get("updated_at") if isinstance(source_payload.get("updated_at"), str) else date,
+            "profile": source_payload.get("profile")
+            if isinstance(source_payload.get("profile"), str) and source_payload.get("profile")
+            else registry_value(registry_text, "项目类型", "已有项目"),
+            "session_mode": source_payload.get("session_mode")
+            if source_payload.get("session_mode") in {"auto", "manual"} else session_mode,
+            "role_order": source_payload.get("role_order")
+            if isinstance(source_payload.get("role_order"), list)
+            and all(isinstance(role, str) for role in source_payload["role_order"])
+            and set(source_payload["role_order"]) == set(roles)
+            else roles,
             "departments": departments,
         }
     else:
         payload = strict_json_loads(
-            session_state_payload(roles, date, session_mode), source="generated legacy fallback session state",
+            session_state_payload(
+                roles, date, session_mode, registry_value(registry_text, "项目类型", "已有项目"),
+            ), source="generated legacy fallback session state",
         )
         if not isinstance(payload, dict):
             raise ValueError("生成的会话状态无效")
@@ -4877,6 +5321,7 @@ def migrated_session_state(
                 item["thread_id"] = session_id
                 item["step"] = "registered"
                 item["note"] = "仅因旧协议确实缺失会话状态文件，从部门表降级恢复"
+    validate_current_session_payload(payload)
     validate_session_thread_identities(payload, task_payloads)
     return payload
 
@@ -4894,7 +5339,7 @@ def registry_data_from_session_state(payload: dict) -> dict[str, dict[str, str]]
         result[item["role_id"]] = {
             "session_id": item.get("thread_id") or "待登记",
             "notification": item["notification_mode"],
-            "status": status_labels[item["step"]],
+            "status": status_labels[item["step"]] if item.get("active", True) else "已停用",
         }
     return result
 
@@ -5229,6 +5674,10 @@ def run_upgrade(collab: Path, *, role_policy_overlay_file: str = "") -> int:
         return 9
 
     session_data = registry_data_from_session_state(state_payload)
+    active_roles = [
+        role for role in roles
+        if state_payload["departments"][ROLE_DEFS[role]["name"]].get("active", True)
+    ]
     scripts_root = collab / "scripts"
     backup_parent = collab / "升级备份"
     guarded_directories = (
@@ -5246,9 +5695,14 @@ def run_upgrade(collab: Path, *, role_policy_overlay_file: str = "") -> int:
     managed: dict[Path, tuple[str, int | None]] = {
         collab / PROTOCOL_FILE: (protocol_payload(date), 0o600),
         collab / "README.md": (readme_markdown(date), None),
-        collab / "部门表.md": (registry_markdown(roles, profile, date, session_mode, session_data), None),
-        collab / "路由表.md": (route_table_markdown(roles, date), None),
-        collab / "会话启动清单.md": (session_startup_markdown(roles, session_mode, date), None),
+        collab / "部门表.md": (
+            registry_markdown(
+                roles, state_payload["profile"], state_payload["created_at"],
+                state_payload["session_mode"], session_data,
+            ), None,
+        ),
+        collab / "路由表.md": (route_table_markdown(active_roles, date), None),
+        collab / "会话启动清单.md": (session_startup_markdown(active_roles, session_mode, date), None),
         collab / "会话启动状态.json": (json.dumps(state_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", 0o600),
         collab / "任务交接模板.md": (handoff_template_markdown(), None),
         collab / "模板" / "工作报告.md": (work_reports_readme_markdown({"name": "填写部门"}, date), None),
@@ -5492,6 +5946,120 @@ def run_upgrade(collab: Path, *, role_policy_overlay_file: str = "") -> int:
     return 0
 
 
+def run_deactivate_roles(collab: Path, role_ids: list[str], evidence: str) -> int:
+    existing_state = validate_existing_collaboration(collab)
+    if existing_state is None:
+        return 3
+    registry_text, all_roles = existing_state
+    if not role_ids or validate_roles(role_ids):
+        return 4
+    if len(role_ids) != len(set(role_ids)):
+        print("停用角色不能重复。", file=sys.stderr)
+        return 4
+    if "lead" in role_ids:
+        print("统筹部不能停用。", file=sys.stderr)
+        return 4
+    evidence = evidence.strip()
+    if not evidence or len(evidence) > 1000 or any(ord(char) < 32 and char not in "\t\n\r" for char in evidence):
+        print("--deactivation-evidence 必须提供不超过 1000 字的用户确认依据。", file=sys.stderr)
+        return 4
+    paths = {
+        "部门表.md": collab / "部门表.md",
+        "会话启动清单.md": collab / "会话启动清单.md",
+        "路由表.md": collab / "路由表.md",
+        "会话启动状态.json": collab / "会话启动状态.json",
+        PROTOCOL_FILE: collab / PROTOCOL_FILE,
+    }
+    try:
+        originals = {name: read_utf8(path) for name, path in paths.items()}
+        state = strict_json_loads(originals["会话启动状态.json"], source=str(paths["会话启动状态.json"]))
+        protocol_before = strict_json_loads(originals[PROTOCOL_FILE], source=str(paths[PROTOCOL_FILE]))
+        state_roles = validate_current_session_payload(state)
+        if set(state_roles) != set(all_roles):
+            raise ValueError("会话状态与部门表的历史角色集合不一致")
+        for role_id in role_ids:
+            department = ROLE_DEFS[role_id]["name"]
+            item = state["departments"].get(department)
+            if not isinstance(item, dict) or not item.get("active", False):
+                raise ValueError(f"部门未启用或不存在: {department}")
+            if item["step"] != "pending" or item["thread_id"] or item["previous_thread_id"]:
+                raise ValueError(f"部门仍有会话事实，须先完成归档并恢复为 pending: {department}")
+        for task_path in sorted((collab / "tasks").glob("TASK-*.json")):
+            task = strict_json_loads(read_utf8(task_path), source=str(task_path))
+            if not isinstance(task, dict):
+                raise ValueError(f"TASK 根节点无效: {task_path.name}")
+            if (
+                task.get("department") in {ROLE_DEFS[role]["name"] for role in role_ids}
+                and task.get("resolution") is None
+                and task.get("execution_state") != "acknowledged"
+            ):
+                raise ValueError(f"部门仍有未核收任务: {task_path.name}")
+        active_roles = [
+            role for role in all_roles
+            if role not in role_ids and state["departments"][ROLE_DEFS[role]["name"]].get("active", True)
+        ]
+        layers = {ROLE_DEFS[role]["layer"] for role in active_roles}
+        if layers != {"management", "execution", "audit"}:
+            raise ValueError("停用后会破坏管理、执行、审核三层最小结构")
+        date = dt.date.today().isoformat()
+        for role_id in role_ids:
+            item = state["departments"][ROLE_DEFS[role_id]["name"]]
+            history = list(item["lifecycle_history"])
+            history.append({
+                "event": "deactivated", "at": date, "actor": "scaffold/deactivate-roles",
+                "evidence": evidence, "thread_id": "",
+            })
+            item["lifecycle_history"] = history
+            item["active"] = False
+            item["note"] = "用户确认停用: " + evidence
+            item["evidence"] = evidence
+            item["updated_at"] = date
+        state["updated_at"] = date
+        profile = state["profile"]
+        session_mode = state["session_mode"]
+        if session_mode not in {"auto", "manual"}:
+            session_mode = "manual"
+        updated = {
+            "部门表.md": registry_markdown(
+                all_roles, profile, state["created_at"], session_mode, registry_data_from_session_state(state),
+            ),
+            "会话启动清单.md": session_startup_markdown(active_roles, session_mode, date),
+            "路由表.md": route_table_markdown(active_roles, date),
+            "会话启动状态.json": json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        }
+        operation_id = "DEACT-" + dt.datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8].upper()
+        marker = collab / DEACTIVATE_TRANSACTION_FILE
+        transaction = {
+            "schema_version": 1, "kind": "deactivate_roles", "operation_id": operation_id,
+            "phase": "applying", "roles": role_ids, "originals": originals,
+        }
+        write_utf8_atomic(marker, json.dumps(transaction, ensure_ascii=False, indent=2, sort_keys=True) + "\n", mode=0o600)
+        for name, content in updated.items():
+            write_utf8_atomic(paths[name], content, mode=0o600 if name == "会话启动状态.json" else None)
+        write_utf8_atomic(
+            paths[PROTOCOL_FILE],
+            protocol_payload(
+                date, managed_manifest_from_disk(collab, all_roles),
+                protocol_before.get(ROLE_POLICY_OVERRIDE_FIELD, {}) if isinstance(protocol_before, dict) else {},
+            ),
+            mode=0o600,
+        )
+        transaction["phase"] = "committed"
+        write_utf8_atomic(marker, json.dumps(transaction, ensure_ascii=False, indent=2, sort_keys=True) + "\n", mode=0o600)
+        marker.unlink()
+        fsync_dir(collab)
+    except Exception as exc:
+        try:
+            recover_deactivate_roles_transaction(collab, announce=False)
+        except Exception as recovery_exc:
+            print(f"停用部门失败且自动回滚失败: {exc}; {recovery_exc}", file=sys.stderr)
+            return 10
+        print(f"停用部门失败，已回滚: {exc}", file=sys.stderr)
+        return 6
+    print(f"DEACTIVATE_ROLES_OK | roles={','.join(role_ids)} | evidence_recorded=true")
+    return 0
+
+
 def run_add_roles(collab: Path, add_roles: list[str]) -> int:
     """增量模式:在已有协作层追加部门。"""
     if not collab.exists():
@@ -5505,20 +6073,36 @@ def run_add_roles(collab: Path, add_roles: list[str]) -> int:
         return 3
     registry_text, existing_roles = existing_state
     registered = set(existing_roles)
+    session_state_path = collab / "会话启动状态.json"
+    try:
+        existing_session_payload = strict_json_loads(
+            read_utf8(session_state_path), source=str(session_state_path),
+        )
+        session_roles = validate_current_session_payload(existing_session_payload)
+    except (OSError, UnicodeError, ValueError) as exc:
+        print(f"会话启动状态格式无效,已拒绝增量修改: {exc}", file=sys.stderr)
+        return 3
+    if set(session_roles) != set(existing_roles):
+        print("会话启动状态与部门表的部门集合不一致,已拒绝增量修改。", file=sys.stderr)
+        return 3
 
     today = dt.date.today()
     date = today.isoformat()
     depts_root = collab / "部门"
     depts_root.mkdir(parents=True, exist_ok=True)
 
-    created, new_roles, repaired, skipped = [], [], [], []
+    created, new_roles, repaired, reactivated, skipped = [], [], [], [], []
     for key in add_roles:
         role = ROLE_DEFS[key]
         department_path = depts_root / role["name"]
         in_registry = key in registered
         on_disk = department_path.exists()
         if in_registry and on_disk:
-            skipped.append(key)
+            item = existing_session_payload["departments"].get(role["name"], {})
+            if item.get("active", True):
+                skipped.append(key)
+            else:
+                reactivated.append(key)
             continue
         if not in_registry and on_disk:
             print(f"协作层状态不一致:部门目录已存在但部门表未登记 {key},已拒绝增量修改。", file=sys.stderr)
@@ -5530,7 +6114,7 @@ def run_add_roles(collab: Path, add_roles: list[str]) -> int:
             new_roles.append(key)
 
     # 先在临时目录完整生成所有新部门,再更新路由表;任一步失败时回滚本次部门。
-    if created:
+    if created or reactivated:
         registry = collab / "部门表.md"
         startup = collab / "会话启动清单.md"
         routes = collab / "路由表.md"
@@ -5580,6 +6164,7 @@ def run_add_roles(collab: Path, add_roles: list[str]) -> int:
             role = ROLE_DEFS[key]
             departments_state[role["name"]] = {
                 "role_id": key,
+                "active": True,
                 "notification_mode": notification_mode,
                 "step": "pending",
                 "thread_id": "",
@@ -5589,18 +6174,36 @@ def run_add_roles(collab: Path, add_roles: list[str]) -> int:
                 "operation_id": "INIT-" + hashlib.sha256(f"{date}:{key}".encode("utf-8")).hexdigest()[:10].upper(),
                 "note": "",
                 "updated_at": date,
+                "lifecycle_history": [],
             }
+        for key in reactivated:
+            item = departments_state[ROLE_DEFS[key]["name"]]
+            history = list(item["lifecycle_history"])
+            history.append({
+                "event": "reactivated", "at": date, "actor": "scaffold/add-roles",
+                "evidence": "explicit --add-roles reactivation request", "thread_id": "",
+            })
+            item["lifecycle_history"] = history
+            item["active"] = True
+            item["note"] = "通过 --add-roles 重新启用"
+            item["evidence"] = "explicit --add-roles reactivation request"
+            item["updated_at"] = date
         session_payload["protocol_version"] = PROTOCOL_VERSION
         session_payload["updated_at"] = date
-        profile = registry_value(registry_text, "项目类型", "已有项目")
+        session_payload["role_order"] = all_roles
+        profile = session_payload["profile"]
         session_data = registry_data_from_session_state(session_payload)
         # 增量路径必须与同一天直接新建同样的团队收敛到同一份派生文档。
         # 会话状态 JSON 才是真值，不再向部门表或启动清单追加一段“待登记”副本。
         updated_registry = registry_markdown(
-            all_roles, profile, date, notification_mode, session_data,
+            all_roles, profile, session_payload["created_at"], notification_mode, session_data,
         )
-        updated_startup = session_startup_markdown(all_roles, notification_mode, date)
-        updated_routes = route_table_markdown(all_roles, date)
+        active_roles = [
+            role for role in all_roles
+            if session_payload["departments"][ROLE_DEFS[role]["name"]].get("active", True)
+        ]
+        updated_startup = session_startup_markdown(active_roles, notification_mode, date)
+        updated_routes = route_table_markdown(active_roles, date)
         updated_session = json.dumps(session_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         build_root = Path(tempfile.mkdtemp(prefix=".add-roles-build-", dir=collab))
         marker = collab / ADD_TRANSACTION_FILE
@@ -5685,6 +6288,11 @@ def run_add_roles(collab: Path, add_roles: list[str]) -> int:
             role = ROLE_DEFS[key]
             action = "修复缺失目录" if key in repaired else "新增并登记"
             print(f"- {LAYER_CN.get(role.get('layer', ''), '')} · {role['name']} ({key}) · {action}")
+    if reactivated:
+        print("已重新启用部门:")
+        for key in reactivated:
+            role = ROLE_DEFS[key]
+            print(f"- {LAYER_CN.get(role.get('layer', ''), '')} · {role['name']} ({key})")
     if skipped:
         print(f"已存在跳过: {', '.join(skipped)}")
     print("部门表、路由表、会话启动清单与会话状态已同步;"
@@ -5699,17 +6307,19 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
         try:
             upgrade_marker = collab / UPGRADE_TRANSACTION_FILE
             add_marker = collab / ADD_TRANSACTION_FILE
-            if upgrade_marker.exists() and add_marker.exists():
-                raise ValueError("同时存在升级与新增部门事务标记，拒绝猜测恢复顺序")
+            deactivate_marker = collab / DEACTIVATE_TRANSACTION_FILE
+            if sum(path.exists() for path in (upgrade_marker, add_marker, deactivate_marker)) > 1:
+                raise ValueError("同时存在多个协作事务标记，拒绝猜测恢复顺序")
             recover_upgrade_transaction(collab)
             recover_add_roles_transaction(collab)
+            recover_deactivate_roles_transaction(collab)
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"发现未完成的协作事务,但无法安全恢复: {exc}", file=sys.stderr)
             return 10
 
     if args.upgrade_collaboration:
-        if args.add_roles:
-            print("--upgrade-collaboration 不能与 --add-roles 同时使用。", file=sys.stderr)
+        if args.add_roles or args.deactivate_roles:
+            print("--upgrade-collaboration 不能与增删部门参数同时使用。", file=sys.stderr)
             return 4
         if not collab.exists():
             print("docs/collaboration/ 不存在,无可升级内容。", file=sys.stderr)
@@ -5725,8 +6335,17 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
 
     # 增量模式
     add_roles = [item.strip() for item in args.add_roles.split(",") if item.strip()]
+    deactivate_roles = [item.strip() for item in args.deactivate_roles.split(",") if item.strip()]
+    if add_roles and deactivate_roles:
+        print("--add-roles 与 --deactivate-roles 不能同时使用。", file=sys.stderr)
+        return 4
     if add_roles:
         return run_add_roles(collab, add_roles)
+    if deactivate_roles:
+        return run_deactivate_roles(collab, deactivate_roles, args.deactivation_evidence)
+    if args.deactivation_evidence:
+        print("--deactivation-evidence 只能与 --deactivate-roles 一起使用。", file=sys.stderr)
+        return 4
 
     # 全新创建模式
     if args.session_mode is None:
@@ -5796,7 +6415,10 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
         write_utf8_atomic(build_collab / "部门表.md", registry_markdown(roles, args.profile, date, args.session_mode))
         write_utf8_atomic(build_collab / "路由表.md", route_table_markdown(roles, date))
         write_utf8_atomic(build_collab / "会话启动清单.md", session_startup_markdown(roles, args.session_mode, date))
-        write_utf8_atomic(build_collab / "会话启动状态.json", session_state_payload(roles, date, args.session_mode), mode=0o600)
+        write_utf8_atomic(
+            build_collab / "会话启动状态.json",
+            session_state_payload(roles, date, args.session_mode, args.profile), mode=0o600,
+        )
         write_utf8_atomic(build_collab / "错题集.md", cuoti_markdown(date))
         write_utf8_atomic(build_collab / "任务交接模板.md", handoff_template_markdown())
         templates_dir = build_collab / "模板"
