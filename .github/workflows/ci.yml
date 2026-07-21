@@ -79,7 +79,7 @@ jobs:
       - name: Checkout verified commit
         uses: actions/checkout@v7
         with:
-          fetch-depth: 1
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -89,7 +89,69 @@ jobs:
       - name: Install validation dependencies
         run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
 
+      - name: Check runtime changes since Latest
+        id: runtime
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          latest_dir="${RUNNER_TEMP}/agent-team-latest"
+          latest_json="${latest_dir}/latest.json"
+          mkdir -p "${latest_dir}"
+
+          # A query failure is not proof that a release is absent. Fail closed so a
+          # temporary API outage cannot create a duplicate public Release.
+          gh release view --repo "${GITHUB_REPOSITORY}" --json tagName,assets > "${latest_json}"
+          latest_tag="$(jq -r .tagName "${latest_json}")"
+
+          if ! git diff --quiet "${latest_tag}" "${GITHUB_SHA}" -- \
+              SKILL.md \
+              agents/openai.yaml \
+              references/temporary-executor.md \
+              scripts/scaffold_team.py \
+              scripts/temporary_executor_runtime.py; then
+            printf 'changed=true\n' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          zip_name="agent-team-2.0-pure.zip"
+          checksum_name="agent-team-2.0-pure.zip.sha256"
+          if ! jq -e --arg zip "${zip_name}" --arg checksum "${checksum_name}" \
+              '([.assets[].name] | index($zip)) != null and ([.assets[].name] | index($checksum)) != null' \
+              "${latest_json}" >/dev/null; then
+            echo "Latest release is incomplete; publish a repaired verified package."
+            printf 'changed=true\n' >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          gh release download "${latest_tag}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --pattern "${zip_name}" \
+            --pattern "${checksum_name}" \
+            --dir "${latest_dir}"
+
+          set +e
+          python scripts/verify_agent_team.py --check-release-assets \
+            "${latest_json}" \
+            "${latest_dir}/${zip_name}" \
+            "${latest_dir}/${checksum_name}" \
+            "${GITHUB_WORKSPACE}"
+          asset_status=$?
+          set -e
+          if [[ "${asset_status}" -eq 3 ]]; then
+            echo "Latest release assets are invalid; publish a repaired verified package."
+            printf 'changed=true\n' >> "${GITHUB_OUTPUT}"
+          elif [[ "${asset_status}" -ne 0 ]]; then
+            echo "Latest release verification could not complete safely." >&2
+            exit "${asset_status}"
+          else
+            printf 'changed=false\n' >> "${GITHUB_OUTPUT}"
+            echo "Runtime bundle and verified Latest assets are unchanged; skip duplicate Release."
+          fi
+
       - name: Build and verify pure runtime package
+        if: steps.runtime.outputs.changed == 'true'
         id: package
         shell: bash
         run: |
@@ -128,6 +190,7 @@ jobs:
           printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
 
       - name: Publish current main as Latest
+        if: steps.runtime.outputs.changed == 'true'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
