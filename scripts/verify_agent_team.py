@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 import yaml
@@ -53,6 +54,10 @@ SPEC = """# Project
 
 class VerifyError(RuntimeError):
     pass
+
+
+class ReleaseAssetInvalid(VerifyError):
+    """The public Latest assets are present but cannot be trusted."""
 
 
 def run(
@@ -96,6 +101,153 @@ def run(
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise VerifyError(message)
+
+
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def verify_latest_release_assets(
+    latest_json_path: Path,
+    zip_path: Path,
+    checksum_path: Path,
+    repo: Path,
+) -> str:
+    """Verify that Latest assets exactly reproduce the runtime files at its tag."""
+    try:
+        release = json.loads(latest_json_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise VerifyError(f"cannot read Latest release metadata: {exc}") from exc
+
+    tag = release.get("tagName") if isinstance(release, dict) else None
+    assets = release.get("assets") if isinstance(release, dict) else None
+    if not isinstance(tag, str) or not tag.strip() or not isinstance(assets, list):
+        raise VerifyError("Latest release metadata is missing tagName or assets")
+
+    expected_assets = {
+        "agent-team-2.0-pure.zip": zip_path,
+        "agent-team-2.0-pure.zip.sha256": checksum_path,
+    }
+    asset_by_name = {
+        asset.get("name"): asset
+        for asset in assets
+        if isinstance(asset, dict) and isinstance(asset.get("name"), str)
+    }
+    missing = sorted(set(expected_assets) - set(asset_by_name))
+    if missing:
+        raise ReleaseAssetInvalid(f"Latest release is missing assets: {', '.join(missing)}")
+
+    for name, path in expected_assets.items():
+        if not path.is_file():
+            raise VerifyError(f"downloaded Latest asset is unavailable: {name}")
+        advertised = asset_by_name[name].get("digest")
+        actual = f"sha256:{file_sha256(path)}"
+        if advertised != actual:
+            raise ReleaseAssetInvalid(
+                f"Latest asset digest mismatch for {name}: advertised={advertised!r}, actual={actual}"
+            )
+
+    checksum_text = checksum_path.read_text(encoding="utf-8").strip()
+    checksum_match = re.fullmatch(
+        r"([0-9a-f]{64})\s+\*?agent-team-2\.0-pure\.zip",
+        checksum_text,
+    )
+    if not checksum_match or checksum_match.group(1) != file_sha256(zip_path):
+        raise ReleaseAssetInvalid("Latest checksum file does not verify the pure ZIP")
+
+    try:
+        with zipfile.ZipFile(zip_path) as archive:
+            file_names = [name for name in archive.namelist() if not name.endswith("/")]
+            if len(file_names) != len(set(file_names)) or sorted(file_names) != sorted(RUNTIME_FILES):
+                raise ReleaseAssetInvalid("Latest pure ZIP does not contain exactly the five runtime files")
+            for relative in RUNTIME_FILES:
+                tagged = run(["git", "show", f"{tag}:{relative}"], cwd=repo).stdout.encode("utf-8")
+                if archive.read(relative) != tagged:
+                    raise ReleaseAssetInvalid(
+                        f"Latest pure ZIP differs from tag {tag} at {relative}"
+                    )
+    except zipfile.BadZipFile as exc:
+        raise ReleaseAssetInvalid("Latest pure ZIP is not a valid ZIP archive") from exc
+    return tag
+
+
+def verify_release_guard_branches(root: Path) -> None:
+    repo = root / "release-guard-repo"
+    repo.mkdir()
+    run(["git", "init", "-q"], cwd=repo)
+    run(["git", "config", "user.name", "Agent Team CI"], cwd=repo)
+    run(["git", "config", "user.email", "ci@users.noreply.github.com"], cwd=repo)
+    for relative in RUNTIME_FILES:
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"fixture:{relative}\n", encoding="utf-8")
+    run(["git", "add", *RUNTIME_FILES], cwd=repo)
+    run(["git", "commit", "-q", "-m", "fixture"], cwd=repo)
+    run(["git", "tag", "build-fixture"], cwd=repo)
+
+    assets_dir = root / "release-guard-assets"
+    assets_dir.mkdir()
+    zip_path = assets_dir / "agent-team-2.0-pure.zip"
+    checksum_path = assets_dir / "agent-team-2.0-pure.zip.sha256"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for relative in RUNTIME_FILES:
+            archive.write(repo / relative, relative)
+    checksum_path.write_text(
+        f"{file_sha256(zip_path)}  agent-team-2.0-pure.zip\n",
+        encoding="utf-8",
+    )
+    latest_json = assets_dir / "latest.json"
+
+    def metadata(*, zip_digest: str | None = None, include_checksum: bool = True) -> dict[str, object]:
+        listed = [{
+            "name": zip_path.name,
+            "digest": zip_digest or f"sha256:{file_sha256(zip_path)}",
+        }]
+        if include_checksum:
+            listed.append({
+                "name": checksum_path.name,
+                "digest": f"sha256:{file_sha256(checksum_path)}",
+            })
+        return {"tagName": "build-fixture", "assets": listed}
+
+    latest_json.write_text(json.dumps(metadata()), encoding="utf-8")
+    check(
+        verify_latest_release_assets(latest_json, zip_path, checksum_path, repo) == "build-fixture",
+        "Latest release guard rejected a valid package",
+    )
+
+    for invalid in (
+        metadata(include_checksum=False),
+        metadata(zip_digest="sha256:" + "0" * 64),
+    ):
+        latest_json.write_text(json.dumps(invalid), encoding="utf-8")
+        try:
+            verify_latest_release_assets(latest_json, zip_path, checksum_path, repo)
+        except ReleaseAssetInvalid:
+            pass
+        else:
+            raise VerifyError("Latest release guard accepted missing or mismatched assets")
+
+    latest_json.write_text(json.dumps(metadata()), encoding="utf-8")
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        for relative in RUNTIME_FILES:
+            content = (repo / relative).read_bytes()
+            archive.writestr(relative, b"tampered\n" if relative == RUNTIME_FILES[0] else content)
+    checksum_path.write_text(
+        f"{file_sha256(zip_path)}  agent-team-2.0-pure.zip\n",
+        encoding="utf-8",
+    )
+    latest_json.write_text(json.dumps(metadata()), encoding="utf-8")
+    try:
+        verify_latest_release_assets(latest_json, zip_path, checksum_path, repo)
+    except ReleaseAssetInvalid:
+        pass
+    else:
+        raise VerifyError("Latest release guard accepted a self-consistent ZIP with wrong runtime content")
 
 
 class UniqueKeyLoader(yaml.SafeLoader):
@@ -306,6 +458,31 @@ def verify_repository_contract() -> None:
         and workflow.count("uses: actions/setup-python@v6") == 2,
         "CI uses a deprecated GitHub Actions JavaScript runtime",
     )
+    try:
+        release_guard = workflow.split("- name: Check runtime changes since Latest", 1)[1].split(
+            "- name: Build and verify pure runtime package", 1
+        )[0]
+    except IndexError as exc:
+        raise VerifyError("CI is missing the bounded Latest release guard") from exc
+    runtime_diff = re.search(
+        r'if ! git diff --quiet "\$\{latest_tag\}" "\$\{GITHUB_SHA\}" -- \\\n(.*?)\n\s+scripts/temporary_executor_runtime\.py; then',
+        release_guard,
+        re.DOTALL,
+    )
+    check(
+        runtime_diff is not None
+        and all(release_guard.count(relative) == 1 for relative in RUNTIME_FILES),
+        "CI Latest guard does not compare exactly the five runtime files",
+    )
+    check(
+        "gh release view" in release_guard
+        and "|| true" not in release_guard
+        and "--check-release-assets" in release_guard
+        and "asset_status" in release_guard
+        and "Latest release assets are invalid" in release_guard
+        and "Latest release verification could not complete safely" in release_guard,
+        "CI Latest guard can skip without proving public asset integrity or fail-closed API handling",
+    )
     check(
         "Publish latest verified package" in workflow
         and "github.ref == 'refs/heads/main'" in workflow
@@ -316,6 +493,10 @@ def verify_repository_contract() -> None:
         and "git/ref/heads/main" in workflow
         and "Skip obsolete run: remote main moved" in workflow
         and "Release creation raced with another run" in workflow
+        and "Check runtime changes since Latest" in workflow
+        and "Runtime bundle and verified Latest assets are unchanged" in workflow
+        and "git diff --quiet" in workflow
+        and workflow.count("steps.runtime.outputs.changed == 'true'") == 2
         and "gh release create" in workflow
         and "--latest" in workflow
         and "published_zip_digest" in workflow
@@ -3641,6 +3822,7 @@ def main() -> int:
     verify_repository_contract()
     with tempfile.TemporaryDirectory(prefix="agent-team-verify-") as temp:
         root = Path(temp)
+        verify_release_guard_branches(root)
         verify_install_bundle_contract(root)
         project = make_project(root, "main")
         scaffold(project)
@@ -3661,6 +3843,14 @@ def main() -> int:
 
 
 def entrypoint() -> int:
+    if len(sys.argv) == 6 and sys.argv[1] == "--check-release-assets":
+        latest_json = Path(sys.argv[2]).expanduser().resolve()
+        zip_path = Path(sys.argv[3]).expanduser().resolve()
+        checksum_path = Path(sys.argv[4]).expanduser().resolve()
+        repo = Path(sys.argv[5]).expanduser().resolve()
+        tag = verify_latest_release_assets(latest_json, zip_path, checksum_path, repo)
+        print(f"LATEST_RELEASE_ASSETS_OK | tag:{tag} | files:{len(RUNTIME_FILES)}")
+        return 0
     if len(sys.argv) == 3 and sys.argv[1] == "--check-installed-copy":
         installed = Path(os.path.abspath(str(Path(sys.argv[2]).expanduser())))
         verify_installed_copy(installed)
@@ -3670,13 +3860,19 @@ def entrypoint() -> int:
         )
         return 0
     if len(sys.argv) != 1:
-        raise VerifyError("usage: verify_agent_team.py [--check-installed-copy PATH]")
+        raise VerifyError(
+            "usage: verify_agent_team.py [--check-installed-copy PATH] "
+            "[--check-release-assets LATEST_JSON ZIP CHECKSUM REPO]"
+        )
     return main()
 
 
 if __name__ == "__main__":
     try:
         raise SystemExit(entrypoint())
+    except ReleaseAssetInvalid as exc:
+        print(f"LATEST_RELEASE_ASSETS_INVALID | {exc}", file=sys.stderr)
+        raise SystemExit(3)
     except VerifyError as exc:
         print(f"VERIFY_ERROR | {exc}", file=sys.stderr)
         raise SystemExit(1)
