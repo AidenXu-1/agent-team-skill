@@ -24,10 +24,10 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = Path(os.environ.get("AGENT_TEAM_SCAFFOLD", ROOT / "scripts" / "scaffold_team.py")).expanduser().resolve()
-PUBLIC_VERSION = "2.0.5"
-SOURCE_VERSION = "2.0.5"
-PROTOCOL_VERSION = "1.4.9"
-PREVIOUS_PROTOCOL_VERSION = "1.4.8"
+PUBLIC_VERSION = "2.0.6"
+SOURCE_VERSION = "2.0.6"
+PROTOCOL_VERSION = "1.4.10"
+PREVIOUS_PROTOCOL_VERSION = "1.4.9"
 RUNTIME_FILES = (
     "SKILL.md",
     "agents/openai.yaml",
@@ -248,10 +248,20 @@ def verify_repository_contract() -> None:
             "status": "required-before-release",
             "scope": "semantic-boundaries",
         }
-        and all(f"S{index:02d}" in semantic_review for index in range(1, 21))
+        and all(f"S{index:02d}" in semantic_review for index in range(1, 28))
         and "自动测试通过不能替代" in readme
         and "本文件只保存稳定问题，不写某次执行结果" in semantic_review,
         "manual semantic release gate is missing or incomplete",
+    )
+    check(
+        all(term in skill for term in (
+            "## 向用户汇报", "需要你做什么", "还需注意",
+            "需要拍板", "需要体验", "重要变化/风险", "节点完成",
+            "入口、操作顺序、预期结果、重点判断和已知限制",
+            "默认不向用户展开 TASK ID",
+        ))
+        and "结果 / 需要你做什么 / 还需注意" in readme,
+        "user-facing reporting contract is missing from the Skill or repository guide",
     )
     check(
         f"当前运行协议为 `{PROTOCOL_VERSION}`" in skill
@@ -410,6 +420,15 @@ def verify_generated(project: Path) -> None:
         and "temporary_session=standby" not in collaboration_readme,
         "generated collaboration guide did not keep the temporary-executor rules cold",
     )
+    check(
+        all(term in collaboration_readme for term in (
+            "需要拍板", "需要体验", "重要变化/风险", "节点完成",
+            "结果 / 需要你做什么 / 还需注意",
+            "入口、操作顺序、预期结果、重点判断和已知限制",
+            "内部任务号、状态词、哈希、命令、日志和协议默认不展开",
+        )),
+        "generated collaboration guide lost the concise user-reporting contract",
+    )
     check("archive-request" not in collaboration_readme and "--archive-mode" not in collaboration_readme,
           "generated collaboration guide retained the rejected hard archive gate")
     for department in ("统筹部", "执行部", "检验部"):
@@ -423,7 +442,17 @@ def verify_generated(project: Path) -> None:
         )
         check(four_docs_bytes <= 7_000, f"{department} four-document onboarding exceeded 7 KB")
     inbox = (collab / "部门" / "执行部" / "收件箱.md").read_text(encoding="utf-8")
+    lead_role_text = (collab / "部门" / "统筹部" / "岗位说明.md").read_text(encoding="utf-8")
     check("../../tasks/" in inbox, "inbox does not use stable clickable task path")
+    check(
+        all(term in lead_role_text for term in (
+            "需要拍板", "需要体验", "重要变化/风险", "节点完成",
+            "结果 / 需要你做什么 / 还需注意",
+            "入口、顺序、预期、判断点和限制",
+            "默认不展开 TASK ID",
+        )),
+        "generated lead role lost the concise user-reporting contract",
+    )
     role_text = (collab / "部门" / "执行部" / "岗位说明.md").read_text(encoding="utf-8")
     bootstrap_text = (collab / "部门" / "执行部" / "上岗引导.md").read_text(encoding="utf-8")
     check(
@@ -545,12 +574,16 @@ docs/decisions/ 技术决策定稿。
         sys.executable, str(SCAFFOLD), str(managed_project), "--upgrade-collaboration",
     ])
     upgraded_product = managed_product.read_text(encoding="utf-8")
+    upgraded_lead = (managed_collab / "部门" / "统筹部" / "岗位说明.md").read_text(encoding="utf-8")
+    upgraded_readme = (managed_collab / "README.md").read_text(encoding="utf-8")
     upgraded_protocol = json.loads(managed_protocol_path.read_text(encoding="utf-8"))
     check(
         managed_upgrade.stdout.startswith("UPGRADE_OK |")
         and "系统级技术实现路径" in upgraded_product
         and "架构类 ADR/决策合同" in upgraded_product
         and "技术实现方式交开发部" not in upgraded_product
+        and "结果 / 需要你做什么 / 还需注意" in upgraded_lead
+        and "内部任务号、状态词、哈希、命令、日志和协议默认不展开" in upgraded_readme
         and upgraded_protocol["protocol_version"] == PROTOCOL_VERSION
         and upgraded_protocol["role_policy_overlays"] == {},
         "managed legacy product policy did not forward-upgrade to the corrected responsibility contract",

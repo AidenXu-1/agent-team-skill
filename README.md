@@ -1,6 +1,6 @@
 # Agent Team 2.0 Skill
 
-当前公开发布版本为 `2.0.5`，当前源码构建为 `2.0.5`，项目内运行协议为 `1.4.9`。`main` 是唯一公开主干，保存最新且已验证的源码；版本标签和正式 Release 保留里程碑；运行协议约束生成协作层的数据、工具与显式升级。本地源码构建高于公开版时，表示修复尚未发布，不能把本地安装状态说成 GitHub Release 已更新。
+当前公开发布版本为 `2.0.6`，当前源码构建为 `2.0.6`，项目内运行协议为 `1.4.10`。`main` 是唯一公开主干，保存最新且已验证的源码；版本标签和正式 Release 保留里程碑；运行协议约束生成协作层的数据、工具与显式升级。本地源码构建高于公开版时，表示修复尚未发布，不能把本地安装状态说成 GitHub Release 已更新。
 
 面向多 Agent / 多会话项目的轻量协作协议。它用项目文件保存长期真值，让会话可以安全接班，同时把管理、执行和独立审核分开。
 
@@ -19,6 +19,7 @@
 - 普通任务不强制写正式报告或日志；共享报告格式只保留一份。
 - 审核层任务例外：必须提交带任务一致 YAML 的本部门审核报告；普通部门不能误用核收命令。
 - `TASK_STATE_OK` 是事务收据，不是业务质量证明。领取人、核收人、授权证据和会话证据都是审计声明，不构成身份认证。
+- 部门完成四件套保留在内部；统筹面向非程序员用户默认只报“结果 / 需要你做什么 / 还需注意”，只在拍板、体验、重要变化/风险和节点完成时打扰用户。
 
 ## 运行边界
 
@@ -36,7 +37,7 @@ scripts/temporary_executor_runtime.py
 
 ## 安装
 
-公开稳定版从 [Latest Release](https://github.com/AidenXu-1/agent-team-skill/releases/latest) 获取。每次 `main` 推送都先运行完整 CI；只有全部通过，且该提交仍是远端 `main` 的最新提交，才会自动更新 [固定最新纯净包](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip) 和 [SHA-256 校验文件](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip.sha256)；源码或打包验证在发布前失败时，现有 Latest 包不会被替换。以下命令从当前已发布的 `2.0.5` 源码检出安装；本地安装副本、`main` 与公开 Latest 纯净包应保持五个运行文件逐字节一致：
+公开稳定版从 [Latest Release](https://github.com/AidenXu-1/agent-team-skill/releases/latest) 获取。每次 `main` 推送都先运行完整 CI；只有全部通过，且该提交仍是远端 `main` 的最新提交，才会自动更新 [固定最新纯净包](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip) 和 [SHA-256 校验文件](https://github.com/AidenXu-1/agent-team-skill/releases/latest/download/agent-team-2.0-pure.zip.sha256)；源码或打包验证在发布前失败时，现有 Latest 包不会被替换。以下命令从当前已发布的 `2.0.6` 源码检出安装；本地安装副本、`main` 与公开 Latest 纯净包应保持五个运行文件逐字节一致：
 
 ```bash
 mkdir -p ~/.codex/skills/agent-team
@@ -107,7 +108,7 @@ docs/collaboration/
 
 日志周文件在第一条真实事件写入时创建。每个部门不再生成重复的报告说明文件。
 
-源码 `2.0.5` 的任务工具把派单和授权绑定当前统筹会话；审核报告只有 `final + pass/fail` 和真实摘要才能完成。用户拒绝或放弃的普通任务用 `resolve` 保留证据收口，其中 `rejected_by_user` 会同步授权拒绝轴。无需全历史判断的热路径不再被一份冷历史 TASK 冻结，索引会提示陈旧；并发判断仍安全停止，`agent_team_task.py doctor` 负责完整历史体检。`acknowledged` 的中文展示为“统筹已核收”，不再误写成“已归档”。
+源码 `2.0.6` 的任务工具把派单和授权绑定当前统筹会话；审核报告只有 `final + pass/fail` 和真实摘要才能完成。用户拒绝或放弃的普通任务用 `resolve` 保留证据收口，其中 `rejected_by_user` 会同步授权拒绝轴。无需全历史判断的热路径不再被一份冷历史 TASK 冻结，索引会提示陈旧；并发判断仍安全停止，`agent_team_task.py doctor` 负责完整历史体检。`acknowledged` 的中文展示为“统筹已核收”，不再误写成“已归档”。
 
 ## 用户常用口令
 
