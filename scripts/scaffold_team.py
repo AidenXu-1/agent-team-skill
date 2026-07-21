@@ -26,7 +26,7 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.4.9"
+PROTOCOL_VERSION = "1.4.10"
 PROTOCOL_FILE = "协议版本.json"
 ADD_TRANSACTION_FILE = ".add-roles-transaction.json"
 DEACTIVATE_TRANSACTION_FILE = ".deactivate-roles-transaction.json"
@@ -601,7 +601,7 @@ ROLE_DEFS = {
         "mission": "判断阶段、拆分验收节点、用任务工具派单、维护项目总进度与跨部门沟通;派单写清验收出口和失败路径,核验任务状态、TASK_STATE_OK、验证结果与错题自检。涉及最终体验、范围、成本、安全、发布或重大方案选择时请用户决定;流程性、技术性和不改变边界的调度可自主推进并如实汇报。视觉任务的设计意图预览只在用户提出或任务明确要求时触发。审核发现问题后,由统筹部根据问题性质派回对应执行部门。",
         "not_responsible": "不亲自替执行层产出;不替审核层做独立验证;不自动对外放行;不把建议下一步当成用户已同意;不在重大边界替用户拍板;默认不吞入无关部门正文、长日志或完整证据;不为没有触发的预览增加流程;派单缺关键验收信息时不要求接收部门脑补。",
         "inputs": "项目目标, 任务状态与完成收据, 可选 LOG_OK 事件收据, 验收出口, 失败路径, 必要的项目总进度",
-        "outputs": "通过任务工具派发的任务, 三类节点卡汇报, 项目总进度汇总, 三关汇总后的放行建议",
+        "outputs": "通过任务工具派发的任务, 面向用户的结果/需要你做什么/还需注意三段短报, 项目总进度汇总, 三关汇总后的放行建议",
         "can_write": "项目总进度文档, 部门表.md;通过任务工具派单和核收,不手工编辑收件箱",
         "cannot_write": "各部门的产出物, 其他部门岗位边界, 不替审核层改把关结论",
         "confirm": "最终体验与用户感知、范围和路线、视觉或交互方向、用户明确要求的设计预览、上线发布、外发交付、明显成本增加、隐私/安全/授权风险、大阶段收口或对外放行",
@@ -1417,7 +1417,7 @@ SESSION_STATE = COLLAB / "会话启动状态.json"
 INDEX_MARKER = "<!-- agent-team task index; use scripts/agent_team_task.py -->"
 INDEX_TRANSACTION = LOCKS / "task-index-transaction.json"
 SCHEMA_VERSION = 1
-PROTOCOL_VERSION = "1.4.9"
+PROTOCOL_VERSION = "1.4.10"
 STATES = ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged")
 BUSY_STATES = {"claimed"}
 VISIBLE_ACTIVE_STATES = {"claimed", "blocked", "waiting_input"}
@@ -2830,7 +2830,7 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_SESSION_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.4.9"
+PROTOCOL_VERSION = "1.4.10"
 ROOT_FIELDS = {
     "schema_version", "protocol_version", "created_at", "updated_at", "profile",
     "session_mode", "role_order", "departments",
@@ -3502,7 +3502,8 @@ def role_markdown(
         else "- 执行/管理层先自检再回报,不得替审核层给出最终质量、风险或成本放行结论。"
     )
     management_rule = (
-        "- 统筹部先读自己的收件箱和项目总进度;只有回报不足、收据错误、部门冲突或用户要求时才扩大证据范围。"
+        "- 统筹部先读自己的收件箱和项目总进度;只有回报不足、收据错误、部门冲突或用户要求时才扩大证据范围。\n"
+        "- 只在需要拍板、需要体验、重要变化/风险或节点完成时找用户;默认只报“结果 / 需要你做什么 / 还需注意”,无注意项则省略。体验时给入口、顺序、预期、判断点和限制;默认不展开 TASK ID、状态词、哈希、命令、日志或协议。"
         if key == "lead"
         else "- 项目总进度由统筹部维护;本部门用收件箱、交接班文档和产出路径完成闭环。"
     )
@@ -4113,6 +4114,8 @@ docs/collaboration/
 ## 报告
 
 普通任务默认用 TASK 完成记录与真实产物闭环。复杂研究、方案、阶段总结或用户决策材料才写工作报告；审核任务写审核报告。共享格式只在 `模板/` 保留一份，各部门统一写入自己的 `报告/`。
+
+部门完成四件套只供统筹核收。统筹面向用户只在需要拍板、需要体验、发生重要变化/风险或节点完成时汇报，默认使用“结果 / 需要你做什么 / 还需注意”三段短报。无注意项时省略第三段；需要体验时给出入口、操作顺序、预期结果、重点判断和已知限制。内部任务号、状态词、哈希、命令、日志和协议默认不展开，只在排障、发布核验或用户追问时补充。
 """
 
 

@@ -2,12 +2,12 @@
 name: agent-team
 description: Build low-context multi-agent teams with durable handoff, independent review, and user gates. Use when a project needs separate management, execution, and review roles.
 metadata:
-  version: 2.0.5
+  version: 2.0.6
 ---
 
 # Agent Team
 
-利用会话之间上下文隔离的机制，一个会话就是一个部门，每个会话职责分明，专心做好属于自己的活，高效协作。并利用项目文件夹本地数据存储的项目留痕方式和巧妙的管理机制，便于更换新的会话使部门能长期稳定工作。
+一个会话对应一个部门，用项目文件保存长期真值，让分工、审核和换会话接班都能稳定延续。
 
 ## 默认热路径
 
@@ -59,7 +59,7 @@ metadata:
 
 ## 事实日志
 
-日志默认不读，只在事件发生时写入部门 ISO 周日志的身份分区。正式部门和临时外包共用一份周文件，但物理分为“正式部门日志”和“临时外包日志”；临时外包再按 TASK 分组。日志只保存可核验事实，不写“经验、启示、方法论”或完整聊天；项目复盘时再根据事实总结。
+日志默认不读，只记可核验的轨迹事件。正式部门和临时外包共用部门 ISO 周文件但分区保存；不写完整聊天或事后方法论。
 
 只记录五类改变项目轨迹的事件：`MILESTONE`（可交付节点）、`CHANGE`（已确认的需求或边界变化）、`CORRECTION`（用户纠偏）、`DECISION`（关键方案选择）和 `INCIDENT`（值得倒查的失败或风险）。
 
@@ -77,7 +77,7 @@ python3 docs/collaboration/scripts/agent_team_log.py append \
   --pointer "docs/spec.md"
 ```
 
-脚本负责带时区时间、唯一事件 ID、周文件创建、末尾原子追加和短收据；不得输出日志正文。一个事件只登记一次：项目级变化和决策由统筹部记录，部门局部事件由发生部门记录，其他部门只引用事件 ID。可复发的 `CORRECTION` 另外在共享错题集写“错误/正确做法”，并引用事件 ID；不要复制事件全文。
+脚本负责时间、事件 ID、周文件和原子追加，只返短收据。项目级事件由统筹部记，部门局部事件由发生部门记，其他部门只引用 ID；可复发的 `CORRECTION` 另写错题条目。
 
 临时外包写日志时还要传 `--executor-type temporary --executor-id ... --parent-department ...`。工具只允许它写入父部门的临时板块。正式吸收后，父部门只在正式板块增加一条引用 TASK、delivery 和正式证据的 MILESTONE，不复制外包原始日志。
 
@@ -147,11 +147,21 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 测试分两段：体验前做独立冒烟和安全探针；体验方向确认后做完整回归。无界面任务直接按验收出口完整验证。
 
+## 向用户汇报
+
+部门仍向统筹部交“产出、已验证/未验证、`TASK_STATE_OK`、错题自检”四件套；统筹部只在需要拍板、需要体验、发生重要变化/风险或节点完成时主动找用户。默认用非程序员能看懂的三段短报：
+
+1. `结果`：先说是否完成、主要成果和当前能否使用。
+2. `需要你做什么`：明确写“无需操作 / 需要判断 / 需要体验”。需要体验时给入口、操作顺序、预期结果、重点判断和已知限制。
+3. `还需注意`：只写会影响用户判断的未验证项、风险或下一汇报点；没有就省略。
+
+默认不向用户展开 TASK ID、内部状态词、哈希、命令、测试日志或协议版本；只在排障、发布核验或用户追问时补充。错题自检有实际风险时翻译进“还需注意”，无命中时不单独展示。
+
 ## 单 TASK 临时外包（按需）
 
 只有用户主动提出临时外包、并行外包或 TASK 级临时会话时，才完整读取 `references/temporary-executor.md`，再做预检、创建或任何生命周期操作。未触发时不要读取该文件，也不要主动扩容。
 
-用户只问“能不能并行 / 是否适合外包”时只做判断，通过后仍需确认创建；只有“如果可以就帮我开”等同时包含判断与创建委托的表达才可在通过后直接创建。运行边界保持很窄：统一模型是 `temporary_executor + parent_department + 单一 TASK`；当前完整执行链只开放临时开发外包，其他父部门只能做通用预检；所有机械操作只用生成的 `agent_team_temporary.py`，不能凭文字跳过候选绑定、正式验证、吸收、reconcile 或真实会话归档收据。
+用户只问“能不能并行”时只判断，通过后仍需确认；“如果可以就帮我开”才同时授权创建。统一模型是 `temporary_executor + parent_department + 单一 TASK`；当前只完整支持开发外包，其他父部门只做通用预检。机械操作只用 `agent_team_temporary.py`，不能跳过候选绑定、正式验证、吸收、reconcile 或会话归档收据。
 
 ## 会话模式与换班
 
@@ -177,7 +187,7 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 增加部门：`--add-roles "<ids>"` 同一事务更新真值与派生表；活跃部门重复添加保持幂等，已停用部门会复用原身份重新启用。
 
-* 当前运行协议为 `1.4.9`。旧层用 `--upgrade-collaboration` 显式升级；旧收件箱有正文或受管岗位说明漂移时停止。升级先写回滚标记；确认过的项目职责用只追加 JSON 和 `--role-policy-overlay-file` 迁移。
+* 当前运行协议为 `1.4.10`。旧层用 `--upgrade-collaboration` 显式升级；旧收件箱有正文或受管岗位说明漂移时停止。升级先写回滚标记；确认过的项目职责用只追加 JSON 和 `--role-policy-overlay-file` 迁移。
 
 * 停用部门：收口任务；已登记会话取得真实归档回执后先运行 `agent_team_session.py retire`，再运行 `--deactivate-roles ... --deactivation-evidence ...`。保留历史身份并维持三层结构。
 
