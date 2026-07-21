@@ -24,10 +24,10 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = Path(os.environ.get("AGENT_TEAM_SCAFFOLD", ROOT / "scripts" / "scaffold_team.py")).expanduser().resolve()
-PUBLIC_VERSION = "2.0.4"
-SOURCE_VERSION = "2.0.4"
-PROTOCOL_VERSION = "1.4.8"
-PREVIOUS_PROTOCOL_VERSION = "1.4.7"
+PUBLIC_VERSION = "2.0.5"
+SOURCE_VERSION = "2.0.5"
+PROTOCOL_VERSION = "1.4.9"
+PREVIOUS_PROTOCOL_VERSION = "1.4.8"
 RUNTIME_FILES = (
     "SKILL.md",
     "agents/openai.yaml",
@@ -62,6 +62,21 @@ def run(
     ok: bool = True,
     env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
+    args = list(args)
+    if (
+        len(args) >= 3
+        and Path(args[1]).name == "agent_team_task.py"
+        and args[2] in {"enqueue", "authorize"}
+        and "--actor" not in args
+    ):
+        args += ["--actor", "统筹部/lead-thread"]
+    if (
+        len(args) >= 3
+        and Path(args[1]).name == "agent_team_session.py"
+        and args[2] == "set-notification"
+        and "--actor" not in args
+    ):
+        args += ["--actor", "统筹部/lead-thread"]
     result = subprocess.run(
         args,
         cwd=cwd,
@@ -334,7 +349,25 @@ def task_id_from(receipt: subprocess.CompletedProcess[str]) -> str:
     return parts[1]
 
 
+def ensure_lead_registered(task_tool: Path, thread_id: str = "lead-thread") -> None:
+    collab = task_tool.parents[1]
+    state_path = collab / "会话启动状态.json"
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    lead = state["departments"]["统筹部"]
+    if lead["step"] == "registered":
+        return
+    check(lead["step"] == "pending" and not lead["thread_id"],
+          "test fixture lead session is neither pending nor registered")
+    session_tool = collab / "scripts" / "agent_team_session.py"
+    for step in ("created", "onboarded", "registered"):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", "统筹部", "--step", step,
+            "--thread-id", thread_id, "--evidence", f"fixture-{step}",
+        ])
+
+
 def enqueue(task_tool: Path, title: str, auth: str = "none", evidence: str = "") -> str:
+    ensure_lead_registered(task_tool)
     args = [
         sys.executable, str(task_tool), "enqueue",
         "--department", "执行部", "--from-department", "统筹部",
@@ -692,6 +725,9 @@ def verify_tasks(project: Path) -> None:
     result_file.write_text("verified\n", encoding="utf-8")
 
     gated = enqueue(tool, "待授权任务", "user_required")
+    gated_list = run([sys.executable, str(tool), "list"])
+    check(f"{gated} | 待用户确认" in gated_list.stdout,
+          "list mislabeled an authorization-gated task as claimable")
     denied = run([sys.executable, str(tool), "claim", "--task-id", gated, "--claimed-by", "s1"], ok=False)
     check("授权状态禁止领取" in denied.stderr, "user_required task was claimable")
     run([sys.executable, str(tool), "authorize", "--task-id", gated, "--state", "user_confirmed", "--evidence", "user-message-1"])
@@ -839,26 +875,37 @@ def verify_tasks(project: Path) -> None:
     del missing_department["department"]
     schema_path.write_text(json.dumps(missing_department, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     before_invalid_enqueue = len(list((collab / "tasks").glob("TASK-*.json")))
-    denied_missing_department = run([
+    hot_path_missing_department = run([
         sys.executable, str(tool), "enqueue", "--department", "执行部", "--from-department", "统筹部",
         "--title", "不应创建", "--node", "单节点", "--details", "测试",
         "--acceptance-exit", "可见", "--failure-path", "结构缺失", "--authorization-state", "none",
-    ], ok=False)
-    check("任务字段缺失" in denied_missing_department.stderr, "missing department was not rejected canonically")
-    check(len(list((collab / "tasks").glob("TASK-*.json"))) == before_invalid_enqueue,
-          "enqueue mutated task store after missing department preflight")
+    ])
+    created_while_history_corrupt = task_id_from(hot_path_missing_department)
+    check("TASK_INDEX_STALE" in hot_path_missing_department.stderr,
+          "hot-path enqueue did not warn that the derived inbox could not refresh")
+    doctor_missing_department = run([sys.executable, str(tool), "doctor"], ok=False)
+    check("任务字段缺失" in doctor_missing_department.stderr,
+          "full-history doctor did not reject a missing canonical department")
+    (collab / "tasks" / f"{created_while_history_corrupt}.json").unlink()
     schema_path.write_text(json.dumps(original, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
     before = len(list((collab / "tasks").glob("TASK-*.json")))
     corrupt = collab / "tasks" / "TASK-20200101-BROKEN.json"
     corrupt.write_text("{broken", encoding="utf-8")
-    refused = run([
+    hot_path_corrupt = run([
         sys.executable, str(tool), "enqueue", "--department", "执行部", "--from-department", "统筹部",
         "--title", "不应创建", "--node", "单节点", "--details", "测试",
         "--acceptance-exit", "可见", "--failure-path", "损坏", "--authorization-state", "none",
-    ], ok=False)
-    check("TASK_ERROR" in refused.stderr, "corrupt canonical task did not stop mutation")
-    check(len(list((collab / "tasks").glob("TASK-*.json"))) == before + 1, "mutation occurred after corrupt task")
+    ])
+    created_while_json_corrupt = task_id_from(hot_path_corrupt)
+    check("TASK_INDEX_STALE" in hot_path_corrupt.stderr,
+          "corrupt cold history did not produce an explicit stale-index warning")
+    doctor_corrupt = run([sys.executable, str(tool), "doctor"], ok=False)
+    check("JSON 无效" in doctor_corrupt.stderr,
+          "full-history doctor did not reject corrupt canonical history")
+    (collab / "tasks" / f"{created_while_json_corrupt}.json").unlink()
+    check(len(list((collab / "tasks").glob("TASK-*.json"))) == before + 1,
+          "hot-path isolation lost or created unexpected TASK files")
     corrupt.unlink()
 
     audit_id = task_id_from(run([
@@ -875,6 +922,48 @@ def verify_tasks(project: Path) -> None:
     ], ok=False)
     check("审核报告" in no_report.stderr, "audit task completed without audit report")
     report = collab / "部门" / "检验部" / "报告" / "audit.md"
+    report.write_text(f"""---
+type: audit_report
+department: 检验部
+target: Agent Team
+status: pending
+date: {dt.date.today().isoformat()}
+related_task: {audit_id}
+decision: 待定
+tags: []
+summary: 待定
+---
+
+# 审核草稿
+""", encoding="utf-8")
+    pending_report = run([
+        sys.executable, str(tool), "complete", "--task-id", audit_id,
+        "--artifact", str(report.relative_to(project)), "--report", str(report.relative_to(project)),
+        "--verified", "仅完成草稿", "--unverified", "最终结论", "--mistake-check", "无命中",
+    ], ok=False)
+    check("status 必须为 final" in pending_report.stderr,
+          "pending audit report crossed the completion gate")
+    report.write_text(f"""---
+type: audit_report
+department: 检验部
+target: Agent Team
+status: final
+date: {dt.date.today().isoformat()}
+related_task: {audit_id}
+decision: pass
+tags: []
+summary: 待填一句话结论
+---
+
+# 占位摘要
+""", encoding="utf-8")
+    placeholder_summary = run([
+        sys.executable, str(tool), "complete", "--task-id", audit_id,
+        "--artifact", str(report.relative_to(project)), "--report", str(report.relative_to(project)),
+        "--verified", "仅完成占位报告", "--unverified", "真实结论", "--mistake-check", "无命中",
+    ], ok=False)
+    check("summary 仍是占位内容" in placeholder_summary.stderr,
+          "placeholder audit summary crossed the completion gate")
     report.write_text(f"""---
 type: audit_report
 department: 检验部
@@ -2589,6 +2678,7 @@ def verify_resume_admission_guards(root: Path) -> None:
     collab = project / "docs" / "collaboration"
     task_tool = collab / "scripts" / "agent_team_task.py"
     temporary_tool = collab / "scripts" / "agent_team_temporary.py"
+    ensure_lead_registered(task_tool)
     formal = task_id_from(run([
         sys.executable, str(task_tool), "enqueue", "--department", "测试部",
         "--from-department", "统筹部", "--title", "正式路径任务",
@@ -3366,6 +3456,153 @@ def verify_task_supersede(root: Path) -> None:
     )
 
 
+def verify_protocol_149_guards(root: Path) -> None:
+    project = make_project(root, "protocol-149-guards")
+    scaffold(project, "lead,do,review,research")
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    session_tool = collab / "scripts" / "agent_team_session.py"
+    temporary_tool = collab / "scripts" / "agent_team_temporary.py"
+    non_git_help = run([sys.executable, str(temporary_tool), "--help"])
+    non_git_pending = run([sys.executable, str(temporary_tool), "pending-archives"])
+    check(
+        "pending-archives" in non_git_help.stdout
+        and non_git_pending.stdout.strip() == "NO_PENDING_THREAD_ARCHIVES",
+        "non-Git read-only temporary commands still required eager Git discovery",
+    )
+    ensure_lead_registered(task_tool)
+
+    actor_help_checks = [
+        (task_tool, "enqueue", "--actor"),
+        (task_tool, "authorize", "--actor"),
+        (task_tool, "supersede", "--actor"),
+        (task_tool, "resolve", "--actor"),
+        (task_tool, "ack", "--acknowledged-by"),
+        (session_tool, "set-notification", "--actor"),
+        (session_tool, "retire", "--actor"),
+    ]
+    for tool, command, option in actor_help_checks:
+        help_result = run([sys.executable, str(tool), command, "--help"])
+        check(
+            option in help_result.stdout and "统筹部/会话ID" in help_result.stdout,
+            f"{command} help omitted the registered lead actor format",
+        )
+
+    wrong_actor = run([
+        sys.executable, str(task_tool), "enqueue", "--department", "执行部",
+        "--from-department", "统筹部", "--title", "伪造派单", "--node", "节点",
+        "--details", "不得创建", "--acceptance-exit", "拒绝", "--failure-path", "身份不符",
+        "--authorization-state", "none", "--actor", "执行部/fake",
+    ], ok=False)
+    check("actor 必须匹配" in wrong_actor.stderr, "non-lead enqueue actor was accepted")
+
+    rejected = enqueue(task_tool, "用户拒绝后的普通任务", "user_required")
+    run([
+        sys.executable, str(task_tool), "authorize", "--task-id", rejected,
+        "--state", "user_confirmed", "--evidence", "user-started",
+    ])
+    run([sys.executable, str(task_tool), "claim", "--task-id", rejected, "--claimed-by", "do-thread"])
+    run([sys.executable, str(task_tool), "block", "--task-id", rejected, "--reason", "等待用户最终决定"])
+    payload = json.loads((collab / "tasks" / f"{rejected}.json").read_text(encoding="utf-8"))
+    resolved = run([
+        sys.executable, str(task_tool), "resolve", "--task-id", rejected,
+        "--state", "rejected_by_user", "--expected-revision", str(payload["revision"]),
+        "--actor", "统筹部/lead-thread", "--reason", "用户明确停止",
+        "--evidence", "user-message-rejected",
+    ])
+    resolved_payload = json.loads((collab / "tasks" / f"{rejected}.json").read_text(encoding="utf-8"))
+    check(
+        resolved.stdout.startswith("TASK_RESOLUTION_OK | state=rejected_by_user")
+        and resolved_payload["execution_state"] == "blocked"
+        and resolved_payload["resolution"]["state"] == "rejected_by_user"
+        and resolved_payload["authorization_state"] == "user_rejected"
+        and resolved_payload["authorization_evidence"] == "user-message-rejected",
+        "user-rejected ordinary TASK did not close while preserving execution history",
+    )
+
+    registry = collab / "部门表.md"
+    registry_before_rebuild = registry.read_bytes()
+    registry.unlink()
+    rebuilt = run([sys.executable, str(session_tool), "rebuild-registry"])
+    check(
+        rebuilt.stdout.startswith("SESSION_REGISTRY_OK")
+        and registry.read_bytes() == registry_before_rebuild,
+        "session registry was not reconstructed exactly from durable state",
+    )
+
+    for step in ("created", "onboarded", "registered"):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", "研究部", "--step", step,
+            "--thread-id", "research-thread", "--evidence", f"research-{step}",
+        ])
+    retired = run([
+        sys.executable, str(session_tool), "retire", "--department", "研究部",
+        "--actor", "统筹部/lead-thread",
+        "--evidence", "host=test-host thread_id=research-thread archived=true",
+    ])
+    check(retired.stdout.startswith("SESSION_RETIRED"), "registered idle department could not retire safely")
+    deactivated = run([
+        sys.executable, str(SCAFFOLD), str(project), "--deactivate-roles", "research",
+        "--deactivation-evidence", "user-confirmed-smaller-team",
+    ])
+    state = json.loads((collab / "会话启动状态.json").read_text(encoding="utf-8"))
+    check(
+        deactivated.stdout.startswith("DEACTIVATE_ROLES_OK")
+        and state["departments"]["研究部"]["active"] is False
+        and (collab / "部门" / "研究部").is_dir()
+        and "研究部" not in (collab / "路由表.md").read_text(encoding="utf-8")
+        and "已停用" in (collab / "部门表.md").read_text(encoding="utf-8"),
+        "department deactivation lost history or left the role active",
+    )
+    inactive_enqueue = run([
+        sys.executable, str(task_tool), "enqueue", "--department", "研究部",
+        "--from-department", "统筹部", "--title", "停用后派单", "--node", "节点",
+        "--details", "不得创建", "--acceptance-exit", "拒绝", "--failure-path", "部门停用",
+        "--authorization-state", "none",
+    ], ok=False)
+    check("部门已停用" in inactive_enqueue.stderr, "inactive department accepted a new task")
+    break_layers = run([
+        sys.executable, str(SCAFFOLD), str(project), "--deactivate-roles", "do",
+        "--deactivation-evidence", "user-confirmed",
+    ], ok=False)
+    check("三层最小结构" in break_layers.stderr, "deactivation broke the three-layer minimum")
+    upgraded = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    upgraded_state = json.loads((collab / "会话启动状态.json").read_text(encoding="utf-8"))
+    check(
+        upgraded.stdout.startswith("UPGRADE_NOT_NEEDED")
+        and upgraded_state["departments"]["研究部"]["active"] is False
+        and "研究部" not in (collab / "路由表.md").read_text(encoding="utf-8"),
+        "same-version maintenance reactivated a deactivated department",
+    )
+    reactivated = run([sys.executable, str(SCAFFOLD), str(project), "--add-roles", "research"])
+    reactivated_state = json.loads((collab / "会话启动状态.json").read_text(encoding="utf-8"))
+    check(
+        "已重新启用部门" in reactivated.stdout
+        and reactivated_state["departments"]["研究部"]["active"] is True
+        and "研究部" in (collab / "路由表.md").read_text(encoding="utf-8"),
+        "explicit add-roles could not reactivate a preserved department identity",
+    )
+    research_history = reactivated_state["departments"]["研究部"]["lifecycle_history"]
+    check(
+        [event["event"] for event in research_history] == ["retired", "deactivated", "reactivated"]
+        and research_history[0]["thread_id"] == "research-thread"
+        and research_history[1]["evidence"] == "user-confirmed-smaller-team",
+        "retire/deactivate/reactivate evidence was overwritten instead of appended",
+    )
+    for step in ("created", "onboarded", "registered"):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", "研究部", "--step", step,
+            "--thread-id", "research-thread-v2", "--evidence", f"research-v2-{step}",
+        ])
+    registered_again = json.loads((collab / "会话启动状态.json").read_text(encoding="utf-8"))
+    check(
+        registered_again["departments"]["研究部"]["lifecycle_history"] == research_history,
+        "new session registration erased preserved department lifecycle history",
+    )
+    doctor = run([sys.executable, str(task_tool), "doctor"])
+    check(doctor.stdout.startswith("TASK_DOCTOR_OK"), "full-history doctor failed after legal resolution")
+
+
 def main() -> int:
     compile_script(SCAFFOLD)
     verify_repository_contract()
@@ -3385,6 +3622,7 @@ def main() -> int:
         verify_upgrade_and_guards(root)
         verify_transaction_recovery_attacks(root)
         verify_task_supersede(root)
+        verify_protocol_149_guards(root)
     print("VERIFY_OK | scaffold, task, temporary executor, tested-tree promotion, absorption, log, session, upgrade, migration, and path guards passed")
     return 0
 

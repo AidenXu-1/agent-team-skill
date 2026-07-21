@@ -1,8 +1,8 @@
 ---
 name: agent-team
-description: Build and maintain low-context multi-agent or multi-session teams with durable file-based handoff, factual event logs, independent review, and explicit user gates. Use for software, AI product, content, operations, research, consulting, automation, or other projects that need separate management, execution, and review roles without relying on one long-running conversation.
+description: Build low-context multi-agent teams with durable handoff, independent review, and user gates. Use when a project needs separate management, execution, and review roles.
 metadata:
-  version: 2.0.4
+  version: 2.0.5
 ---
 
 # Agent Team
@@ -137,13 +137,15 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 完成时校验本地产物真实存在且位于项目内；外部产物必须显式标记。任务完成必须提供产出、已验证、未验证和错题自检，收到 `TASK_STATE_OK` 后才能唤醒统筹部。
 
-* 审核层任务必须提交本部门 `报告/` 下的审核报告；报告必须带与任务一致的 YAML 元数据，并同时列为本地产物，否则不能完成。
+* 审核层任务必须提交本部门 `报告/` 下的审核报告；报告必须带与任务一致的 YAML 元数据、`status=final`、`decision=pass|fail` 和非占位摘要，并同时列为本地产物。草稿或“待定”结论不能完成。
 
 * 统筹部只能核收 `completed` 任务；`acknowledged-by` 必须精确匹配会话状态中当前已登记的 `统筹部/会话ID`，用于防止普通部门误操作，核收后状态为 `acknowledged`。
 
-* `queued` 任务被后续主链取代时，只能由已登记统筹会话调用 `supersede`；必须绑定已进入执行生命周期的 replacement TASK、双方 revision、reason 和 evidence。原正文与 `queued` 态保留，只新增 `resolution=superseded`；不开放无替代证据的 cancel。
+* 普通任务退出时保留原文和执行状态。后续主链取代用 `supersede`；用户拒绝或放弃用 `resolve`。`rejected_by_user` 会同步记录授权拒绝证据；`claimed` 先 `block` 再收口。
 
-* `TASK_STATE_OK` 只证明状态已持久化和本地产物路径已校验，不证明业务质量。脚本参数中的领取人、核收人和授权证据只作审计记录，不冒充身份认证。
+* `enqueue / authorize / supersede / resolve / ack / set-notification` 的 actor 必须匹配已登记统筹会话；这只是防误操作的审计线索，不构成安全认证。
+
+* 测试分两段：体验前做独立冒烟和安全探针；体验方向确认后做完整回归。无界面任务直接按验收出口完整验证。
 
 ## 单 TASK 临时外包（按需）
 
@@ -153,7 +155,7 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 ## 会话模式与换班
 
-* `manual`：只生成文件和上岗清单；不得声称已经创建部门会话。
+* `manual`：用户建窗口并发送上岗引导后，也必须用同一会话 ID 依次登记 `created / onboarded / registered`；统筹部 registered 后才能派单。不得把生成文件说成已创建会话。
 
 * `auto`：生成文件后，用当前环境的会话工具创建各部门新会话、发送上岗引导，再把真实会话 ID 和外部证据写入会话状态；会话工具刷新部门表派生索引。任一步失败都如实回退为人工。
 
@@ -173,11 +175,13 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 ## 维护与验证
 
-* 增加部门：`scaffold_team.py <项目> --add-roles "<ids>"`；脚本同一事务更新部门表、路由表、会话启动清单、会话状态和部门目录。派生文档从会话状态真值整体重建，不追加另一份“待登记”副本；重复新增已存在部门保持幂等。
+* 增加部门：`--add-roles "<ids>"` 同一事务更新真值与派生表；活跃部门重复添加保持幂等，已停用部门会复用原身份重新启用。
 
-* 当前运行协议为 `1.4.8`。旧协作层升级：`scaffold_team.py <项目> --upgrade-collaboration`。如旧收件箱存在待办/回报正文，脚本拒绝猜测迁移，要求先处理清楚；升级在任何真值变更前写持久回滚标记，成功前保留带时间戳备份。岗位说明相对受管基线发生变化时默认 fail-closed；用户确认项目新增职责后，将其迁移为只追加 JSON，再传 `--role-policy-overlay-file`。标准职责继续升级，项目补充合并到同一份岗位说明，不冻结整份旧模板。
+* 当前运行协议为 `1.4.9`。旧层用 `--upgrade-collaboration` 显式升级；旧收件箱有正文或受管岗位说明漂移时停止。升级先写回滚标记；确认过的项目职责用只追加 JSON 和 `--role-policy-overlay-file` 迁移。
 
-* 减少或合并部门：先把在办事项和历史指针交代清楚，再调整部门表与岗位边界，不删除历史。
+* 停用部门：收口任务；已登记会话取得真实归档回执后先运行 `agent_team_session.py retire`，再运行 `--deactivate-roles ... --deactivation-evidence ...`。保留历史身份并维持三层结构。
+
+* 部门表丢失或损坏时运行 `agent_team_session.py rebuild-registry`，只从会话状态真值重建。
 
 * 通知能力只在上岗/接班时登记一次；后续按部门表的自动/人工模式执行。
 
