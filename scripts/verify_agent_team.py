@@ -728,8 +728,20 @@ def verify_repository_contract() -> None:
         and "--latest" in workflow
         and "draft_zip_digest" in workflow
         and "draft_target" in workflow
-        and "target_commitish" in workflow
-        and "remote_tag_sha" in workflow
+        and "targetCommitish" in workflow
+        and "existing_release" in workflow
+        and "draft_is_draft" in workflow
+        and "draft_asset_count" in workflow
+        and "Reusing exact reviewed draft release" in workflow
+        and "Recovering unpublished draft onto runtime-identical reviewed commit" in workflow
+        and 'git diff --quiet "${draft_target}" "${GITHUB_SHA}" -- \\' in workflow
+        and 'gh release edit "${TAG}" \\' in workflow
+        and '--target "${GITHUB_SHA}" \\' in workflow
+        and 'gh release upload "${TAG}" \\' in workflow
+        and '--clobber' in workflow
+        and "Tag appeared before publication" in workflow
+        and "remote_tag_sha" not in workflow
+        and 'releases/tags/${TAG}" --jq .target_commitish' not in workflow
         and "published_tag_sha" in workflow
         and "gh release download" in workflow
         and "sha256sum -c" in workflow
