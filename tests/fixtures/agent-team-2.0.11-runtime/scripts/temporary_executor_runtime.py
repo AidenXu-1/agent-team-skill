@@ -24,7 +24,7 @@ else:
     import fcntl
 
 
-PROTOCOL_VERSION = "1.5.0"
+PROTOCOL_VERSION = "1.4.15"
 DISPATCH_CONTROL_NAME = "dispatch-control.json"
 TASK_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
 SAFE_STATES = {"safe", "manual", "unsafe", "waiting_base"}
@@ -35,7 +35,6 @@ PROMOTION_STATES = {
 }
 SESSION_STATES = {"provisioning", "awaiting_rule_confirmation", "active", "standby", "archived", "failed", "cancelled"}
 ABSORPTION_STATES = {"pending", "completed", "not_applicable"}
-ACTOR_MAX_CHARS = 400
 
 
 def now_iso() -> str:
@@ -216,7 +215,7 @@ def work_mode() -> str:
         expected_action = "unfreeze" if expected_action == "freeze" else "freeze"
         if (
             not isinstance(event["actor"], str) or not event["actor"].startswith("统筹部/")
-            or len(event["actor"]) > ACTOR_MAX_CHARS or any(char.isspace() for char in event["actor"])
+            or len(event["actor"]) > 200 or any(char.isspace() for char in event["actor"])
             or not isinstance(event["evidence"], str) or not event["evidence"].strip()
             or event["evidence"] != event["evidence"].strip() or len(event["evidence"]) > 1000
         ):
@@ -240,32 +239,13 @@ def work_mode() -> str:
 def enforce_stop_loss(args: argparse.Namespace) -> None:
     if work_mode() != "frozen":
         return
-    cleanup_commands = {
-        "pause", "abandon", "cleanup", "reconcile-cleanup", "acknowledge",
-        "reconcile-provision", "reset-failed-provision", "reconcile-promotion", "absorb",
-    }
+    cleanup_commands = {"pause", "abandon"}
     if args.cmd in cleanup_commands:
         return
     if args.cmd == "session-mark" and args.state in {"standby", "archived", "failed"}:
         return
     raise ValueError(
-        "P0_FREEZE_ACTIVE | 临时外包推进已冻结；只允许暂停、核收、放弃、清理/归档或失败记账，禁止删除证据"
-    )
-
-
-def enforce_legacy_closeout_only(args: argparse.Namespace) -> None:
-    allowed = {
-        "pause", "abandon", "cleanup", "reconcile-cleanup", "acknowledge",
-        "reconcile-provision", "reset-failed-provision", "reconcile-promotion", "absorb",
-        "preflight", "provision",
-    }
-    if args.cmd in allowed:
-        return
-    if args.cmd == "session-mark" and args.state in {"standby", "archived", "failed"}:
-        return
-    raise ValueError(
-        "LEGACY_TEMPORARY_CLOSEOUT_ONLY | 协议 1.5 只维护升级前临时执行者的恢复、放弃、"
-        "资源清理、知识收口与会话归档；禁止 resume/rework/amend/candidate/submit 或新建执行"
+        "P0_FREEZE_ACTIVE | 临时外包推进已冻结；只允许暂停、放弃、归档或失败记账，禁止删除证据"
     )
 
 
@@ -478,87 +458,9 @@ def write_task(task: dict, *, expected_revision: int) -> None:
         temp.unlink(missing_ok=True)
 
 
-def legacy_archive_recovery_path() -> Path:
-    return secure_locks_root() / "legacy-archive-recovery.json"
-
-
-def read_legacy_archive_recovery() -> dict:
-    path = legacy_archive_recovery_path()
-    if not path.exists():
-        return {"schema_version": 1, "protocol_version": PROTOCOL_VERSION, "entries": {}}
-    payload = read_plain_json(path, secure_locks_root(), label="legacy archive recovery")
-    if not isinstance(payload, dict) or set(payload) != {"schema_version", "protocol_version", "entries"}:
-        raise ValueError("legacy archive recovery 结构无效")
-    entries = payload.get("entries")
-    if payload.get("schema_version") != 1 or payload.get("protocol_version") != PROTOCOL_VERSION or not isinstance(entries, dict):
-        raise ValueError("legacy archive recovery 版本无效")
-    for task_id, entry in entries.items():
-        if (
-            not TASK_RE.fullmatch(task_id)
-            or not isinstance(entry, dict)
-            or set(entry) != {"task_sha256", "thread_id", "state", "receipt", "verified_at"}
-            or not re.fullmatch(r"[0-9a-f]{64}", entry.get("task_sha256", ""))
-            or not isinstance(entry.get("thread_id"), str)
-            or entry.get("state") not in {"pending", "verified"}
-            or not isinstance(entry.get("receipt"), str)
-            or not isinstance(entry.get("verified_at"), str)
-            or (entry["state"] == "pending" and (entry["receipt"] or entry["verified_at"]))
-            or (entry["state"] == "verified" and (not entry["receipt"] or not entry["verified_at"]))
-        ):
-            raise ValueError("legacy archive recovery 条目无效")
-        task = task_path(task_id)
-        if not task.is_file() or task.is_symlink() or hashlib.sha256(task.read_bytes()).hexdigest() != entry["task_sha256"]:
-            raise ValueError(f"legacy archive recovery 与原 TASK 字节不一致: {task_id}")
-    return payload
-
-
-def write_legacy_archive_recovery(payload: dict) -> None:
-    path = legacy_archive_recovery_path()
-    data = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True).encode("utf-8") + b"\n"
-    temporary = path.parent / f".{path.name}.{uuid.uuid4().hex}.tmp"
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0), 0o600)
-    try:
-        view = memoryview(data)
-        while view:
-            written = os.write(fd, view)
-            if written <= 0:
-                raise OSError("legacy archive recovery 写入失败")
-            view = view[written:]
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-    try:
-        os.replace(temporary, path)
-        fsync_dir(path.parent)
-    finally:
-        temporary.unlink(missing_ok=True)
-
-
-def record_legacy_archive_receipt(task_id: str, evidence: str) -> bool:
-    payload = read_legacy_archive_recovery()
-    entry = payload["entries"].get(task_id)
-    if not isinstance(entry, dict):
-        return False
-    thread_id = entry["thread_id"]
-    receipt = clean("evidence", evidence, max_chars=1000)
-    if not thread_id or not valid_archive_receipt(receipt, thread_id):
-        raise ValueError(
-            "归档回执必须绑定 legacy recovery 的 thread_id、包含 archived=true，并注明 host 或 user_confirmation"
-        )
-    if entry["state"] == "verified":
-        if entry["receipt"] != receipt:
-            raise ValueError("legacy archive recovery 已绑定另一份不可改写回执")
-        print(f"TEMP_SESSION_OK | {task_id} | archived | recovery-idempotent")
-        return True
-    entry.update(state="verified", receipt=receipt, verified_at=now_iso())
-    write_legacy_archive_recovery(payload)
-    print(f"TEMP_SESSION_OK | {task_id} | archived | recovery-ledger")
-    return True
-
-
 @contextmanager
 def named_lock(filename: str):
-    if filename not in {"project-control.lock", "identity.lock"}:
+    if filename not in {"tasks.lock", "identity.lock"}:
         raise ValueError("锁文件名无效")
     locks = secure_locks_root()
     lock_path = locks / filename
@@ -584,7 +486,7 @@ def named_lock(filename: str):
 
 @contextmanager
 def task_lock():
-    with named_lock("project-control.lock"):
+    with named_lock("tasks.lock"):
         yield
 
 
@@ -913,11 +815,15 @@ def cmd_declare_impact(args: argparse.Namespace) -> int:
 
 
 def cmd_preflight(args: argparse.Namespace) -> int:
-    read_task(args.task_id)
-    raise ValueError(
-        "TEMPORARY_EXECUTOR_P2_REQUIRED | 协议 1.5 不再发起新临时执行者；"
-        "保留当前 owner，只维护升级前已存在的 1.4 temporary 收口事务"
-    )
+    task = read_task(args.task_id)
+    if task.get("department") != args.parent_department:
+        raise ValueError("parent-department 必须等于 TASK 所属部门")
+    revision_name = clean_revision("base-revision", args.base_revision)
+    base = run_git(PROJECT, "rev-parse", "--verify", f"{revision_name}^{{commit}}").stdout.strip()
+    impact = impact_from_args(args, args.task_id, base)
+    state, reasons = admission_for(args.task_id, impact)
+    print(f"TEMP_ADMISSION_{state.upper()} | {args.task_id} | " + "；".join(reasons))
+    return 0 if state == "safe" else 4
 
 
 def rule_text(task: dict, temp: dict) -> str:
@@ -1003,11 +909,6 @@ def provision_request_digest(args: argparse.Namespace, *, base: str, impact: dic
 
 def cmd_provision(args: argparse.Namespace) -> int:
     task = read_task(args.task_id)
-    if not task.get("temporary_executor"):
-        raise ValueError(
-            "TEMPORARY_EXECUTOR_P2_REQUIRED | 协议 1.5 不再创建新临时执行者；"
-            "只允许继续收口升级前已 provision 的 1.4 temporary 事务"
-        )
     if task.get("department") != args.parent_department or args.parent_department not in configured_departments():
         raise ValueError("父部门不存在或与 TASK 所属部门不一致")
     if args.parent_department != "开发部":
@@ -1339,19 +1240,14 @@ def registered_thread_owners() -> tuple[dict[str, str], dict[str, str]]:
             if registered:
                 formal_owners[registered] = f"{department}.{field}"
     temporary_owners: dict[str, str] = {}
-    recovery_entries = read_legacy_archive_recovery()["entries"]
     for path in task_files():
         other = read_task(path.stem)
         other_temp = other.get("temporary_executor")
         if not isinstance(other_temp, dict):
             continue
-        recovery_entry = recovery_entries.get(path.stem)
-        if recovery_entry is not None:
-            registered = recovery_entry["thread_id"]
-        else:
-            validate_extension(other)
-            other_session = other_temp.get("temporary_session")
-            registered = other_session.get("thread_id", "") if isinstance(other_session, dict) else ""
+        validate_extension(other)
+        other_session = other_temp.get("temporary_session")
+        registered = other_session.get("thread_id", "") if isinstance(other_session, dict) else ""
         if not registered:
             continue
         if registered in formal_owners:
@@ -1378,8 +1274,6 @@ def require_unique_thread_id(task_id: str, thread_id: str) -> None:
 
 
 def cmd_session(args: argparse.Namespace) -> int:
-    if args.state == "archived" and record_legacy_archive_receipt(args.task_id, args.evidence):
-        return 0
     task, temp = temp_task(args.task_id)
     state = args.state
     allowed = {
@@ -2227,15 +2121,7 @@ def cmd_reconcile_cleanup(args: argparse.Namespace) -> int:
 def cmd_pending_archives(args: argparse.Namespace) -> int:
     registered_thread_owners()
     pending: list[tuple[str, str]] = []
-    recovery_entries = read_legacy_archive_recovery()["entries"]
-    pending.extend(
-        (task_id, entry["thread_id"])
-        for task_id, entry in recovery_entries.items()
-        if entry["state"] == "pending"
-    )
     for path in task_files():
-        if path.stem in recovery_entries:
-            continue
         task = read_task(path.stem)
         temp = task.get("temporary_executor")
         if not isinstance(temp, dict):
@@ -2411,7 +2297,6 @@ def main() -> int:
             return args.func(args)
         with task_lock():
             enforce_stop_loss(args)
-            enforce_legacy_closeout_only(args)
             return args.func(args)
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         print(f"TEMP_ERROR | {exc}", file=sys.stderr)

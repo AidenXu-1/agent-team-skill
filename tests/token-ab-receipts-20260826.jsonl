@@ -1,0 +1,32 @@
+{"type":"evidence.meta","schema_version":1,"captured_at":"2026-08-26T14:35:53+08:00","source":"codex exec --ephemeral --json","source_root_thread_id":"01a038a7-b787-7b42-a829-4b2966b6406a","model":"gpt-5.6-sol","reasoning_effort":"low","prompt_sha256":"8a27d4dae6ca23272ea09cb9819816fd82d03b5b431e183e8f45ac56fd78114a","run_order":["candidate-1","legacy-1","legacy-2","candidate-2"],"excerpt_policy":"Exact thread IDs, completed command strings, final structured answer and turn.completed usage were retained; command stdout was omitted because the fixture files and byte counts are independently reproducible."}
+{"type":"evidence.run","run_id":"candidate-1","variant":"candidate","runtime_set_sha256":"314f8e856f661135f22e21180a3e0ed2bdf4ab7953a4e6245f11bca7932d7c41","fixture_hot_context_bytes":6257,"cold_history_tasks":927,"current_tasks":1}
+{"type":"thread.started","thread_id":"01a03cc4-86d3-74f1-be4b-73df0753f575"}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,240p' 'docs/collaboration/部门/执行部/上岗引导.md'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'python3 docs/collaboration/scripts/agent_team_task.py onboard-bundle --department \"执行部\"'","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"{\"department\":\"执行部\",\"mode\":\"normal\",\"task_title\":\"当前只读接班任务\",\"unverified\":[\"任务未领取、未执行\",\"未验证任何项目产出或体验\"]}"}}
+{"type":"turn.completed","usage":{"input_tokens":81774,"cached_input_tokens":51712,"cache_write_input_tokens":0,"output_tokens":402,"reasoning_output_tokens":99}}
+{"type":"evidence.run","run_id":"legacy-1","variant":"legacy","runtime_set_sha256":"171fae3f6cae4454a4cca5521a894e615431e323180d0344b7b2cf3eda4a28ec","fixture_hot_context_bytes":5703,"cold_history_tasks":927,"current_tasks":1}
+{"type":"thread.started","thread_id":"01a03cc5-4747-7923-bd5f-8e7778313330"}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,240p' 'docs/collaboration/部门/执行部/上岗引导.md'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,260p' 'docs/collaboration/部门/执行部/岗位说明.md'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,260p' 'docs/collaboration/部门/执行部/交接班文档.md'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,260p' 'docs/collaboration/部门/执行部/收件箱.md'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,300p' 'docs/collaboration/tasks/TASK-20260826-C9639A.json'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"{\"department\":\"执行部\",\"mode\":\"只读接班\",\"task_title\":\"当前只读接班任务\",\"unverified\":[\"任务尚未领取或执行\",\"任务无已验证项\",\"未验证任何实际产出\"]}"}}
+{"type":"turn.completed","usage":{"input_tokens":109519,"cached_input_tokens":79104,"cache_write_input_tokens":0,"output_tokens":520,"reasoning_output_tokens":85}}
+{"type":"evidence.run","run_id":"legacy-2","variant":"legacy","runtime_set_sha256":"171fae3f6cae4454a4cca5521a894e615431e323180d0344b7b2cf3eda4a28ec","fixture_hot_context_bytes":5703,"cold_history_tasks":927,"current_tasks":1}
+{"type":"thread.started","thread_id":"01a03cc5-e558-7431-b029-b7844db6114e"}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,240p' 'docs/collaboration/部门/执行部/上岗引导.md'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,260p' 'docs/collaboration/部门/执行部/岗位说明.md'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,260p' 'docs/collaboration/部门/执行部/交接班文档.md'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,260p' 'docs/collaboration/部门/执行部/收件箱.md'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,320p' 'docs/collaboration/tasks/TASK-20260826-C9639A.json'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"jq -e '(.schema_version == 1) and (.task_id == \\\"TASK-20260826-C9639A\\\") and (.department == \\\"执行部\\\") and (.execution_state == \\\"queued\\\") and (.claimed_by == \\\"\\\") and (.authorization_state == \\\"none\\\")' 'docs/collaboration/tasks/TASK-20260826-C9639A.json'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"{\"department\":\"执行部\",\"mode\":\"只读接班\",\"task_title\":\"当前只读接班任务\",\"unverified\":[\"任务未领取、未执行；无产出物或执行结果可验证\"]}"}}
+{"type":"turn.completed","usage":{"input_tokens":138464,"cached_input_tokens":106496,"cache_write_input_tokens":0,"output_tokens":866,"reasoning_output_tokens":302}}
+{"type":"evidence.run","run_id":"candidate-2","variant":"candidate","runtime_set_sha256":"314f8e856f661135f22e21180a3e0ed2bdf4ab7953a4e6245f11bca7932d7c41","fixture_hot_context_bytes":6257,"cold_history_tasks":927,"current_tasks":1}
+{"type":"thread.started","thread_id":"01a03cc6-f410-72d1-ad25-213c89dd8847"}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"sed -n '1,240p' 'docs/collaboration/部门/执行部/上岗引导.md'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc \"python3 docs/collaboration/scripts/agent_team_task.py onboard-bundle --department '执行部'\"","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"type":"agent_message","text":"{\"department\":\"执行部\",\"mode\":\"normal（只读接班，未领取）\",\"task_title\":\"当前只读接班任务\",\"unverified\":[\"任务未领取、未执行；除 onboard-bundle freshness 机械校验外未做其他验证\"]}"}}
+{"type":"turn.completed","usage":{"input_tokens":81956,"cached_input_tokens":51712,"cache_write_input_tokens":0,"output_tokens":586,"reasoning_output_tokens":268}}

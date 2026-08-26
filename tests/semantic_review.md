@@ -21,7 +21,7 @@ scope: semantic-boundaries
 | ID | 场景 | 必须成立的判断 | 主要覆盖 |
 |---|---|---|---|
 | S01 | 用户只问“能不能并行” | 只判断，不能创建；通过后仍需确认 | 人工 |
-| S02 | 用户说“如果可以就帮我开” | 判断通过后可直接创建，授权只绑定当前 TASK | 人工 |
+| S02 | 用户说“如果可以就帮我开” | 授权意图已明确，但协议 1.5 仍返回 `TEMPORARY_EXECUTOR_P2_REQUIRED`；授权不能冒充第二执行者宿主能力 | 人工 + P2 阻断 |
 | S03 | 用户说“取消 / 先停一下” | 停止投入并保留现场，不能自动映射为放弃或 cleanup | 人工 + 自动终态守卫 |
 | S04 | 用户长期无回复 | 进入 standby，继续绑定原 TASK、workspace 和 thread ID | 人工 + 自动状态守卫 |
 | S05 | 产品体验、范围、设计、发布、成本或隐私风险 | 建议不能冒充用户授权 | 人工 + 任务授权轴 |
@@ -30,33 +30,43 @@ scope: semantic-boundaries
 | S08 | 新会话接班且已有 claimed 任务 | 短报后同一轮续做；授权不清、冲突或用户要求只接班时停下 | 人工 + 任务状态 |
 | S09 | 审核部门收到执行部门结论 | 必须亲自验证，只回结论和证据，不直接返工或放行 | 人工 + 审核报告守卫 |
 | S10 | UI 任务没有要求预览 | 不额外制作；触发预览后仍以真实运行出口验收 | 人工 |
-| S11 | 非开发父部门申请临时外包 | 只做通用 preflight，专业适配未完成前不能冒充可执行 | 人工 + runtime 类型守卫 |
+| S11 | 非开发父部门申请临时外包 | 协议 1.5 同样直接返回 P2 阻断，不做会被误解为创建前奏的通用 preflight | 人工 + runtime P2 守卫 |
 | S12 | 临时执行者提出长期规则或架构结论 | 只能提交待吸收候选，不能自行写成正式 Spec、ADR 或 conventions | 人工 |
 | S13 | 临时 workspace 已清理但宿主会话仍存在 | `promotion_state=archived` 与 `temporary_session=archived` 分开，必须取得真实归档收据 | 人工 + archive receipt 守卫 |
-| S14 | README、安装副本或答复提到版本 | 同时区分公开版本、当前源码构建和运行协议 | 人工 + repository contract |
+| S14 | README、安装副本或答复提到版本 | 同时区分公开版本、当前源码候选、全局安装副本和项目运行协议 | 人工 + repository contract |
 | S15 | 当前源码同步到全局 Skill | 只包含运行文件且逐字节一致；开发文档和验证器不得进入安装目录 | 自动 + 人工清单复核 |
-| S16 | 准备公开发布 | 新内容使用新的可复现版本，tag、Release、纯净 ZIP、README 与安装副本一致 | 人工 + 发布后实测 |
+| S16 | 准备公开发布 | 普通 main push 只验证；另行人工触发并绑定审查 commit、运行集 SHA 和确认。先在 draft 中验证 tag、版本化 ZIP、README、fresh clone、Release 资产与安装副本一致，再公开为 Latest | 人工授权 + draft 反向探针 + 发布后实测 |
 | S17 | 产品部规划技术路线 | 产品部拥有系统级技术实现路径、整体架构、模块/数据/接口边界、技术选型实验、迁移/回滚与架构类 ADR；不写正式业务代码 | 人工 + 生成岗位断言 |
 | S18 | 开发部发现架构合同不可行 | 先提交证据与优化方案，经统筹退回产品部修订；不能静默改需求、系统级架构合同或路线 | 人工 + 生成岗位断言 |
 | S19 | 开发部决定实现细节 | 函数、类、算法和代码组织等代码级细节归开发部，不能把产品部拥有系统级规划误解为产品部写代码 | 人工 + 生成岗位断言 |
 | S20 | 协作层升级遇到定制岗位说明 | 默认停止且不改真值；显式迁移时只保留经用户确认的追加层，标准职责仍向前升级，不冻结整份旧模板 | 人工 + 升级前向测试 |
-| S21 | queued 任务已被后续主链取代 | 只有已登记统筹会话可绑定已形成执行事实的 replacement TASK 做 supersede；原正文保留，不伪造业务写路径，不用无证据 cancel 隐藏遗留任务 | 人工 + resolution/revision/actor 守卫 |
+| S21 | 1.4 legacy queued 任务已被后续主链取代 | 只有已登记统筹会话可做 supersede；1.5 切片返工必须更新同一 owner 的候选代次，不能继续制造 replacement TASK 链 | 人工 + resolution/revision/actor 守卫 |
 | S22 | 用户在普通任务启动后明确拒绝 | 先记录 `user_rejected` 证据，再保留执行状态并用 `resolve=rejected_by_user` 收口；不能恢复、完成或删除原 TASK | 人工 + 自动收口守卫 |
 | S23 | 团队要减少部门 | 先收口会话与未核收任务；停用后保留目录、TASK 和历史角色身份，且活跃团队仍有管理、执行、审核三层 | 人工 + 停用事务回滚 |
 | S24 | 用户准备体验 UI 候选 | 测试部先做最小独立冒烟与安全探针；体验方向确认后再做完整回归，不能把冒烟通过说成正式质量放行 | 人工 + 生成岗位断言 |
 | S25 | 审核报告仍是 pending / 待定 | 可以保留草稿，但不能完成审核 TASK；最终报告必须是 `status=final` 和 `decision=pass|fail` | 人工 + 报告门禁 |
 | S26 | 部门表丢失或损坏 | 只从会话状态真值完整重建项目信息、原顺序、会话与启停状态，不反向猜测或覆盖状态 | 人工 + registry rebuild |
 | S27 | 统筹向不懂编程的 AI 开发者汇报 | 内部四件套完整留档，用户默认只看结果、需要做什么和有实际影响的注意项；体验必须给入口、顺序、预期、判断点和限制，不默认倾倒内部术语和日志 | 人工 + 生成岗位断言 + 前向测试 |
+| S28 | 执行测试可能明显妨碍用户正常使用设备 | 后台和普通低影响测试自动执行且不增加汇报；高影响测试执行前说明影响、预计时长、能否继续工作和退出方式，前台独占或难以自行退出时取得当次确认，阶段性授权不能继承 | 人工 + 生成岗位断言 |
+| S29 | 当前切片仍在运行，但宿主没有 heartbeat、lease 或恢复适配器 | 明确使用 manual-degraded 短交接；不能轮询、承诺无人值守或把提示词写成宿主能力，也不能自动开启下一切片 | 人工 + host boundary 断言 |
+| S30 | 用户要求冻结、任务堆积、上下文/存储压力、同一 gate 跨两代连续失败，或节点无真实用户出口 | 机械冻结新派单和返工；保留安全停下、同一 gate verdict、用户出口/指标、完成、核收、清账、交接、换班和证据。只有用户明确同意才解冻 | 人工 + stop-loss 前向/反向测试 |
+| S31 | 新 App/Web 项目没有持续独立的产品、设计或安全队列 | 默认只创建 `lead,dev,test` 三层最小盘；不得因“软件项目”自动扩成五到七个常驻部门，新增角色继续由用户确认 | 人工 + scaffold 默认值前向测试 |
+| S32 | 普通 TASK 使用伪造、旧会话或换班后的过期身份动作 | claim/block/wait/resume/complete 必须匹配当前登记会话；换班先 rebind，doctor 对漂移失败关闭 | 人工 + identity 反向探针 |
+| S33 | 交接班、收件箱或 freshness 记录被改旧，或人工文字出现假/跨部门 TASK | `onboard-bundle` 必须失败关闭或忽略非机器身份；重建后一次调用只输出三个热入口、活动 TASK 和窄索引冻结恢复 TASK。超过 24,000 字节告警但不截断 | 人工 + freshness/hash/injection/bundle 探针 |
+| S34 | gate FAIL 后返工 | owner 保持 claimed，同一 gate TASK 追加 attempt，新 manifest 使用新的全项目唯一 candidate ID；两个 gate 都只审同一代候选 | 人工 + candidate/gate 状态机 |
+| S35 | 统筹宣称 Agent-Team 已降低 Token | 只有同模型、同提示、同夹具的真实宿主 input/output/tool-calls/hot-bytes 交替 A/B 才可比较；保留 thread ID、原始 usage 摘录、构建脚本和无效样本。小样本只支持接班路径，不外推全生命周期 | 人工 + JSONL receipts + fixture builder |
+| S36 | 1.4.15 项目迁移或准备发布 2.1 | 先冻结；旧记录不重写且不得重新激活；rollback 在最终热索引后绑定当前 operation、manifest 和状态表面。人工交接或升级新建目录出现额外内容时，必须在任何写入前拒绝并保留现场；旧代清单失败关闭。2.0.11 fixture 必须真实迁移；源码、全局安装、公开 Release 和 Lulu 升级分别核验、授权 | 人工 + stale/manual-content/new-directory rollback/release 边界 |
+| S37 | GitHub draft 已验证并转为公开 Latest | 从公开 Release 重新下载 ZIP 与 `.sha256`，复算校验、解包验证五文件安装副本，并通过 Latest API 确认同一 tag；公开前 PASS 不能替代发布后可下载事实 | 人工授权 + post-public download probe |
 
 ## 自动覆盖仍需保留
 
 以下机械能力继续以 `scripts/verify_agent_team.py` 为真值，不在本矩阵复写全部案例：
 
-- 唯一 TASK 路径、单一 claimed、授权状态、完成与核收收据。
-- 热路径隔离、`doctor` 全历史体检、普通任务拒绝/放弃收口和陈旧索引提示。
-- 路径、符号链接、重复 JSON key、并发写入和升级回滚。
+- 单活动切片、单 owner、最多两 gate、唯一候选、授权状态、完成与核收收据。
+- 登记身份/rebind、热入口 freshness、冷历史隔离和 `doctor` 全历史体检。
+- 路径、符号链接、统一锁竞态、gate 崩溃恢复、冻结历史上限和显式迁移回滚。
 - 会话创建、换班、thread ID 唯一性和精确归档回执。
-- 临时 workspace、候选绑定、rework、delivery、tested-tree、吸收和 reconcile。
+- 1.5 临时外包 P2 阻断；1.4 legacy temporary 只在 frozen 模式收口，完全终态前阻断解冻和 1.5 owner。真实 2.0.11 fixture 必须进入主验证。
 - 五文件安装副本、内容漂移、Python 编译和 Skill 元数据。
 
 人工审查发现语义缺口时，先修正规则或模板；能机械化且不会假装理解自然语言的部分，再补入自动验证。

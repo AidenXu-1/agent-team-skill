@@ -1,32 +1,28 @@
 ---
 title: Agent Team 单 TASK 临时外包运行参考
-status: legacy-maintenance-p2-blocked
+status: implemented
 ---
 
 # 单 TASK 临时外包运行参考
 
-> 仅在用户主动提出临时外包、并行外包或 TASK 级临时会话时读取。协议 1.5 新切片会返回 `TEMPORARY_EXECUTOR_P2_REQUIRED`，不再另开第二 owner TASK；以下完整生命周期只用于维护升级前已经存在的 1.4 legacy temporary TASK。
+> 仅在用户主动提出临时外包、并行外包或 TASK 级临时会话时读取。适用于运行协议 `1.4.15`。
 
 ## 启用边界
 
-- 协议 1.5 的单切片、单 owner 是机械闸门。宿主没有第二执行者 heartbeat、lease、状态查询、恢复和归档适配器前，不创建新 temporary TASK，不用普通 enqueue 或隐式会话绕过。
-- 对 legacy 生命周期，统筹部也只能基于原用户授权维护，不能主动扩容、拆任务、自动重派或让临时执行者自行领取共享任务。
+- 统筹部只能在用户主动发起后判断和创建，不能主动扩容、拆任务、自动重派或让临时执行者自行领取共享任务。
 - 每个临时执行者固定为 `temporary_executor + parent_department + 单一 TASK`。用户侧按父部门称“临时开发外包”“临时设计外包”等。
-- 协议 1.5 对所有新 temporary 请求统一返回 `TEMPORARY_EXECUTOR_P2_REQUIRED`，包括非开发父部门；不再提供会被误解为可创建前奏的通用 preflight。旧协议已经 provision 的临时开发外包只允许恢复与收口，其他专业链不补开。
-- 升级会把未终态 1.4 temporary 的 TASK ID 写入窄 `legacy-closeout-index`，并由协议受管哈希固定索引原件；需要补真实归档收据的 ID 另有不可省略标记。解冻、派单和热列表只读这些指针，不展开全部冷历史；索引截断或必需恢复条目缺失会失败关闭。`doctor` 才做全历史完整性核验。
+- 当前完整 workspace、候选、delivery、tested-tree 和晋升链只开放临时开发外包。其他父部门只能做通用 preflight，专业版本和吸收方式未适配前不得进入执行链。
 - 首轮禁止密钥、隐私数据、生产、发布、购买、付费、真实发送及其他外部副作用。Git worktree 只提供协作隔离，不是 OS 权限沙箱。
 
 ## 用户表达与授权
 
 - 用户只询问“能不能并行 / 是否适合外包”时，只做判断；判断通过后仍需确认创建，不能把问题当成授权。
-- 用户明确表达“如果可以就帮我开 / 适合的话直接创建”时，表示授权意图已经明确；协议 1.5 仍必须返回 P2 阻断，不能因为有授权就虚构第二执行者宿主能力。
+- 用户明确表达“如果可以就帮我开 / 适合的话直接创建”时，才同时包含判断与创建委托；判断通过后可以直接创建。
 - 授权只绑定当前 TASK、范围和证据指针。“建议下一步”、方向满意或允许继续讨论都不扩大权限。
 - 用户说“取消 / 先停一下”只停止继续投入，保留 TASK、workspace 和证据，不自动等于 `abandoned`，也不允许 cleanup。
 - 只有用户明确表示放弃该成果，才能进入 abandoned 收口。长期无回复只进入 `standby`，仍绑定原 TASK 和 workspace。
 
-## 1.4 历史创建合同（只用于识别和恢复既有资源）
-
-以下内容解释既有 legacy TASK 当初应满足的创建证据，不能在 1.5 中重新执行 preflight、provision 或创建会话。
+## 创建前预检
 
 1. 正式在办、阻断、等待输入以及尚未吸收完成的临时任务都声明 `write_paths / shared_contracts / external_effects / base_revision / owner_task`。
 2. 声明不足只报 `manual`。写路径、共享契约、生成物或外部影响重叠时阻断；工具不得自动 stash、reset、commit 或 checkpoint 正式部门工作。
@@ -51,9 +47,7 @@ workspace 内只生成 `.agent-team/临时执行规则.md`，它是临时会话�
 
 临时日志写入父部门周文件的“临时外包日志”板块，必须精确绑定 TASK、executor ID 和 parent department。只记录五类轨迹事件，不复制聊天或任务正文。
 
-## 1.4 历史生命周期与 1.5 收口白名单
-
-下列完整链只用于判断既有证据处于哪一阶段。升级到 1.5 后禁止 `resume / rework / amend / candidate / submit`；项目保持 frozen，只开放已开始事务的 reconcile、明确 abandon、必要知识收口、cleanup、acknowledge、失败记账和真实会话归档。legacy 完全终态前禁止解冻或创建 1.5 owner。
+## 正向生命周期
 
 1. 用 `agent_team_temporary.py` 完成影响声明、preflight 和 provision；真实会话创建后登记原始 thread ID 并确认当前临时规则 digest。
 2. 任务内部的小调整可继续。实质变化使用带 expected brief revision 的 `amend`，原子重做并行判断、增加 attempt、清空候选与交付证据并重生成规则。
@@ -114,4 +108,4 @@ python3 docs/collaboration/scripts/agent_team_temporary.py session-mark \
 
 thread ID 在正式与临时会话间全局唯一，按原始字符串精确绑定；不能包含空白、以 `=` 开头或超过 300 字符。换班、failed 重试、规则重建、amend 和 rework 都不能覆盖已经登记但尚未归档的 ID。
 
-`pending-archives` 是可重复调用的只读查询，不改变 TASK。旧协议中缺少可信收据的 archived 会话保持原 TASK 字节不变，由 1.5 派生恢复账本记录待归档；能精确绑定 thread ID、`archived=true` 和 host 或 user confirmation 的新收据只写恢复账本，不能只因版本旧而抹掉原记录。
+`pending-archives` 是可重复调用的只读查询，不改变 TASK。旧协议中缺少可信收据的 archived 会话退回 standby；能精确绑定 thread ID、`archived=true` 和 host 或 user confirmation 的收据继续保留，不能只因版本旧而抹掉。

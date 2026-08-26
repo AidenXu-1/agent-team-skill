@@ -1,0 +1,16 @@
+{
+  "captured_on": "2026-08-26",
+  "protocol_version": "1.4.15",
+  "runtime_files": {
+    "SKILL.md": "2427c50e2d56b3b6efc0e5f9db1c28072928fa799ca92ca755de3fe6a772ecc4",
+    "agents/openai.yaml": "f80aae22d930f807492a91b65c287daf5b80997b7d3d4fbb45b6d8008e0b4676",
+    "references/temporary-executor.md": "ebd48a873b6884caeb9ba7411a8a5a347f6b1009e08102788b8c4665c79938c3",
+    "scripts/scaffold_team.py": "803eb3c059340944f7da53bb5ea6b2874438c89a89d4e897fd0fb02b31c9341b",
+    "scripts/temporary_executor_runtime.py": "2961cd36923c1b46773f457159577e06ae5c5fcdb1dfe7529bcc88ff0359215d"
+  },
+  "runtime_set_sha256": "171fae3f6cae4454a4cca5521a894e615431e323180d0344b7b2cf3eda4a28ec",
+  "runtime_set_sha256_algorithm": "sha256 of ordered `<file sha256>  <relative path>\\n` rows for runtime_files",
+  "schema_version": 1,
+  "source_kind": "exact-installed-runtime-copy",
+  "source_version": "2.0.11"
+}

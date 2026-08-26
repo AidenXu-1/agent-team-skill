@@ -1,0 +1,125 @@
+{
+  "candidate": {
+    "cached_input_tokens_mean": 51712,
+    "hot_context_bytes": 6257,
+    "input_tokens_mean": 81865,
+    "output_tokens_mean": 494.0,
+    "protocol_version": "1.5.0",
+    "reasoning_output_tokens_mean": 183.5,
+    "runtime_set_sha256": "314f8e856f661135f22e21180a3e0ed2bdf4ab7953a4e6245f11bca7932d7c41",
+    "sample_count": 2,
+    "samples": [
+      {
+        "cached_input_tokens": 51712,
+        "input_tokens": 81774,
+        "output_tokens": 402,
+        "reasoning_output_tokens": 99,
+        "run_id": "candidate-1",
+        "thread_id": "01a03cc4-86d3-74f1-be4b-73df0753f575",
+        "tool_calls": 2
+      },
+      {
+        "cached_input_tokens": 51712,
+        "input_tokens": 81956,
+        "output_tokens": 586,
+        "reasoning_output_tokens": 268,
+        "run_id": "candidate-2",
+        "thread_id": "01a03cc6-f410-72d1-ad25-213c89dd8847",
+        "tool_calls": 2
+      }
+    ],
+    "source_version": "2.1.0",
+    "tool_calls_mean": 2.0
+  },
+  "cli_version": "codex-cli 0.149.0-alpha.4.1",
+  "conclusion": {
+    "hot_context_bytes_percent": 9.7,
+    "input_tokens_percent": -34.0,
+    "observed_mechanism": "five or six separate reads became one guide read plus one freshness-bound bundle",
+    "output_tokens_percent": -28.7,
+    "pair_input_tokens_percent": [
+      -25.3,
+      -40.8
+    ],
+    "tool_calls_percent": -63.6
+  },
+  "fixture": {
+    "builder": "tests/build_token_ab_fixture.py",
+    "builder_sha256": "b045f3a081d800dd0dd768edb950f6721815749ada11b52abb6d69c1bd307d15",
+    "candidate_total_tasks": 928,
+    "cold_history_loaded": 0,
+    "current_tasks_loaded": 1,
+    "legacy_history_tasks": 927,
+    "legacy_total_tasks": 928,
+    "synthetic_only": true
+  },
+  "legacy": {
+    "cached_input_tokens_mean": 92800,
+    "hot_context_bytes": 5703,
+    "input_tokens_mean": 123991.5,
+    "output_tokens_mean": 693.0,
+    "protocol_version": "1.4.15",
+    "reasoning_output_tokens_mean": 193.5,
+    "runtime_set_sha256": "171fae3f6cae4454a4cca5521a894e615431e323180d0344b7b2cf3eda4a28ec",
+    "sample_count": 2,
+    "samples": [
+      {
+        "cached_input_tokens": 79104,
+        "input_tokens": 109519,
+        "output_tokens": 520,
+        "reasoning_output_tokens": 85,
+        "run_id": "legacy-1",
+        "thread_id": "01a03cc5-4747-7923-bd5f-8e7778313330",
+        "tool_calls": 5
+      },
+      {
+        "cached_input_tokens": 106496,
+        "input_tokens": 138464,
+        "output_tokens": 866,
+        "reasoning_output_tokens": 302,
+        "run_id": "legacy-2",
+        "thread_id": "01a03cc5-e558-7431-b029-b7844db6114e",
+        "tool_calls": 6
+      }
+    ],
+    "source_version": "2.0.11",
+    "tool_calls_mean": 5.5
+  },
+  "limitations": [
+    "two samples per arm are an order-balanced engineering probe, not a statistical benchmark",
+    "synthetic collaboration project, not a Lulu business or foreground UX run",
+    "host-wide skill and plugin context dominated the absolute token totals",
+    "Codex JSONL did not export per-request max input, price, or billing cost",
+    "the result only measures first-turn onboarding and must not be extrapolated to a full task lifecycle"
+  ],
+  "measured_at": "2026-08-26T14:35:53+08:00",
+  "model": "gpt-5.6-sol",
+  "prompt": "你是执行部的新接班人。第一步直接读取 docs/collaboration/部门/执行部/上岗引导.md，不要先搜索文件；随后严格按上岗引导完成接班。除上岗引导要求的机械校验外，不修改文件，不扫描 tasks 目录，不展开冷历史或日志，不领取或执行任务。最后仅返回 department、mode、task_title、unverified。",
+  "prompt_sha256": "8a27d4dae6ca23272ea09cb9819816fd82d03b5b431e183e8f45ac56fd78114a",
+  "reasoning_effort": "low",
+  "receipts": "tests/token-ab-receipts-20260826.jsonl",
+  "receipts_sha256": "d75235cd47fef56f8da28bde72c8fa94d16d6bb0b7ddbbb77f4ad93a8557c46d",
+  "rejected_probes": [
+    {
+      "input_tokens": 175654,
+      "reason": "pre-fix candidate used six host turns and was 17.3 percent worse than legacy; this triggered onboard-bundle",
+      "runtime_set_sha256": "65b2a5c758c8d07c12c9ca26b818ac2932837a54d3c7abadcaa47c9543371850",
+      "status": "design-failure",
+      "tool_calls": 6
+    },
+    {
+      "input_tokens": 135240,
+      "reason": "read-only sandbox blocked the old lock-taking onboard-check, so the run did not complete equivalent onboarding",
+      "status": "invalid-comparison"
+    }
+  ],
+  "run_order": [
+    "candidate-1",
+    "legacy-1",
+    "legacy-2",
+    "candidate-2"
+  ],
+  "sandbox": "workspace-write with prompt-level no-write boundary",
+  "schema_version": 2,
+  "status": "controlled-two-pair-alternating"
+}
