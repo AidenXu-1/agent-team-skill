@@ -216,15 +216,56 @@ jobs:
             "源码提交：${GITHUB_SHA}" \
             "运行集 SHA-256：${{ inputs.reviewed_runtime_sha256 }}" \
             > "${notes_file}"
-          gh release create "${TAG}" \
-            "${RELEASE_DIR}/${ZIP_NAME}" \
-            "${RELEASE_DIR}/${ZIP_NAME}.sha256" \
-            --repo "${repo}" \
-            --target "${GITHUB_SHA}" \
-            --title "Agent Team ${VERSION}" \
-            --notes-file "${notes_file}" \
-            --draft
-          draft_target="$(gh api "repos/${repo}/releases/tags/${TAG}" --jq .target_commitish)"
+          existing_release="$(gh release view "${TAG}" --repo "${repo}" --json isDraft,targetCommitish 2>/dev/null || true)"
+          reused_release="false"
+          if [[ -z "${existing_release}" ]]; then
+            gh release create "${TAG}" \
+              "${RELEASE_DIR}/${ZIP_NAME}" \
+              "${RELEASE_DIR}/${ZIP_NAME}.sha256" \
+              --repo "${repo}" \
+              --target "${GITHUB_SHA}" \
+              --title "Agent Team ${VERSION}" \
+              --notes-file "${notes_file}" \
+              --draft
+            existing_release="$(gh release view "${TAG}" --repo "${repo}" --json isDraft,targetCommitish)"
+          else
+            reused_release="true"
+            echo "Reusing exact reviewed draft release ${TAG} after an interrupted verification run."
+          fi
+          draft_is_draft="$(jq -r .isDraft <<<"${existing_release}")"
+          draft_target="$(jq -r .targetCommitish <<<"${existing_release}")"
+          [[ "${draft_is_draft}" == "true" ]]
+          if [[ "${reused_release}" == "true" ]]; then
+            unexpected_asset_count="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq --arg zip "${ZIP_NAME}" --arg checksum "${ZIP_NAME}.sha256" '[.assets[] | select(.name != $zip and .name != $checksum)] | length')"
+            [[ "${unexpected_asset_count}" == "0" ]]
+            if [[ "${draft_target}" != "${GITHUB_SHA}" ]]; then
+              if ! git diff --quiet "${draft_target}" "${GITHUB_SHA}" -- \
+                SKILL.md \
+                agents/openai.yaml \
+                references/temporary-executor.md \
+                scripts/scaffold_team.py \
+                scripts/temporary_executor_runtime.py; then
+                echo "Existing draft runtime differs from the reviewed commit; refusing recovery." >&2
+                exit 1
+              fi
+              echo "Recovering unpublished draft onto runtime-identical reviewed commit ${GITHUB_SHA}."
+            fi
+            gh release edit "${TAG}" \
+              --repo "${repo}" \
+              --target "${GITHUB_SHA}" \
+              --title "Agent Team ${VERSION}" \
+              --notes-file "${notes_file}" \
+              --draft
+            gh release upload "${TAG}" \
+              "${RELEASE_DIR}/${ZIP_NAME}" \
+              "${RELEASE_DIR}/${ZIP_NAME}.sha256" \
+              --repo "${repo}" \
+              --clobber
+            existing_release="$(gh release view "${TAG}" --repo "${repo}" --json isDraft,targetCommitish)"
+            draft_is_draft="$(jq -r .isDraft <<<"${existing_release}")"
+            draft_target="$(jq -r .targetCommitish <<<"${existing_release}")"
+          fi
+          [[ "${draft_is_draft}" == "true" ]]
           [[ "${draft_target}" == "${GITHUB_SHA}" ]]
           metadata="${RUNNER_TEMP}/agent-team-draft-release.json"
           gh release view "${TAG}" --repo "${repo}" --json tagName,assets > "${metadata}"
@@ -235,10 +276,14 @@ jobs:
             "${FRESH_CLONE}"
           draft_zip_digest="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq --arg name "${ZIP_NAME}" '.assets[] | select(.name == $name) | .digest')"
           draft_checksum_digest="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq --arg name "${ZIP_NAME}.sha256" '.assets[] | select(.name == $name) | .digest')"
+          draft_asset_count="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq '.assets | length')"
           [[ "${draft_zip_digest}" == "${zip_digest}" ]]
           [[ "${draft_checksum_digest}" == "${checksum_digest}" ]]
-          remote_tag_sha="$(gh api "repos/${repo}/git/ref/tags/${TAG}" --jq .object.sha)"
-          [[ "${remote_tag_sha}" == "${GITHUB_SHA}" ]]
+          [[ "${draft_asset_count}" == "2" ]]
+          if gh api "repos/${repo}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
+            echo "Tag appeared before publication: ${TAG}" >&2
+            exit 1
+          fi
           gh release edit "${TAG}" --repo "${repo}" --draft=false --latest
           published_tag_sha="$(gh api "repos/${repo}/git/ref/tags/${TAG}" --jq .object.sha)"
           [[ "${published_tag_sha}" == "${GITHUB_SHA}" ]]
