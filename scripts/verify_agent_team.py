@@ -346,6 +346,7 @@ def verify_install_bundle_contract(root: Path) -> None:
 
 def verify_repository_contract() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    spec = (ROOT / "docs" / "spec.md").read_text(encoding="utf-8")
     candidate_manifest = json.loads((ROOT / "candidate-manifest.json").read_text(encoding="utf-8"))
     token_ab = json.loads((ROOT / "tests" / "token-ab-20260826.json").read_text(encoding="utf-8"))
     temporary_reference = (ROOT / "references" / "temporary-executor.md").read_text(encoding="utf-8")
@@ -523,12 +524,12 @@ def verify_repository_contract() -> None:
         and legacy_tokens.get("source_version") == "2.0.11"
         and legacy_tokens.get("runtime_set_sha256") == "171fae3f6cae4454a4cca5521a894e615431e323180d0344b7b2cf3eda4a28ec"
         and legacy_tokens.get("sample_count") == 2
-        and legacy_tokens.get("input_tokens_mean") == 123991.5
-        and legacy_tokens.get("tool_calls_mean") == 5.5
+        and legacy_tokens.get("input_tokens_mean") == 137668.0
+        and legacy_tokens.get("tool_calls_mean") == 5.0
         and candidate_tokens.get("source_version") == SOURCE_VERSION
         and candidate_tokens.get("runtime_set_sha256") == runtime_set_sha256
         and candidate_tokens.get("sample_count") == 2
-        and candidate_tokens.get("input_tokens_mean") == 81865
+        and candidate_tokens.get("input_tokens_mean") == 81903.5
         and candidate_tokens.get("tool_calls_mean") == 2.0
         and token_fixture.get("cold_history_loaded") == 0
         and token_fixture.get("current_tasks_loaded") == 1
@@ -539,14 +540,14 @@ def verify_repository_contract() -> None:
         and token_fixture.get("builder") == "tests/build_token_ab_fixture.py"
         and token_fixture.get("builder_sha256")
         == hashlib.sha256((ROOT / token_fixture["builder"]).read_bytes()).hexdigest()
-        and token_conclusion.get("input_tokens_percent") == -34.0
-        and token_conclusion.get("pair_input_tokens_percent") == [-25.3, -40.8]
+        and token_conclusion.get("input_tokens_percent") == -40.5
+        and token_conclusion.get("pair_input_tokens_percent") == [-50.5, -25.4]
         and candidate_tokens.get("hot_context_bytes", 0) > legacy_tokens.get("hot_context_bytes", 0)
         and isinstance(token_ab.get("limitations"), list) and len(token_ab["limitations"]) >= 5,
         "real Token A/B evidence is stale, selective, or no longer bound to the candidate runtime",
     )
     check(
-        "123,991.5" in readme and "81,865" in readme and "34.0%" in readme
+        "137,668" in readme and "81,903.5" in readme and "40.5%" in readme
         and "不代表 Lulu 业务全流程" in readme
         and "tests/token-ab-20260826.json" in readme,
         "README omitted the measured onboarding Token result or overstated its scope",
@@ -599,10 +600,26 @@ def verify_repository_contract() -> None:
             "status": "required-before-release",
             "scope": "semantic-boundaries",
         }
-        and all(f"S{index:02d}" in semantic_review for index in range(1, 37))
+        and all(f"S{index:02d}" in semantic_review for index in range(1, 41))
         and "自动测试通过不能替代" in readme
         and "本文件只保存稳定问题，不写某次执行结果" in semantic_review,
         "manual semantic release gate is missing or incomplete",
+    )
+    check(
+        all(term in skill for term in (
+            "统筹会话按项目阶段", "执行会话按端到端切片",
+            "同一切片返工", "同一候选的审核复测",
+            "旧候选或身份串入", "输入、缓存输入、输出和工具调用",
+            "无法测量", "固定倍数阈值", "只建议换班",
+        ))
+        and all(term in readme for term in (
+            "项目文件保存长期真值", "会话只保留眼前施工所需的工作集",
+            "不能按聊天轮数", "不能自动换班",
+        ))
+        and all(term in spec for term in (
+            "会话生命周期", "完整任务生命周期 A/B", "不新增自动换班状态机",
+        )),
+        "session lifecycle guidance is missing, unmeasured, or able to masquerade as automatic switching",
     )
     check(
         all(term in skill for term in (

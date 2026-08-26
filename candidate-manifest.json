@@ -1,17 +1,17 @@
 {
-  "base_commit": "a8a40acd7d6a1cb3257b2d75551a1f5470654cf1",
-  "candidate_id": "AT-2.1.0-RC-314F8E856F66",
+  "base_commit": "e9b01114097c6f1bf035b5a2783bc5432a00613c",
+  "candidate_id": "AT-2.1.0-RC-7711517262CE",
   "generated_on": "2026-08-26",
   "protocol_version": "1.5.0",
   "public_version_at_review": "2.0.6",
   "runtime_files": {
-    "SKILL.md": "dc40215df75fd10eaaaa8cf6d95fead756c78822cf5e1f5f4d87a5fadb496a9a",
+    "SKILL.md": "d34fefa00370bc90663e7aee3dc67a8866139c7abc0d873f5cc4b6a80061b069",
     "agents/openai.yaml": "f80aae22d930f807492a91b65c287daf5b80997b7d3d4fbb45b6d8008e0b4676",
     "references/temporary-executor.md": "5b3c3ec4c0c66851f61852a4483c38f4ad067831b72170aa6820b0c67d65012e",
     "scripts/scaffold_team.py": "5ded69e8c0a62f1ad0f3621f0ba05aed4b757fe85f00a996785be588b5908ae0",
     "scripts/temporary_executor_runtime.py": "aa86de22bad3a5d9d8c031d458ae3c0137061c17c8a6fcbb5bed077d4a10da42"
   },
-  "runtime_set_sha256": "314f8e856f661135f22e21180a3e0ed2bdf4ab7953a4e6245f11bca7932d7c41",
+  "runtime_set_sha256": "7711517262ce6f1b1d3445f873784636b78406ffb717a467a8753dcf1f9d6517",
   "runtime_set_sha256_algorithm": "sha256 of ordered `shasum -a 256` output for runtime_files",
   "schema_version": 1,
   "source_version": "2.1.0",

@@ -57,6 +57,9 @@ scope: semantic-boundaries
 | S35 | 统筹宣称 Agent-Team 已降低 Token | 只有同模型、同提示、同夹具的真实宿主 input/output/tool-calls/hot-bytes 交替 A/B 才可比较；保留 thread ID、原始 usage 摘录、构建脚本和无效样本。小样本只支持接班路径，不外推全生命周期 | 人工 + JSONL receipts + fixture builder |
 | S36 | 1.4.15 项目迁移或准备发布 2.1 | 先冻结；旧记录不重写且不得重新激活；rollback 在最终热索引后绑定当前 operation、manifest 和状态表面。人工交接或升级新建目录出现额外内容时，必须在任何写入前拒绝并保留现场；旧代清单失败关闭。2.0.11 fixture 必须真实迁移；源码、全局安装、公开 Release 和 Lulu 升级分别核验、授权 | 人工 + stale/manual-content/new-directory rollback/release 边界 |
 | S37 | GitHub draft 已验证并转为公开 Latest | 从公开 Release 重新下载 ZIP 与 `.sha256`，复算校验、解包验证五文件安装副本，并通过 Latest API 确认同一 tag；公开前 PASS 不能替代发布后可下载事实 | 人工授权 + post-public download probe |
+| S38 | 统筹进入新阶段，或执行切片已收口且下一项明显不同 | 建议换班并说明证据、收益和当前事项；同一切片返工继续原会话，不按固定轮数机械切换 | 人工 + 角色生命周期断言 |
+| S39 | 审核 gate 对同一候选做失败、修复、复测 | 审核仍不继承执行长上下文，但可以保持原审核会话连续；独立性不能被误写成每次复测都新建会话 | 人工 + 审核连续性反向探针 |
+| S40 | 用户询问长会话 Token，宿主未提供可比逐轮数据 | 明确写无法测量；不得用轮数、文件字节、响应时长、固定倍数阈值或压缩次数冒充 Token，且建议不能自动创建、登记或归档会话 | 人工 + 成本证据/授权反向探针 |
 
 ## 自动覆盖仍需保留
 
