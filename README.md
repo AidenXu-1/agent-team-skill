@@ -152,7 +152,7 @@ scripts/temporary_executor_runtime.py
 
 `main` 是唯一公开主干。push 和 pull request 只运行验证，不创建 Release。公开发布必须由维护者手动触发，并同时提交被独立审查的 commit SHA、运行集 SHA-256、精确版本和 `PUBLISH v<版本>` 确认；缺任一项都失败关闭。
 
-仓库已固化由五文件 SHA-256 清单约束的 `tests/fixtures/agent-team-2.0.11-runtime`；普通验证和发布任务都必须完成真实 2.0.11 迁移。当前候选仍未提交、未完成 GitHub CI，因此不得发布。
+仓库已固化由五文件 SHA-256 清单约束的 `tests/fixtures/agent-team-2.0.11-runtime`；普通验证和发布任务都必须完成真实 2.0.11 迁移。候选即使已经本地提交，也必须通过 GitHub CI 和显式发布工作流，才能成为公开版本。
 
 正式包使用不可复用的 `v2.1.0` 版本标签和 `agent-team-2.1.0-pure.zip` 文件名。发布前还要把 `candidate-manifest.json` 标记为 `reviewed-release-candidate`；其中 `base_commit` 始终表示本轮开发起点，正式候选 commit 由发布输入单独绑定，避免清单引用包含自身的 Git SHA。公开后还会从 Release 重新下载 ZIP 和校验文件，复算 SHA-256、解包验证五文件安装副本，并核对 Latest API 指向同一 tag。任一步未完成，都不能写成 GitHub Release 已更新。
 
