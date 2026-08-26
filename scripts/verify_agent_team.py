@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import datetime as dt
+import argparse
 import contextlib
 import hashlib
 import importlib.util
@@ -26,9 +27,10 @@ import yaml
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = Path(os.environ.get("AGENT_TEAM_SCAFFOLD", ROOT / "scripts" / "scaffold_team.py")).expanduser().resolve()
 PUBLIC_VERSION = "2.0.6"
-SOURCE_VERSION = "2.0.6"
-PROTOCOL_VERSION = "1.4.10"
-PREVIOUS_PROTOCOL_VERSION = "1.4.9"
+SOURCE_VERSION = "2.1.0"
+PROTOCOL_VERSION = "1.5.0"
+PREVIOUS_PROTOCOL_VERSION = "1.4.15"
+LEGACY_2011_FIXTURE = ROOT / "tests" / "fixtures" / "agent-team-2.0.11-runtime"
 RUNTIME_FILES = (
     "SKILL.md",
     "agents/openai.yaml",
@@ -72,6 +74,13 @@ def run(
         len(args) >= 3
         and Path(args[1]).name == "agent_team_task.py"
         and args[2] in {"enqueue", "authorize"}
+        and "--actor" not in args
+    ):
+        args += ["--actor", "统筹部/lead-thread"]
+    if (
+        len(args) >= 3
+        and Path(args[1]).name == "agent_team_task.py"
+        and args[2] == "rebuild-index"
         and "--actor" not in args
     ):
         args += ["--actor", "统筹部/lead-thread"]
@@ -128,9 +137,10 @@ def verify_latest_release_assets(
     if not isinstance(tag, str) or not tag.strip() or not isinstance(assets, list):
         raise VerifyError("Latest release metadata is missing tagName or assets")
 
+    asset_stem = f"agent-team-{tag.removeprefix('v')}-pure.zip"
     expected_assets = {
-        "agent-team-2.0-pure.zip": zip_path,
-        "agent-team-2.0-pure.zip.sha256": checksum_path,
+        asset_stem: zip_path,
+        f"{asset_stem}.sha256": checksum_path,
     }
     asset_by_name = {
         asset.get("name"): asset
@@ -153,7 +163,7 @@ def verify_latest_release_assets(
 
     checksum_text = checksum_path.read_text(encoding="utf-8").strip()
     checksum_match = re.fullmatch(
-        r"([0-9a-f]{64})\s+\*?agent-team-2\.0-pure\.zip",
+        rf"([0-9a-f]{{64}})\s+\*?{re.escape(asset_stem)}",
         checksum_text,
     )
     if not checksum_match or checksum_match.group(1) != file_sha256(zip_path):
@@ -187,17 +197,19 @@ def verify_release_guard_branches(root: Path) -> None:
         target.write_text(f"fixture:{relative}\n", encoding="utf-8")
     run(["git", "add", *RUNTIME_FILES], cwd=repo)
     run(["git", "commit", "-q", "-m", "fixture"], cwd=repo)
-    run(["git", "tag", "build-fixture"], cwd=repo)
+    fixture_tag = f"v{SOURCE_VERSION}"
+    run(["git", "tag", fixture_tag], cwd=repo)
 
     assets_dir = root / "release-guard-assets"
     assets_dir.mkdir()
-    zip_path = assets_dir / "agent-team-2.0-pure.zip"
-    checksum_path = assets_dir / "agent-team-2.0-pure.zip.sha256"
+    asset_stem = f"agent-team-{SOURCE_VERSION}-pure.zip"
+    zip_path = assets_dir / asset_stem
+    checksum_path = assets_dir / f"{asset_stem}.sha256"
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for relative in RUNTIME_FILES:
             archive.write(repo / relative, relative)
     checksum_path.write_text(
-        f"{file_sha256(zip_path)}  agent-team-2.0-pure.zip\n",
+        f"{file_sha256(zip_path)}  {asset_stem}\n",
         encoding="utf-8",
     )
     latest_json = assets_dir / "latest.json"
@@ -212,11 +224,11 @@ def verify_release_guard_branches(root: Path) -> None:
                 "name": checksum_path.name,
                 "digest": f"sha256:{file_sha256(checksum_path)}",
             })
-        return {"tagName": "build-fixture", "assets": listed}
+        return {"tagName": fixture_tag, "assets": listed}
 
     latest_json.write_text(json.dumps(metadata()), encoding="utf-8")
     check(
-        verify_latest_release_assets(latest_json, zip_path, checksum_path, repo) == "build-fixture",
+        verify_latest_release_assets(latest_json, zip_path, checksum_path, repo) == fixture_tag,
         "Latest release guard rejected a valid package",
     )
 
@@ -238,7 +250,7 @@ def verify_release_guard_branches(root: Path) -> None:
             content = (repo / relative).read_bytes()
             archive.writestr(relative, b"tampered\n" if relative == RUNTIME_FILES[0] else content)
     checksum_path.write_text(
-        f"{file_sha256(zip_path)}  agent-team-2.0-pure.zip\n",
+        f"{file_sha256(zip_path)}  {asset_stem}\n",
         encoding="utf-8",
     )
     latest_json.write_text(json.dumps(metadata()), encoding="utf-8")
@@ -334,6 +346,9 @@ def verify_install_bundle_contract(root: Path) -> None:
 
 def verify_repository_contract() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    spec = (ROOT / "docs" / "spec.md").read_text(encoding="utf-8")
+    candidate_manifest = json.loads((ROOT / "candidate-manifest.json").read_text(encoding="utf-8"))
+    token_ab = json.loads((ROOT / "tests" / "token-ab-20260826.json").read_text(encoding="utf-8"))
     temporary_reference = (ROOT / "references" / "temporary-executor.md").read_text(encoding="utf-8")
     semantic_review = (ROOT / "tests" / "semantic_review.md").read_text(encoding="utf-8")
     skill = (ROOT / "SKILL.md").read_text(encoding="utf-8")
@@ -358,31 +373,223 @@ def verify_repository_contract() -> None:
     check(isinstance(metadata, dict) and metadata.get("version") == SOURCE_VERSION,
           "SKILL metadata did not identify the current source build")
     check(
-        f"公开发布版本为 `{PUBLIC_VERSION}`" in readme
-        and f"当前源码构建为 `{SOURCE_VERSION}`" in readme
-        and f"运行协议为 `{PROTOCOL_VERSION}`" in readme,
-        "README conflated or omitted public, source-build, or runtime protocol versions",
+        "公开发布版、当前源码候选、本机全局安装副本、项目生成协议是四份独立真值" in readme
+        and f"源码候选为 `{SOURCE_VERSION}`" in readme
+        and f"生成协议为 `{PROTOCOL_VERSION}`" in readme
+        and "本机安装版也必须另行核验" in readme
+        and "candidate-manifest.json" in readme,
+        "README conflated or omitted public, source-build, installed-copy, or runtime protocol truths",
+    )
+    runtime_hashes = {
+        relative: hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
+        for relative in RUNTIME_FILES
+    }
+    runtime_set_bytes = "".join(
+        f"{runtime_hashes[relative]}  {relative}\n" for relative in RUNTIME_FILES
+    ).encode("utf-8")
+    runtime_set_sha256 = hashlib.sha256(runtime_set_bytes).hexdigest()
+    expected_candidate_id = f"AT-{SOURCE_VERSION}-RC-{runtime_set_sha256[:12].upper()}"
+    candidate_status = candidate_manifest.get("status") if isinstance(candidate_manifest, dict) else None
+    base_commit = candidate_manifest.get("base_commit") if isinstance(candidate_manifest, dict) else None
+    current_head = run(["git", "rev-parse", "HEAD"], cwd=ROOT).stdout.strip()
+    base_is_commit = (
+        isinstance(base_commit, str)
+        and subprocess.run(
+            ["git", "cat-file", "-e", f"{base_commit}^{{commit}}"], cwd=ROOT,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    )
+    base_is_ancestor = (
+        base_is_commit
+        and subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base_commit, current_head], cwd=ROOT,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    )
+    status_binding_valid = (
+        candidate_status == "uncommitted-review-candidate" and base_commit == current_head
+    ) or (
+        candidate_status == "reviewed-release-candidate" and base_is_ancestor and base_commit != current_head
     )
     check(
-        "releases/latest/download/agent-team-2.0-pure.zip" in readme
-        and "releases/latest/download/agent-team-2.0-pure.zip.sha256" in readme,
-        "README omitted the stable latest pure-package or checksum URL",
+        isinstance(candidate_manifest, dict)
+        and set(candidate_manifest) == {
+            "schema_version", "candidate_id", "status", "generated_on", "base_commit",
+            "source_version", "protocol_version", "public_version_at_review", "runtime_files",
+            "runtime_set_sha256", "runtime_set_sha256_algorithm",
+        }
+        and candidate_manifest.get("schema_version") == 1
+        and candidate_manifest.get("candidate_id") == expected_candidate_id
+        and candidate_status in {"uncommitted-review-candidate", "reviewed-release-candidate"}
+        and status_binding_valid
+        and candidate_manifest.get("source_version") == SOURCE_VERSION
+        and candidate_manifest.get("protocol_version") == PROTOCOL_VERSION
+        and candidate_manifest.get("public_version_at_review") == PUBLIC_VERSION
+        and candidate_manifest.get("runtime_files") == runtime_hashes
+        and candidate_manifest.get("runtime_set_sha256") == runtime_set_sha256,
+        "candidate manifest is stale, ambiguous, or not bound to the five runtime files",
+    )
+    legacy_tokens = token_ab.get("legacy", {}) if isinstance(token_ab, dict) else {}
+    candidate_tokens = token_ab.get("candidate", {}) if isinstance(token_ab, dict) else {}
+    token_fixture = token_ab.get("fixture", {}) if isinstance(token_ab, dict) else {}
+    token_conclusion = token_ab.get("conclusion", {}) if isinstance(token_ab, dict) else {}
+    receipts_relative = token_ab.get("receipts") if isinstance(token_ab, dict) else None
+    receipts_path = ROOT / receipts_relative if isinstance(receipts_relative, str) else ROOT / "missing"
+    check(
+        isinstance(receipts_relative, str)
+        and not Path(receipts_relative).is_absolute()
+        and ".." not in Path(receipts_relative).parts
+        and receipts_path.is_file()
+        and hashlib.sha256(receipts_path.read_bytes()).hexdigest() == token_ab.get("receipts_sha256"),
+        "Token A/B receipt path or hash is invalid",
+    )
+    receipt_records = [
+        json.loads(line) for line in receipts_path.read_text(encoding="utf-8").splitlines() if line.strip()
+    ]
+    check(
+        bool(receipt_records)
+        and receipt_records[0].get("type") == "evidence.meta"
+        and re.fullmatch(
+            r"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+            receipt_records[0].get("source_root_thread_id", ""),
+        )
+        and receipt_records[0].get("prompt_sha256") == token_ab.get("prompt_sha256")
+        and receipt_records[0].get("run_order") == token_ab.get("run_order"),
+        "Token A/B receipt metadata is stale or reordered",
+    )
+    receipt_runs: dict[str, dict] = {}
+    current_receipt_run: dict | None = None
+    for record in receipt_records[1:]:
+        if record.get("type") == "evidence.run":
+            run_id = record.get("run_id")
+            check(isinstance(run_id, str) and run_id not in receipt_runs,
+                  "Token A/B receipt run identity is missing or duplicated")
+            current_receipt_run = {**record, "tool_calls": 0, "thread_id": "", "usage": None}
+            receipt_runs[run_id] = current_receipt_run
+        elif record.get("type") == "thread.started":
+            check(current_receipt_run is not None and not current_receipt_run["thread_id"],
+                  "Token A/B receipt thread is unbound or duplicated")
+            current_receipt_run["thread_id"] = record.get("thread_id")
+        elif record.get("type") == "item.completed" and record.get("item", {}).get("type") == "command_execution":
+            check(
+                current_receipt_run is not None
+                and record["item"].get("exit_code") == 0
+                and record["item"].get("status") == "completed"
+                and isinstance(record["item"].get("command"), str),
+                "Token A/B receipt contains an invalid command completion",
+            )
+            current_receipt_run["tool_calls"] += 1
+        elif record.get("type") == "turn.completed":
+            check(current_receipt_run is not None and current_receipt_run["usage"] is None,
+                  "Token A/B turn usage is unbound or duplicated")
+            current_receipt_run["usage"] = record.get("usage")
+    expected_order = token_ab.get("run_order")
+    check(
+        isinstance(expected_order, list)
+        and list(receipt_runs) == expected_order
+        and all(
+            isinstance(run.get("thread_id"), str) and run["thread_id"]
+            and isinstance(run.get("usage"), dict)
+            for run in receipt_runs.values()
+        ),
+        "Token A/B receipt set is incomplete",
+    )
+    summary_samples = {
+        sample["run_id"]: sample
+        for variant in (legacy_tokens, candidate_tokens)
+        for sample in variant.get("samples", [])
+        if isinstance(sample, dict) and isinstance(sample.get("run_id"), str)
+    }
+    check(
+        set(summary_samples) == set(receipt_runs)
+        and all(
+            summary_samples[run_id].get("thread_id") == receipt["thread_id"]
+            and summary_samples[run_id].get("tool_calls") == receipt["tool_calls"]
+            and all(
+                summary_samples[run_id].get(field) == receipt["usage"].get(field)
+                for field in (
+                    "input_tokens", "cached_input_tokens", "output_tokens", "reasoning_output_tokens",
+                )
+            )
+            for run_id, receipt in receipt_runs.items()
+        ),
+        "Token A/B summary no longer matches its JSONL receipts",
+    )
+    check(
+        isinstance(token_ab, dict)
+        and token_ab.get("schema_version") == 2
+        and token_ab.get("status") == "controlled-two-pair-alternating"
+        and token_ab.get("model") == "gpt-5.6-sol"
+        and token_ab.get("reasoning_effort") == "low"
+        and legacy_tokens.get("source_version") == "2.0.11"
+        and legacy_tokens.get("runtime_set_sha256") == "171fae3f6cae4454a4cca5521a894e615431e323180d0344b7b2cf3eda4a28ec"
+        and legacy_tokens.get("sample_count") == 2
+        and legacy_tokens.get("input_tokens_mean") == 101929.0
+        and legacy_tokens.get("tool_calls_mean") == 5.0
+        and candidate_tokens.get("source_version") == SOURCE_VERSION
+        and candidate_tokens.get("runtime_set_sha256") == runtime_set_sha256
+        and candidate_tokens.get("sample_count") == 2
+        and candidate_tokens.get("input_tokens_mean") == 75915.0
+        and candidate_tokens.get("tool_calls_mean") == 2.0
+        and token_fixture.get("cold_history_loaded") == 0
+        and token_fixture.get("current_tasks_loaded") == 1
+        and token_fixture.get("legacy_history_tasks") == 927
+        and token_fixture.get("legacy_total_tasks") == 928
+        and token_fixture.get("candidate_total_tasks") == 928
+        and token_fixture.get("synthetic_only") is True
+        and token_fixture.get("builder") == "tests/build_token_ab_fixture.py"
+        and token_fixture.get("builder_sha256")
+        == hashlib.sha256((ROOT / token_fixture["builder"]).read_bytes()).hexdigest()
+        and token_conclusion.get("input_tokens_percent") == -25.5
+        and token_conclusion.get("pair_input_tokens_percent") == [-25.5, -25.5]
+        and candidate_tokens.get("hot_context_bytes", 0) > legacy_tokens.get("hot_context_bytes", 0)
+        and any(
+            probe.get("status") == "invalid-comparison"
+            and probe.get("thread_id") == "01a03eb4-5e2b-7602-80d1-a63d0e2321ca"
+            and probe.get("tool_calls") == 8
+            for probe in token_ab.get("rejected_probes", [])
+        )
+        and isinstance(token_ab.get("limitations"), list) and len(token_ab["limitations"]) >= 5,
+        "real Token A/B evidence is stale, selective, or no longer bound to the candidate runtime",
+    )
+    check(
+        "101,929" in readme and "75,915" in readme and "25.5%" in readme
+        and "无效样本" in readme
+        and "不代表 Lulu 业务全流程" in readme
+        and "tests/token-ab-20260826.json" in readme,
+        "README omitted the measured onboarding Token result or overstated its scope",
+    )
+    check(
+        "https://github.com/AidenXu-1/agent-team-skill/releases" in readme
+        and "releases/download/v${VERSION}/agent-team-${VERSION}-pure.zip" in readme
+        and "agent-team-${VERSION}-pure.zip.sha256" in readme
+        and f"releases/latest/download/agent-team-{SOURCE_VERSION}-pure.zip" not in readme,
+        "README omitted the truthful Releases route or advertised an unpublished candidate asset",
     )
     check(
         "`main` 是唯一公开主干" in readme
-        and "只有全部通过" in readme
-        and "仍是远端 `main` 的最新提交" in readme
-        and "现有 Latest 包不会被替换" in readme
-        and "build-*" in readme,
-        "README omitted the main-branch or verified-latest publication contract",
+        and "push 和 pull request 只运行验证，不创建 Release" in readme
+        and "手动触发" in readme
+        and "reviewed-release-candidate" in readme
+        and f"agent-team-{SOURCE_VERSION}-pure.zip" in readme,
+        "README omitted the manual reviewed versioned publication contract",
     )
     check(
         set(reference_frontmatter) == {"title", "status"}
-        and reference_frontmatter.get("status") == "implemented"
-        and f"运行协议 `{PROTOCOL_VERSION}`" in temporary_reference
+        and reference_frontmatter.get("status") == "legacy-maintenance-p2-blocked"
+        and "TEMPORARY_EXECUTOR_P2_REQUIRED" in temporary_reference
+        and "1.4 legacy temporary TASK" in temporary_reference
         and "pending-archives" in temporary_reference
         and "YAML frontmatter" in temporary_reference,
         "temporary executor cold reference is missing or carries redundant version metadata",
+    )
+    temporary_runtime = (ROOT / "scripts" / "temporary_executor_runtime.py").read_text(encoding="utf-8")
+    check(
+        "enforce_legacy_closeout_only" in temporary_runtime
+        and "LEGACY_TEMPORARY_CLOSEOUT_ONLY" in temporary_runtime
+        and "TEMPORARY_EXECUTOR_P2_REQUIRED" in temporary_runtime
+        and "legacy-archive-recovery.json" in temporary_runtime,
+        "temporary runtime freeze whitelist or protocol-1.5 creation boundary drifted",
     )
     check(
         "只询问“能不能并行" in temporary_reference
@@ -400,25 +607,56 @@ def verify_repository_contract() -> None:
             "status": "required-before-release",
             "scope": "semantic-boundaries",
         }
-        and all(f"S{index:02d}" in semantic_review for index in range(1, 28))
+        and all(f"S{index:02d}" in semantic_review for index in range(1, 48))
         and "自动测试通过不能替代" in readme
         and "本文件只保存稳定问题，不写某次执行结果" in semantic_review,
         "manual semantic release gate is missing or incomplete",
     )
     check(
         all(term in skill for term in (
-            "## 向用户汇报", "需要你做什么", "还需注意",
-            "需要拍板", "需要体验", "重要变化/风险", "节点完成",
-            "入口、操作顺序、预期结果、重点判断和已知限制",
-            "默认不向用户展开 TASK ID",
+            "统筹会话按项目阶段", "执行会话按端到端切片",
+            "同一切片返工", "同一候选的审核复测",
+            "旧候选或身份串入", "输入、缓存输入、输出和工具调用",
+            "无法测量", "固定倍数阈值", "只建议换班",
         ))
-        and "结果 / 需要你做什么 / 还需注意" in readme,
+        and all(term in readme for term in (
+            "项目文件保存长期真值", "会话只保留眼前施工所需的工作集",
+            "不能按聊天轮数", "不能自动换班",
+        ))
+        and all(term in spec for term in (
+            "会话生命周期", "完整任务生命周期 A/B", "不新增自动换班状态机",
+        )),
+        "session lifecycle guidance is missing, unmeasured, or able to masquerade as automatic switching",
+    )
+    check(
+        all(term in skill for term in (
+            "## 用户闸门与汇报", "需要你做什么", "还需注意",
+            "不穷举场景", "对当前 TASK 的影响", "用户出口保持 `pending`", "`not_applicable`",
+            "同一切片内继续", "普通问答自然回复", "不为凑格式制造空话",
+            "临时提问/状态追问直接答并保留当前 TASK",
+            "入口/操作顺序/预期结果/重点判断/已知限制",
+            "默认不展开 TASK ID",
+            "全项目同一时刻只有一个活动切片",
+            "freeze-new-work",
+            "同一 gate 跨两代连续 FAIL",
+            "当前不可确认可用",
+        ))
+        and all(term in readme for term in (
+            "结果 / 需要你做什么 / 还需注意",
+            "不靠穷举场景", "亲自体验/判断", "纯代码或内部检查",
+            "临时提问和状态追问直接回答并保留当前 TASK",
+            "普通问答不套模板",
+        ))
+        and all(term in spec for term in (
+            "稳定但不死板", "不穷举用户场景", "用户出口保持 `pending`", "`not_applicable`",
+            "不得自动开启下一切片",
+        )),
         "user-facing reporting contract is missing from the Skill or repository guide",
     )
     check(
         f"当前运行协议为 `{PROTOCOL_VERSION}`" in skill
         and "references/temporary-executor.md" in skill
-        and "未触发时不要读取" in skill
+        and "TEMPORARY_EXECUTOR_P2_REQUIRED" in skill
         and "文档修订号" not in readme
         and "文档修订号" not in temporary_reference,
         "SKILL did not keep temporary-executor rules on the cold path",
@@ -445,63 +683,64 @@ def verify_repository_contract() -> None:
         jobs_index = workflow_lines.index("jobs:")
     except ValueError as exc:
         raise VerifyError("CI workflow is missing exact on/jobs sections") from exc
-    trigger_lines = [
-        line.strip() for line in workflow_lines[on_index + 1:jobs_index]
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
-    check(trigger_lines == ["push:", "pull_request:"],
-          "CI must run on every push and pull request without branch filters")
+    trigger_block = "\n".join(workflow_lines[on_index + 1:jobs_index])
+    check(
+        "  push:" in trigger_block and "  pull_request:" in trigger_block
+        and "  workflow_dispatch:" in trigger_block
+        and all(field in trigger_block for field in (
+            "release_version:", "reviewed_commit:", "reviewed_runtime_sha256:", "confirm_publish:",
+        )),
+        "CI must verify push/PR and expose a fully bound manual release dispatch",
+    )
     check('python-version: ["3.9", "3.11"]' in workflow,
           "CI no longer verifies both Python 3.9 and 3.11")
     check(
         workflow.count("uses: actions/checkout@v7") == 2
-        and workflow.count("uses: actions/setup-python@v6") == 2,
-        "CI uses a deprecated GitHub Actions JavaScript runtime",
-    )
-    try:
-        release_guard = workflow.split("- name: Check runtime changes since Latest", 1)[1].split(
-            "- name: Build and verify pure runtime package", 1
-        )[0]
-    except IndexError as exc:
-        raise VerifyError("CI is missing the bounded Latest release guard") from exc
-    runtime_diff = re.search(
-        r'if ! git diff --quiet "\$\{latest_tag\}" "\$\{GITHUB_SHA\}" -- \\\n(.*?)\n\s+scripts/temporary_executor_runtime\.py; then',
-        release_guard,
-        re.DOTALL,
+        and workflow.count("uses: actions/setup-python@v6") == 2
+        and workflow.count("fetch-depth: 0") == 2,
+        "CI uses a deprecated action runtime or shallow history that breaks candidate ancestry",
     )
     check(
-        runtime_diff is not None
-        and all(release_guard.count(relative) == 1 for relative in RUNTIME_FILES),
-        "CI Latest guard does not compare exactly the five runtime files",
-    )
-    check(
-        "gh release view" in release_guard
-        and "|| true" not in release_guard
-        and "--check-release-assets" in release_guard
-        and "asset_status" in release_guard
-        and "Latest release assets are invalid" in release_guard
-        and "Latest release verification could not complete safely" in release_guard,
-        "CI Latest guard can skip without proving public asset integrity or fail-closed API handling",
-    )
-    check(
-        "Publish latest verified package" in workflow
-        and "github.ref == 'refs/heads/main'" in workflow
+        "Publish explicitly authorized reviewed release" in workflow
+        and "github.event_name == 'workflow_dispatch'" in workflow
+        and "github.ref == 'refs/heads/main'" not in workflow
         and "needs: verify" in workflow
+        and "environment: agent-team-public-release" in workflow
         and "contents: write" in workflow
         and "git archive --format=zip" in workflow
         and all(relative in workflow for relative in RUNTIME_FILES)
-        and "git/ref/heads/main" in workflow
-        and "Skip obsolete run: remote main moved" in workflow
-        and "Release creation raced with another run" in workflow
-        and "Check runtime changes since Latest" in workflow
-        and "Runtime bundle and verified Latest assets are unchanged" in workflow
-        and "git diff --quiet" in workflow
-        and workflow.count("steps.runtime.outputs.changed == 'true'") == 2
+        and "reviewed-release-candidate" in workflow
+        and "inputs.reviewed_commit" in workflow
+        and "inputs.reviewed_runtime_sha256" in workflow
+        and "inputs.confirm_publish" in workflow
+        and "PUBLISH v${version}" in workflow
+        and "agent-team-%s-pure.zip" in workflow
+        and 'tag="v${version}"' in workflow
         and "gh release create" in workflow
+        and "--draft" in workflow
+        and "--check-release-assets" in workflow
+        and "agent-team-fresh-clone" in workflow
+        and "AGENT_TEAM_LEGACY_2011_ROOT" in workflow
+        and "tests/fixtures/agent-team-2.0.11-runtime" in workflow
+        and "fixture-manifest.json" in workflow
+        and "gh release edit" in workflow
+        and "--draft=false" in workflow
         and "--latest" in workflow
-        and "published_zip_digest" in workflow
+        and "draft_zip_digest" in workflow
+        and "draft_target" in workflow
+        and "target_commitish" in workflow
+        and "remote_tag_sha" in workflow
+        and "published_tag_sha" in workflow
+        and "gh release download" in workflow
+        and "sha256sum -c" in workflow
+        and "published_install" in workflow
+        and 'releases/latest" --jq .tag_name' in workflow
+        and "published_zip_sha" in workflow
+        and '--check-installed-copy "${published_install}"' in workflow
+        and "/git/ref/tags/" in workflow
+        and "github.event_name == 'push'" not in workflow
         and "gh release delete" not in workflow,
-        "CI omitted the verified main-to-Latest publication gate",
+        "CI omitted the explicit reviewed versioned publication gate",
     )
     try:
         openai_metadata = yaml.load(openai_yaml, Loader=UniqueKeyLoader)
@@ -541,18 +780,23 @@ def task_id_from(receipt: subprocess.CompletedProcess[str]) -> str:
 
 
 def ensure_lead_registered(task_tool: Path, thread_id: str = "lead-thread") -> None:
+    ensure_department_registered(task_tool, "统筹部", thread_id)
+
+
+def ensure_department_registered(task_tool: Path, department: str, thread_id: str) -> None:
     collab = task_tool.parents[1]
     state_path = collab / "会话启动状态.json"
     state = json.loads(state_path.read_text(encoding="utf-8"))
-    lead = state["departments"]["统筹部"]
-    if lead["step"] == "registered":
+    item = state["departments"][department]
+    if item["step"] == "registered":
+        check(item["thread_id"] == thread_id, f"fixture {department} registered with unexpected thread")
         return
-    check(lead["step"] == "pending" and not lead["thread_id"],
-          "test fixture lead session is neither pending nor registered")
+    check(item["step"] == "pending" and not item["thread_id"],
+          f"test fixture {department} session is neither pending nor registered")
     session_tool = collab / "scripts" / "agent_team_session.py"
     for step in ("created", "onboarded", "registered"):
         run([
-            sys.executable, str(session_tool), "mark", "--department", "统筹部", "--step", step,
+            sys.executable, str(session_tool), "mark", "--department", department, "--step", step,
             "--thread-id", thread_id, "--evidence", f"fixture-{step}",
         ])
 
@@ -579,7 +823,8 @@ def verify_generated(project: Path) -> None:
         "协议版本.json", "README.md", "路由表.md", "部门表.md", "会话启动清单.md",
         "会话启动状态.json", "任务交接模板.md", "错题集.md", "模板/工作报告.md", "模板/审核报告.md",
         "模板/专项结论.md", "scripts/agent_team_log.py", "scripts/agent_team_task.py",
-        "scripts/agent_team_session.py", "scripts/agent_team_temporary.py",
+        "scripts/agent_team_session.py", "scripts/agent_team_temporary.py", ".locks/dispatch-control.json",
+        ".locks/slice-control.json", ".locks/legacy-closeout-index.json",
     ]
     for relative in required:
         check((collab / relative).is_file(), f"missing generated file: {relative}")
@@ -590,23 +835,68 @@ def verify_generated(project: Path) -> None:
     check(protocol.get("role_policy_overlays") == {}, "fresh scaffold registered unexpected role policy overlays")
     for script in (collab / "scripts").glob("*.py"):
         compile_script(script)
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    run([sys.executable, str(task_tool), "rebuild-index", "--actor", "统筹部/bootstrap"])
+    run([sys.executable, str(task_tool), "onboard-check", "--department", "执行部"])
+    fresh_bundle = run([sys.executable, str(task_tool), "onboard-bundle", "--department", "执行部"])
+    check(
+        fresh_bundle.stdout.startswith(
+            "ONBOARD_BUNDLE_OK | 执行部 | current_tasks=0 | recovery_tasks=0 | cold_history=not_loaded"
+        )
+        and "hot_context_bytes=" in fresh_bundle.stdout
+        and "hot_context_warning=none" in fresh_bundle.stdout
+        and "===== BEGIN 岗位说明.md =====" in fresh_bundle.stdout
+        and "===== BEGIN 交接班文档.md =====" in fresh_bundle.stdout
+        and "===== BEGIN 收件箱.md =====" in fresh_bundle.stdout,
+        "read-only onboarding bundle omitted a hot entry or invented a cold task",
+    )
+    role_doc = collab / "部门" / "执行部" / "岗位说明.md"
+    role_doc_bytes = role_doc.read_bytes()
+    role_doc.write_bytes(role_doc_bytes + ("\n上下文告警探针" * 2_000).encode("utf-8"))
+    oversized_bundle = run([sys.executable, str(task_tool), "onboard-bundle", "--department", "执行部"])
+    role_doc.write_bytes(role_doc_bytes)
+    check(
+        "hot_context_warning=review_required" in oversized_bundle.stdout
+        and "HOT_CONTEXT_WARNING | 执行部" in oversized_bundle.stdout
+        and "内容未截断" in oversized_bundle.stdout,
+        "oversized hot context was silently accepted or destructively truncated",
+    )
+    session_tool = collab / "scripts" / "agent_team_session.py"
+    for step in ("created", "onboarded", "registered"):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", "统筹部", "--step", step,
+            "--thread-id", "lead-thread", "--evidence", f"fresh-bootstrap-{step}",
+        ])
+    run([sys.executable, str(task_tool), "onboard-check", "--department", "执行部"])
     guide = (project / "docs" / "agent-guide.md").read_text(encoding="utf-8")
     check(f"受管协议版本:{PROTOCOL_VERSION}" in guide and "任务真值" in guide,
           "project guide not refreshed")
     collaboration_readme = (collab / "README.md").read_text(encoding="utf-8")
     check(
-        "references/temporary-executor.md" in collaboration_readme
-        and "agent_team_temporary.py" in collaboration_readme
+        "agent_team_temporary.py" in collaboration_readme
+        and "TEMPORARY_EXECUTOR_P2_REQUIRED" in collaboration_readme
         and "session-mark" not in collaboration_readme
         and "temporary_session=standby" not in collaboration_readme,
         "generated collaboration guide did not keep the temporary-executor rules cold",
     )
     check(
         all(term in collaboration_readme for term in (
-            "需要拍板", "需要体验", "重要变化/风险", "节点完成",
+            "不得依赖穷举场景", "对当前 TASK 的影响", "用户出口 `pending`",
+            "纯代码或内部检查", "`not_applicable`", "不强制汇报",
+            "临时提问、状态追问直接回答并保留当前 TASK",
             "结果 / 需要你做什么 / 还需注意",
             "入口、操作顺序、预期结果、重点判断和已知限制",
+            "普通问答不套模板", "不为格式制造空话",
             "内部任务号、状态词、哈希、命令、日志和协议默认不展开",
+            "后台及普通低影响测试照常自动执行",
+            "明显妨碍用户正常使用设备",
+            "前台独占或难以自行退出",
+            "阶段性 Kickoff / 开发授权不能替代",
+            "正常模式一次只推进一个切片、一个 owner、最多两个 gate",
+            "不自动开启下一切片",
+            "freeze-new-work",
+            "同一 gate 跨两代连续 FAIL",
+            "只保留已领取任务完成或安全停下、清账、核收、交接、换班和证据",
         )),
         "generated collaboration guide lost the concise user-reporting contract",
     )
@@ -621,16 +911,26 @@ def verify_generated(project: Path) -> None:
             (root / name).stat().st_size
             for name in ("上岗引导.md", "岗位说明.md", "交接班文档.md", "收件箱.md")
         )
-        check(four_docs_bytes <= 7_000, f"{department} four-document onboarding exceeded 7 KB")
+        check(four_docs_bytes <= 7_000,
+              f"{department} four-document onboarding exceeded 7 KB: {four_docs_bytes}")
     inbox = (collab / "部门" / "执行部" / "收件箱.md").read_text(encoding="utf-8")
     lead_role_text = (collab / "部门" / "统筹部" / "岗位说明.md").read_text(encoding="utf-8")
     check("../../tasks/" in inbox, "inbox does not use stable clickable task path")
     check(
         all(term in lead_role_text for term in (
-            "需要拍板", "需要体验", "重要变化/风险", "节点完成",
+            "用户互动按意图、TASK 影响", "用户信息/体验判断/授权", "user_exit pending",
+            "本切片验证后 not_applicable 继续", "临时问题直接答并保留 TASK",
             "结果 / 需要你做什么 / 还需注意",
-            "入口、顺序、预期、判断点和限制",
-            "默认不展开 TASK ID",
+            "第三段按需", "普通问答不套模板",
+            "后台及普通低影响测试照常自动执行",
+            "明显妨碍用户正常使用设备",
+            "前台独占或难以自行退出",
+            "一次只推进一个切片和一个执行 owner",
+            "manual-degraded",
+            "不得自动开启下一切片",
+            "freeze-new-work",
+            "同一 gate 跨两代连续 FAIL",
+            "仅凭用户明确恢复证据运行 `unfreeze-new-work`",
         )),
         "generated lead role lost the concise user-reporting contract",
     )
@@ -639,12 +939,186 @@ def verify_generated(project: Path) -> None:
     check(
         "../../tasks/TASK-*.json" in role_text
         and "项目总进度由统筹部维护" in role_text
+        and "后台及普通低影响测试照常自动执行" in role_text
+        and "阶段性 Kickoff / 开发授权不能替代" in role_text
         and "tasks/TASK-*.json" not in role_text.replace("../../tasks/TASK-*.json", ""),
         "slimmed role guide lost task truth or retained the wrong relative task path",
     )
     check("当前消息/文件就是第 1 份上岗入口" in bootstrap_text
           and "换会话 / 换班" in bootstrap_text and "不 fork 旧历史" in bootstrap_text,
           "slimmed bootstrap lost the explicit session-switch boundary")
+
+
+def verify_default_minimal_software_team(root: Path) -> None:
+    project = make_project(root, "default-minimal-software-team")
+    run([
+        sys.executable, str(SCAFFOLD), str(project),
+        "--profile", "App / Web 最小协作", "--session-mode", "manual",
+        "--foundation-file", "docs/spec.md",
+    ])
+    collab = project / "docs" / "collaboration"
+    state = json.loads((collab / "会话启动状态.json").read_text(encoding="utf-8"))
+    check(
+        state["role_order"] == ["lead", "dev", "test"]
+        and set(state["departments"]) == {"统筹部", "开发部", "测试部"}
+        and not (collab / "部门" / "产品部").exists()
+        and not (collab / "部门" / "设计部").exists()
+        and not (collab / "部门" / "安全部").exists(),
+        "software default expanded beyond the lead/dev/test three-layer minimum",
+    )
+
+
+def verify_stop_loss_control(root: Path) -> None:
+    project = make_project(root, "stop-loss-control")
+    scaffold(project)
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    ensure_lead_registered(task_tool)
+    result_file = project / "docs" / "stop-loss-result.txt"
+    result_file.write_text("completed before freeze\n", encoding="utf-8")
+
+    mode_before = run([sys.executable, str(task_tool), "work-mode"])
+    check(mode_before.stdout.strip() == "WORK_MODE | normal | history:0",
+          "fresh collaboration did not default to normal work mode")
+    claimed = enqueue(task_tool, "冻结前已领取任务")
+    run([sys.executable, str(task_tool), "claim", "--task-id", claimed, "--claimed-by", "do-thread"])
+    queued = enqueue(task_tool, "冻结前待领取任务")
+    gated = enqueue(task_tool, "冻结前待用户授权任务", "user_required", "awaiting-user-decision")
+    resumable = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--department", "检验部",
+        "--from-department", "统筹部", "--title", "冻结前已阻断任务", "--node", "节点",
+        "--details", "用于验证冻结时不可恢复", "--acceptance-exit", "恢复动作被明确拒绝",
+        "--failure-path", "冻结旁路", "--authorization-state", "none",
+    ]))
+    run([sys.executable, str(task_tool), "claim", "--task-id", resumable, "--claimed-by", "review-thread"])
+    run([sys.executable, str(task_tool), "block", "--task-id", resumable, "--reason", "等待止血验证"])
+    queued_path = collab / "tasks" / f"{queued}.json"
+    queued_before = queued_path.read_bytes()
+    task_count_before = len(list((collab / "tasks").glob("TASK-*.json")))
+
+    frozen = run([
+        sys.executable, str(task_tool), "freeze-new-work",
+        "--actor", "统筹部/lead-thread", "--evidence", "user-requested-p0-freeze",
+    ])
+    frozen_again = run([
+        sys.executable, str(task_tool), "freeze-new-work",
+        "--actor", "统筹部/lead-thread", "--evidence", "duplicate-freeze-call",
+    ])
+    check(
+        frozen.stdout.startswith("WORK_FREEZE_OK | frozen | history:1")
+        and "idempotent" in frozen_again.stdout,
+        "freeze-new-work was not durable and idempotent",
+    )
+    denied_enqueue = run([
+        sys.executable, str(task_tool), "enqueue", "--department", "执行部",
+        "--from-department", "统筹部", "--title", "冻结后新任务", "--node", "节点",
+        "--details", "不得创建", "--acceptance-exit", "明确拒绝", "--failure-path", "派单已冻结",
+        "--authorization-state", "none", "--actor", "统筹部/lead-thread",
+    ], ok=False)
+    denied_claim = run([
+        sys.executable, str(task_tool), "claim", "--task-id", queued, "--claimed-by", "do-thread",
+    ], ok=False)
+    denied_impact = run([
+        sys.executable, str(task_tool), "declare-impact", "--task-id", queued,
+        "--expected-revision", "1", "--write-path", "docs/blocked.txt", "--base-revision", "HEAD",
+    ], ok=False)
+    denied_expand = run([
+        sys.executable, str(SCAFFOLD), str(project), "--add-roles", "security",
+    ], ok=False)
+    denied_resume = run([
+        sys.executable, str(task_tool), "resume", "--task-id", resumable,
+    ], ok=False)
+    denied_authorize = run([
+        sys.executable, str(task_tool), "authorize", "--task-id", gated,
+        "--state", "user_confirmed", "--evidence", "must-not-open-work-during-freeze",
+    ], ok=False)
+    control_path = collab / ".locks" / "dispatch-control.json"
+    frozen_control_before_upgrade = control_path.read_bytes()
+    frozen_upgrade = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    check(
+        all("P0_FREEZE_ACTIVE" in result.stderr for result in (
+            denied_enqueue, denied_claim, denied_impact, denied_expand, denied_resume, denied_authorize,
+        ))
+        and frozen_upgrade.stdout.startswith(f"UPGRADE_NOT_NEEDED | protocol:{PROTOCOL_VERSION}")
+        and control_path.read_bytes() == frozen_control_before_upgrade
+        and len(list((collab / "tasks").glob("TASK-*.json"))) == task_count_before
+        and queued_path.read_bytes() == queued_before,
+        "P0 freeze allowed new work or mutated the queued task: "
+        + " | ".join(result.stderr.strip() for result in (
+            denied_enqueue, denied_claim, denied_impact, denied_expand, denied_resume, denied_authorize,
+        )),
+    )
+
+    completed = run([
+        sys.executable, str(task_tool), "complete", "--task-id", claimed,
+        "--artifact", "docs/stop-loss-result.txt", "--verified", "冻结前领取内容已安全完成",
+        "--unverified", "未启动任何新任务", "--mistake-check", "已检查止血边界",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", claimed,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    queued_payload = json.loads(queued_path.read_text(encoding="utf-8"))
+    resolved = run([
+        sys.executable, str(task_tool), "resolve", "--task-id", queued,
+        "--state", "abandoned", "--expected-revision", str(queued_payload["revision"]),
+        "--actor", "统筹部/lead-thread", "--reason", "止血清账",
+        "--evidence", "user-requested-p0-freeze",
+    ])
+    rejected = run([
+        sys.executable, str(task_tool), "authorize", "--task-id", gated,
+        "--state", "user_rejected", "--evidence", "freeze-cleanup-rejection",
+    ])
+    for task_id in (gated, resumable):
+        payload = json.loads((collab / "tasks" / f"{task_id}.json").read_text(encoding="utf-8"))
+        run([
+            sys.executable, str(task_tool), "resolve", "--task-id", task_id,
+            "--state", "abandoned", "--expected-revision", str(payload["revision"]),
+            "--actor", "统筹部/lead-thread", "--reason", "止血清账",
+            "--evidence", "user-requested-p0-freeze",
+        ])
+    check(completed.stdout.startswith("TASK_STATE_OK") and resolved.stdout.startswith("TASK_RESOLUTION_OK"),
+          "freeze blocked safe completion, acknowledgement, or cleanup")
+    check(rejected.stdout.startswith("TASK_AUTH_RECORDED"),
+          "freeze blocked a user_rejected authorization cleanup record")
+
+    wrong_actor = run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "执行部/fake",
+        "--user-confirmation", "user-approved-resume",
+    ], ok=False)
+    check("actor 必须匹配" in wrong_actor.stderr, "non-lead actor could unfreeze new work")
+    unfrozen = run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "user-approved-resume",
+    ])
+    control = json.loads((collab / ".locks" / "dispatch-control.json").read_text(encoding="utf-8"))
+    check(
+        unfrozen.stdout.startswith("WORK_UNFREEZE_OK | normal | history:2")
+        and control["mode"] == "normal"
+        and [event["action"] for event in control["history"]] == ["freeze", "unfreeze"]
+        and [event["evidence"] for event in control["history"]]
+        == ["user-requested-p0-freeze", "user-approved-resume"],
+        "unfreeze did not require the registered lead or preserve append-only evidence",
+    )
+    control_before_missing_probe = control_path.read_bytes()
+    control_path.unlink()
+    denied_missing_control_enqueue = run([
+        sys.executable, str(task_tool), "enqueue", "--department", "执行部",
+        "--from-department", "统筹部", "--title", "控制缺失后新任务", "--node", "节点",
+        "--details", "不得创建", "--acceptance-exit", "明确拒绝", "--failure-path", "控制缺失",
+        "--authorization-state", "none", "--actor", "统筹部/lead-thread",
+    ], ok=False)
+    denied_missing_control_expand = run([
+        sys.executable, str(SCAFFOLD), str(project), "--add-roles", "security",
+    ], ok=False)
+    control_path.write_bytes(control_before_missing_probe)
+    check(
+        "派单控制缺失" in denied_missing_control_enqueue.stderr
+        and "派单控制缺失" in denied_missing_control_expand.stderr,
+        "missing dispatch control failed open for enqueue or team expansion",
+    )
+    resumed_intake = enqueue(task_tool, "用户解冻后的单一恢复任务")
+    check(resumed_intake.startswith("TASK-"), "explicit unfreeze did not restore intake")
 
 
 def verify_product_development_boundary(root: Path) -> None:
@@ -1456,6 +1930,66 @@ def verify_temporary_executor(root: Path) -> None:
         if evidence:
             args += ["--authorization-evidence", evidence]
         return task_id_from(run(args))
+
+    frozen_temporary = enqueue_dev("止血时不得推进的临时任务", "user_confirmed", "user-requested-temporary")
+    frozen_path = collab / "tasks" / f"{frozen_temporary}.json"
+    frozen_before = frozen_path.read_bytes()
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "user-requested-p0-freeze",
+    ])
+    denied_frozen_temporary = run([
+        sys.executable, str(temporary_tool), "preflight", "--task-id", frozen_temporary,
+        "--parent-department", "开发部", "--write-path", "app/frozen.py",
+    ], ok=False)
+    denied_frozen_cleanup = run([
+        sys.executable, str(temporary_tool), "cleanup", "--task-id", frozen_temporary,
+        "--evidence", "must-not-delete-evidence-during-freeze",
+    ], ok=False)
+    denied_frozen_reconcile_cleanup = run([
+        sys.executable, str(temporary_tool), "reconcile-cleanup", "--task-id", frozen_temporary,
+    ], ok=False)
+    check(
+        all("P0_FREEZE_ACTIVE" in result.stderr for result in (
+            denied_frozen_temporary, denied_frozen_cleanup, denied_frozen_reconcile_cleanup,
+        ))
+        and frozen_path.read_bytes() == frozen_before,
+        "temporary executor bypassed P0 freeze, deleted evidence, or mutated its TASK",
+    )
+    control_path = collab / ".locks" / "dispatch-control.json"
+    control_before = control_path.read_bytes()
+    corrupted = json.loads(control_before.decode("utf-8"))
+    corrupted["history"].insert(0, {
+        "at": corrupted["history"][0]["at"], "action": "unfreeze",
+        "actor": "统筹部/lead-thread", "evidence": "corrupted-order",
+    })
+    control_path.write_text(json.dumps(corrupted, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    corrupt_history_denied = run([
+        sys.executable, str(temporary_tool), "preflight", "--task-id", frozen_temporary,
+        "--parent-department", "开发部", "--write-path", "app/frozen.py",
+    ], ok=False)
+    control_path.write_bytes(control_before)
+    check("派单控制历史顺序无效" in corrupt_history_denied.stderr,
+          "temporary executor accepted a corrupted freeze history")
+    control_path.unlink()
+    missing_control_denied = run([
+        sys.executable, str(temporary_tool), "preflight", "--task-id", frozen_temporary,
+        "--parent-department", "开发部", "--write-path", "app/frozen.py",
+    ], ok=False)
+    control_path.write_bytes(control_before)
+    check("派单控制缺失" in missing_control_denied.stderr,
+          "temporary executor failed open after dispatch control disappeared")
+    run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "user-approved-test-resume",
+    ])
+    frozen_payload = json.loads(frozen_path.read_text(encoding="utf-8"))
+    run([
+        sys.executable, str(task_tool), "resolve", "--task-id", frozen_temporary,
+        "--state", "abandoned", "--expected-revision", str(frozen_payload["revision"]),
+        "--actor", "统筹部/lead-thread", "--reason", "止血门禁测试清账",
+        "--evidence", "verification-cleanup",
+    ])
 
     formal = enqueue_dev("正式任务 A", "none")
     run([sys.executable, str(task_tool), "claim", "--task-id", formal, "--claimed-by", "dev-session"])
@@ -3691,6 +4225,8 @@ def verify_protocol_149_guards(root: Path) -> None:
         (task_tool, "authorize", "--actor"),
         (task_tool, "supersede", "--actor"),
         (task_tool, "resolve", "--actor"),
+        (task_tool, "freeze-new-work", "--actor"),
+        (task_tool, "unfreeze-new-work", "--actor"),
         (task_tool, "ack", "--acknowledged-by"),
         (session_tool, "set-notification", "--actor"),
         (session_tool, "retire", "--actor"),
@@ -3817,6 +4353,1332 @@ def verify_protocol_149_guards(root: Path) -> None:
     check(doctor.stdout.startswith("TASK_DOCTOR_OK"), "full-history doctor failed after legal resolution")
 
 
+def verify_protocol_150_core(root: Path) -> None:
+    def task_args(
+        task_tool: Path, department: str, title: str, *, kind: str = "owner",
+        slice_id: str = "", gate_type: str = "", required_gates: tuple[str, ...] = (),
+    ) -> list[str]:
+        args = [
+            sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+            "--department", department, "--from-department", "统筹部",
+            "--title", title, "--node", "2.1 单切片", "--details", "验证机械状态机",
+            "--acceptance-exit", "最终出口可复验", "--failure-path", "身份或候选错误时拒绝",
+            "--authorization-state", "none", "--task-kind", kind,
+        ]
+        if slice_id:
+            args += ["--slice-id", slice_id]
+        if gate_type:
+            args += ["--gate-type", gate_type]
+        for gate in required_gates:
+            args += ["--required-gate", gate]
+        return args
+
+    def write_candidate(project: Path, candidate_id: str, label: str) -> tuple[Path, str]:
+        artifact = project / "docs" / f"{label}.txt"
+        artifact.write_text(f"candidate {candidate_id}\n", encoding="utf-8")
+        artifact_sha = file_sha256(artifact)
+        manifest = project / "docs" / f"{label}-manifest.json"
+        manifest.write_text(json.dumps({
+            "schema_version": 1,
+            "candidate_id": candidate_id,
+            "artifact": {"path": artifact.relative_to(project).as_posix(), "sha256": artifact_sha, "kind": "file"},
+            "source_revision": f"verify-{label}",
+        }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return manifest, file_sha256(manifest)
+
+    def write_gate_report(
+        collab: Path, department: str, task_id: str, candidate_id: str, decision: str, label: str,
+    ) -> Path:
+        report = collab / "部门" / department / "报告" / f"{label}.md"
+        report.write_text(f"""---
+type: audit_report
+department: {department}
+target: Agent Team 2.1 candidate
+status: final
+date: {dt.date.today().isoformat()}
+related_task: {task_id}
+decision: {decision}
+candidate_id: {candidate_id}
+tags: [protocol-1.5]
+summary: 已对指定候选执行独立反向探针并记录结论
+---
+
+# 独立审核
+
+候选身份、失败路径和最终出口已按本次 verdict 复核。
+""", encoding="utf-8")
+        return report
+
+    project = make_project(root, "protocol-150-stop-loss")
+    scaffold(project, "lead,dev,test,security")
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    session_tool = collab / "scripts" / "agent_team_session.py"
+    for department, thread_id in (
+        ("统筹部", "lead-thread"), ("开发部", "dev-thread"),
+        ("测试部", "test-thread"), ("安全部", "security-thread"),
+    ):
+        ensure_department_registered(task_tool, department, thread_id)
+    run([sys.executable, str(task_tool), "rebuild-index"])
+    run([sys.executable, str(task_tool), "onboard-check", "--department", "开发部"])
+
+    owner = task_id_from(run(task_args(
+        task_tool, "开发部", "唯一 owner", required_gates=("test", "security"),
+    )))
+    slice_control_path = collab / ".locks" / "slice-control.json"
+    slice_control = json.loads(slice_control_path.read_text(encoding="utf-8"))
+    slice_id = slice_control["active_slice"]["slice_id"]
+    phantom = run([
+        sys.executable, str(task_tool), "claim", "--task-id", owner,
+        "--claimed-by", "开发部/fake-thread-that-was-never-created",
+    ], ok=False)
+    check("当前已登记部门会话" in phantom.stderr, "phantom ordinary TASK identity was accepted")
+    run([
+        sys.executable, str(task_tool), "claim", "--task-id", owner,
+        "--claimed-by", "开发部/dev-thread",
+    ])
+    second_owner = run(task_args(task_tool, "开发部", "不得出现的第二 owner"), ok=False)
+    check("ACTIVE_SLICE_EXISTS" in second_owner.stderr, "a second active owner was accepted")
+
+    run([
+        sys.executable, str(session_tool), "begin-switch", "--department", "开发部",
+        "--old-thread-id", "dev-thread", "--reason", "verify identity rebind",
+    ])
+    for step in ("created", "onboarded", "registered"):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", "开发部", "--step", step,
+            "--thread-id", "dev-thread-v2", "--evidence", f"verify-switch-{step}",
+        ])
+    drifted = run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "identity probe", "--actor", "开发部/dev-thread-v2",
+    ], ok=False)
+    check("rebind-owner" in drifted.stderr, "switched session silently inherited ordinary TASK ownership")
+    owner_payload = json.loads((collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8"))
+    run([
+        sys.executable, str(task_tool), "rebind-owner", "--task-id", owner,
+        "--expected-revision", str(owner_payload["revision"]),
+        "--actor", "开发部/dev-thread-v2", "--previous-actor", "开发部/dev-thread",
+        "--evidence", "authorized switch and four-document onboarding",
+    ])
+    run([
+        sys.executable, str(session_tool), "finish-switch", "--department", "开发部",
+        "--new-thread-id", "dev-thread-v2",
+        "--evidence", "host=verify thread_id=dev-thread archived=true",
+    ])
+
+    candidate_1 = "CAND-20260825-A10001"
+    manifest_1, manifest_sha_1 = write_candidate(project, candidate_1, "candidate-a1")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_1, "--manifest", str(manifest_1.relative_to(project)),
+        "--sha256", manifest_sha_1, "--actor", "开发部/dev-thread-v2",
+    ])
+    test_gate = task_id_from(run(task_args(
+        task_tool, "测试部", "测试 gate", kind="gate", slice_id=slice_id, gate_type="test",
+    )))
+    security_gate = task_id_from(run(task_args(
+        task_tool, "安全部", "安全 gate", kind="gate", slice_id=slice_id, gate_type="security",
+    )))
+    third_gate = run(task_args(
+        task_tool, "测试部", "重复第三 gate", kind="gate", slice_id=slice_id, gate_type="test",
+    ), ok=False)
+    check("已存在" in third_gate.stderr or "最多两个" in third_gate.stderr,
+          "a third or duplicate gate was accepted")
+    run([sys.executable, str(task_tool), "claim", "--task-id", test_gate, "--claimed-by", "测试部/test-thread"])
+    run([sys.executable, str(task_tool), "claim", "--task-id", security_gate, "--claimed-by", "安全部/security-thread"])
+    wrong_candidate_report = write_gate_report(collab, "测试部", test_gate, candidate_1, "fail", "wrong-candidate")
+    wrong_candidate = run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", test_gate,
+        "--candidate-id", "CAND-20260825-BAD999", "--decision", "fail",
+        "--report", str(wrong_candidate_report.relative_to(project)), "--evidence", "identity mismatch probe",
+        "--actor", "测试部/test-thread",
+    ], ok=False)
+    check("唯一候选" in wrong_candidate.stderr, "gate verdict accepted a non-current candidate")
+    report_fail_1 = write_gate_report(collab, "测试部", test_gate, candidate_1, "fail", "test-fail-1")
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", test_gate,
+        "--candidate-id", candidate_1, "--decision", "fail",
+        "--report", str(report_fail_1.relative_to(project)), "--evidence", "reverse probe failed generation 1",
+        "--actor", "测试部/test-thread",
+    ])
+    candidate_2 = "CAND-20260825-A10002"
+    manifest_2, manifest_sha_2 = write_candidate(project, candidate_2, "candidate-a2")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_2, "--manifest", str(manifest_2.relative_to(project)),
+        "--sha256", manifest_sha_2, "--actor", "开发部/dev-thread-v2",
+    ])
+    security_fail_2 = write_gate_report(
+        collab, "安全部", security_gate, candidate_2, "fail", "security-fail-2",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", security_gate,
+        "--candidate-id", candidate_2, "--decision", "fail",
+        "--report", str(security_fail_2.relative_to(project)), "--evidence", "security failed generation 2",
+        "--actor", "安全部/security-thread",
+    ])
+    manifest_1_bytes = manifest_1.read_bytes()
+    manifest_1.write_bytes(manifest_1_bytes + b"drift\n")
+    historical_candidate_drift = run([sys.executable, str(task_tool), "doctor"], ok=False)
+    check("候选 manifest SHA-256 不匹配" in historical_candidate_drift.stderr,
+          "full-history doctor ignored an overwritten older candidate manifest")
+    manifest_1.write_bytes(manifest_1_bytes)
+    run([sys.executable, str(task_tool), "doctor"])
+    report_fail_1_bytes = report_fail_1.read_bytes()
+    report_fail_1.write_bytes(report_fail_1_bytes + b"\ntampered-after-verdict\n")
+    historical_report_drift = run([sys.executable, str(task_tool), "doctor"], ok=False)
+    check("审核报告内容已漂移" in historical_report_drift.stderr,
+          "doctor accepted a gate report changed after its verdict")
+    report_fail_1.write_bytes(report_fail_1_bytes)
+    run([sys.executable, str(task_tool), "doctor"])
+    reused_candidate = run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_1, "--manifest", str(manifest_1.relative_to(project)),
+        "--sha256", manifest_sha_1, "--actor", "开发部/dev-thread-v2",
+    ], ok=False)
+    check("全项目唯一" in reused_candidate.stderr,
+          "a candidate ID from an older active generation was reused")
+    report_fail_2 = write_gate_report(collab, "测试部", test_gate, candidate_2, "fail", "test-fail-2")
+    module_spec = importlib.util.spec_from_file_location("agent_team_gate_crash_probe", task_tool)
+    check(module_spec is not None and module_spec.loader is not None, "could not import generated task runtime")
+    gate_module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(gate_module)
+    original_store_dispatch = gate_module.store_dispatch_control
+
+    def injected_dispatch_failure(payload: dict) -> None:
+        raise OSError("injected crash between gate TASK and freeze control")
+
+    gate_module.store_dispatch_control = injected_dispatch_failure
+    try:
+        with gate_module.task_lock():
+            try:
+                gate_module.cmd_gate_verdict(argparse.Namespace(
+                    task_id=test_gate, candidate_id=candidate_2, decision="fail",
+                    report=str(report_fail_2.relative_to(project)),
+                    evidence="reverse probe failed generation 2", actor="测试部/test-thread",
+                ))
+            except OSError as exc:
+                check("injected crash" in str(exc), "gate fault injection raised an unexpected error")
+            else:
+                raise VerifyError("gate fault injection unexpectedly completed")
+    finally:
+        gate_module.store_dispatch_control = original_store_dispatch
+    transaction_path = collab / ".locks" / "gate-verdict-transaction.json"
+    check(transaction_path.is_file(), "crashed gate verdict did not leave a recovery transaction")
+    recovered = run([sys.executable, str(task_tool), "work-mode"])
+    check(
+        "GATE_VERDICT_RECOVERY_OK" in recovered.stdout and "WORK_MODE | frozen" in recovered.stdout
+        and not transaction_path.exists(),
+        "gate verdict recovery did not atomically converge TASK and freeze control",
+    )
+    dispatch = json.loads((collab / ".locks" / "dispatch-control.json").read_text(encoding="utf-8"))
+    check(dispatch["mode"] == "frozen" and "AUTO_GATE_FAIL_X2" in dispatch["history"][-1]["evidence"],
+          "automatic gate freeze was not durable")
+    task_count = len(list((collab / "tasks").glob("TASK-*.json")))
+    check(task_count == 3, "same-slice rework created replacement TASKs")
+    denied_rework = run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", "CAND-20260825-A10003", "--manifest", str(manifest_2.relative_to(project)),
+        "--sha256", manifest_sha_2, "--actor", "开发部/dev-thread-v2",
+    ], ok=False)
+    check("P0_FREEZE_ACTIVE" in denied_rework.stderr, "automatic freeze allowed a third rework generation")
+    metrics = run([
+        sys.executable, str(task_tool), "record-metrics", "--slice-id", slice_id,
+        "--source", "verified-host-export", "--input-tokens", "1200", "--output-tokens", "300",
+        "--max-input-tokens", "800", "--tool-calls", "12", "--polls", "0",
+        "--hot-context-bytes", "4096", "--actor", "统筹部/lead-thread",
+    ])
+    check("mode:manual-degraded | claims:none" in metrics.stdout,
+          "manual host mode made an unsupported token-reduction claim")
+    metrics_control = json.loads(slice_control_path.read_text(encoding="utf-8"))
+    metric_seed = metrics_control["active_slice"]["metrics"][0]
+    metrics_control["active_slice"]["metrics"] = [
+        {**metric_seed, "source": f"bounded-seed-{index}"} for index in range(100)
+    ]
+    slice_control_path.write_text(
+        json.dumps(metrics_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    run([
+        sys.executable, str(task_tool), "record-metrics", "--slice-id", slice_id,
+        "--source", "bounded-overflow", "--input-tokens", "1", "--output-tokens", "1",
+        "--max-input-tokens", "1", "--tool-calls", "1", "--polls", "0",
+        "--hot-context-bytes", "1", "--actor", "统筹部/lead-thread",
+    ])
+    bounded_metrics = json.loads(slice_control_path.read_text(encoding="utf-8"))["active_slice"]["metrics"]
+    check(
+        len(bounded_metrics) == 100 and bounded_metrics[-1]["source"] == "bounded-overflow",
+        "101st metrics receipt corrupted or exceeded the bounded active history",
+    )
+
+    handoff = collab / "部门" / "开发部" / "交接班文档.md"
+    handoff.write_text(
+        handoff.read_text(encoding="utf-8")
+        + f"\n- stale manual claim TASK-19990101-FAKE00 and cross-department {test_gate}\n",
+        encoding="utf-8",
+    )
+    manual_note = run([
+        sys.executable, str(task_tool), "onboard-check", "--department", "开发部",
+    ])
+    manual_bundle = run([
+        sys.executable, str(task_tool), "onboard-bundle", "--department", "开发部",
+    ])
+    check(manual_note.stdout.startswith("ONBOARD_FRESH_OK"),
+          "manual cold notes outside the machine block incorrectly invalidated freshness")
+    check("stale manual claim" in manual_bundle.stdout,
+          "onboarding bundle summarized or dropped the untrusted manual handoff text")
+    check(
+        "current_tasks=1 | recovery_tasks=0" in manual_bundle.stdout
+        and "===== BEGIN tasks/TASK-19990101-FAKE00.json =====" not in manual_bundle.stdout
+        and f"===== BEGIN tasks/{test_gate}.json =====" not in manual_bundle.stdout,
+        "manual text injected an unknown or cross-department TASK into onboarding identity",
+    )
+    handoff_text = handoff.read_text(encoding="utf-8")
+    handoff.write_text(
+        handoff_text.replace("<!-- agent-team current-slice:start -->",
+                             "<!-- agent-team current-slice:start -->\n- forged stale machine claim", 1),
+        encoding="utf-8",
+    )
+    stale = run([
+        sys.executable, str(task_tool), "onboard-check", "--department", "开发部",
+    ], ok=False)
+    stale_bundle = run([
+        sys.executable, str(task_tool), "onboard-bundle", "--department", "开发部",
+    ], ok=False)
+    check("HOT_STATE_STALE" in stale.stderr,
+          "tampered machine-managed handoff block passed onboarding freshness")
+    check("HOT_STATE_STALE" in stale_bundle.stderr,
+          "tampered machine-managed handoff block passed bundled onboarding")
+    run([sys.executable, str(task_tool), "rebuild-index"])
+    run([sys.executable, str(task_tool), "onboard-check", "--department", "开发部"])
+
+    happy = make_project(root, "protocol-150-happy-path")
+    run(["git", "init", "-b", "main"], cwd=happy)
+    run(["git", "config", "user.name", "Agent Team Verify"], cwd=happy)
+    run(["git", "config", "user.email", "verify@example.invalid"], cwd=happy)
+    run(["git", "add", "."], cwd=happy)
+    run(["git", "commit", "-m", "foundation"], cwd=happy)
+    scaffold(happy, "lead,dev,test")
+    happy_collab = happy / "docs" / "collaboration"
+    happy_tool = happy_collab / "scripts" / "agent_team_task.py"
+    for department, thread_id in (("统筹部", "lead-thread"), ("开发部", "dev-thread"), ("测试部", "test-thread")):
+        ensure_department_registered(happy_tool, department, thread_id)
+    run([sys.executable, str(happy_tool), "rebuild-index"])
+    too_many = run(task_args(
+        happy_tool, "开发部", "三个 gates", required_gates=("test", "security", "finance"),
+    ), ok=False)
+    check("最多两个" in too_many.stderr or "已配置" in too_many.stderr,
+          "owner accepted more than two gates")
+    happy_owner = task_id_from(run(task_args(
+        happy_tool, "开发部", "happy owner", required_gates=("test",),
+    )))
+    happy_control_path = happy_collab / ".locks" / "slice-control.json"
+    happy_slice = json.loads(happy_control_path.read_text(encoding="utf-8"))["active_slice"]["slice_id"]
+    run([sys.executable, str(happy_tool), "claim", "--task-id", happy_owner, "--claimed-by", "开发部/dev-thread"])
+    temporary_tool = happy_collab / "scripts" / "agent_team_temporary.py"
+    temporary_denied = run([
+        sys.executable, str(temporary_tool), "preflight", "--task-id", happy_owner,
+        "--parent-department", "开发部", "--write-path", "app/probe.py", "--base-revision", "HEAD",
+    ], ok=False)
+    check("TEMPORARY_EXECUTOR_P2_REQUIRED" in temporary_denied.stderr,
+          "temporary executor bypassed the 1.5 single-owner boundary")
+    happy_candidate = "CAND-20260825-H10001"
+    happy_manifest, happy_manifest_sha = write_candidate(happy, happy_candidate, "happy-candidate")
+    run([
+        sys.executable, str(happy_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "initial candidate freeze whitelist probe",
+    ])
+    frozen_initial_candidate = run([
+        sys.executable, str(happy_tool), "bind-candidate", "--task-id", happy_owner,
+        "--candidate-id", happy_candidate, "--manifest", str(happy_manifest.relative_to(happy)),
+        "--sha256", happy_manifest_sha, "--actor", "开发部/dev-thread",
+    ], ok=False)
+    check("P0_FREEZE_ACTIVE" in frozen_initial_candidate.stderr,
+          "freeze whitelist allowed an initial candidate to advance work")
+    run([
+        sys.executable, str(happy_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "resume happy-path candidate after whitelist probe",
+    ])
+    run([
+        sys.executable, str(happy_tool), "bind-candidate", "--task-id", happy_owner,
+        "--candidate-id", happy_candidate, "--manifest", str(happy_manifest.relative_to(happy)),
+        "--sha256", happy_manifest_sha, "--actor", "开发部/dev-thread",
+    ])
+    happy_manifest_payload = json.loads(happy_manifest.read_text(encoding="utf-8"))
+    happy_artifact = happy / happy_manifest_payload["artifact"]["path"]
+    happy_artifact_bytes = happy_artifact.read_bytes()
+    happy_artifact.write_bytes(happy_artifact_bytes + b"tampered\n")
+    tampered_artifact_gate = run(task_args(
+        happy_tool, "测试部", "tampered artifact gate", kind="gate",
+        slice_id=happy_slice, gate_type="test",
+    ), ok=False)
+    check("artifact SHA-256" in tampered_artifact_gate.stderr,
+          "gate creation accepted a candidate whose real artifact had drifted")
+    happy_artifact.write_bytes(happy_artifact_bytes)
+    happy_gate = task_id_from(run(task_args(
+        happy_tool, "测试部", "happy gate", kind="gate", slice_id=happy_slice, gate_type="test",
+    )))
+    run([sys.executable, str(happy_tool), "claim", "--task-id", happy_gate, "--claimed-by", "测试部/test-thread"])
+    happy_report = write_gate_report(happy_collab, "测试部", happy_gate, happy_candidate, "pass", "happy-pass")
+    run([
+        sys.executable, str(happy_tool), "gate-verdict", "--task-id", happy_gate,
+        "--candidate-id", happy_candidate, "--decision", "pass",
+        "--report", str(happy_report.relative_to(happy)), "--evidence", "all reverse probes passed",
+        "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(happy_tool), "record-user-exit", "--task-id", happy_owner,
+        "--candidate-id", happy_candidate, "--status", "not_applicable",
+        "--evidence", "non-UI protocol verification", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(happy_tool), "complete", "--task-id", happy_gate,
+        "--actor", "测试部/test-thread", "--artifact", str(happy_report.relative_to(happy)),
+        "--verified", "指定候选通过", "--unverified", "无", "--mistake-check", "无命中",
+        "--report", str(happy_report.relative_to(happy)),
+    ])
+    run([
+        sys.executable, str(happy_tool), "ack", "--task-id", happy_gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(happy_tool), "complete", "--task-id", happy_owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(happy_manifest.relative_to(happy)),
+        "--verified", "唯一候选和最终出口已固定", "--unverified", "无",
+        "--mistake-check", "未把局部 PASS 冒充其他项目可用",
+    ])
+    close_spec = importlib.util.spec_from_file_location("agent_team_slice_close_probe", happy_tool)
+    check(close_spec is not None and close_spec.loader is not None,
+          "could not import generated task runtime for slice-close fault injection")
+    close_module = importlib.util.module_from_spec(close_spec)
+    close_spec.loader.exec_module(close_module)
+    original_close_store = close_module.store_slice_control
+
+    def injected_slice_close_failure(payload: dict) -> None:
+        raise OSError("injected crash between final TASK acknowledgement and slice close")
+
+    close_module.store_slice_control = injected_slice_close_failure
+    try:
+        with close_module.task_lock():
+            try:
+                close_module.cmd_ack(argparse.Namespace(
+                    task_id=happy_owner, acknowledged_by="统筹部/lead-thread",
+                ))
+            except OSError as exc:
+                check("injected crash" in str(exc),
+                      "slice-close fault injection raised an unexpected error")
+            else:
+                raise VerifyError("slice-close fault injection unexpectedly completed")
+    finally:
+        close_module.store_slice_control = original_close_store
+    close_transaction = happy_collab / ".locks" / "slice-close-transaction.json"
+    crashed_owner = json.loads((happy_collab / "tasks" / f"{happy_owner}.json").read_text(encoding="utf-8"))
+    crashed_control = json.loads(happy_control_path.read_text(encoding="utf-8"))
+    check(
+        close_transaction.is_file()
+        and crashed_owner["execution_state"] == "acknowledged"
+        and crashed_control["active_slice"] is not None,
+        "final acknowledgement crash did not preserve a recoverable slice-close transaction",
+    )
+    close_recovered = run([sys.executable, str(happy_tool), "work-mode"])
+    check(
+        "SLICE_CLOSE_RECOVERY_OK" in close_recovered.stdout
+        and not close_transaction.exists()
+        and json.loads(happy_control_path.read_text(encoding="utf-8"))["active_slice"] is None,
+        "slice-close WAL did not recover the TASK/control split",
+    )
+    closed_control = json.loads(happy_control_path.read_text(encoding="utf-8"))
+    inbox = (happy_collab / "部门" / "开发部" / "收件箱.md").read_text(encoding="utf-8")
+    doctor = run([sys.executable, str(happy_tool), "doctor"])
+    hot_only_list = run([sys.executable, str(happy_tool), "list"])
+    cold_audit_list = run([sys.executable, str(happy_tool), "list", "--include-cold"])
+    check(
+        closed_control["active_slice"] is None and len(closed_control["history"]) == 1
+        and happy_owner not in inbox and "host_runtime=manual-degraded" in doctor.stdout
+        and hot_only_list.stdout.strip() == "NO_TASKS" and happy_owner in cold_audit_list.stdout,
+        "happy slice did not close into cold history or leaked into the active inbox",
+    )
+    original_happy_history = list(closed_control["history"])
+    closed_control["history"] = []
+    happy_control_path.write_text(
+        json.dumps(closed_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    ledger_owner = task_id_from(run(task_args(
+        happy_tool, "开发部", "candidate ledger owner", required_gates=(),
+    )))
+    run([
+        sys.executable, str(happy_tool), "claim", "--task-id", ledger_owner,
+        "--claimed-by", "开发部/dev-thread",
+    ])
+    ledger_reuse = run([
+        sys.executable, str(happy_tool), "bind-candidate", "--task-id", ledger_owner,
+        "--candidate-id", happy_candidate, "--manifest", str(happy_manifest.relative_to(happy)),
+        "--sha256", happy_manifest_sha, "--actor", "开发部/dev-thread",
+    ], ok=False)
+    check("全项目唯一" in ledger_reuse.stderr,
+          "candidate ID became reusable after its bounded slice history was evicted")
+    run([
+        sys.executable, str(happy_tool), "block", "--task-id", ledger_owner,
+        "--reason", "candidate ledger probe complete", "--actor", "开发部/dev-thread",
+    ])
+    ledger_payload = json.loads((happy_collab / "tasks" / f"{ledger_owner}.json").read_text(encoding="utf-8"))
+    run([
+        sys.executable, str(happy_tool), "resolve", "--task-id", ledger_owner,
+        "--state", "abandoned", "--expected-revision", str(ledger_payload["revision"]),
+        "--actor", "统筹部/lead-thread", "--reason", "candidate ledger probe complete",
+        "--evidence", "permanent identity ledger retained prior candidate",
+    ])
+    restored_history_control = json.loads(happy_control_path.read_text(encoding="utf-8"))
+    restored_history_control["history"] = original_happy_history + restored_history_control["history"]
+    happy_control_path.write_text(
+        json.dumps(restored_history_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    zero_gate_owner = task_id_from(run(task_args(
+        happy_tool, "开发部", "zero gate immutable history", required_gates=(),
+    )))
+    run([
+        sys.executable, str(happy_tool), "claim", "--task-id", zero_gate_owner,
+        "--claimed-by", "开发部/dev-thread",
+    ])
+    zero_gate_candidate = "CAND-20260825-Z10001"
+    zero_gate_manifest, zero_gate_manifest_sha = write_candidate(
+        happy, zero_gate_candidate, "zero-gate-candidate",
+    )
+    run([
+        sys.executable, str(happy_tool), "bind-candidate", "--task-id", zero_gate_owner,
+        "--candidate-id", zero_gate_candidate,
+        "--manifest", str(zero_gate_manifest.relative_to(happy)),
+        "--sha256", zero_gate_manifest_sha, "--actor", "开发部/dev-thread",
+    ])
+    run([
+        sys.executable, str(happy_tool), "record-user-exit", "--task-id", zero_gate_owner,
+        "--candidate-id", zero_gate_candidate, "--status", "not_applicable",
+        "--evidence", "non-UI zero-gate history probe", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(happy_tool), "complete", "--task-id", zero_gate_owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(zero_gate_manifest.relative_to(happy)),
+        "--verified", "zero-gate candidate fixed", "--unverified", "无",
+        "--mistake-check", "未用任务完成冒充其他项目可用",
+    ])
+    run([
+        sys.executable, str(happy_tool), "ack", "--task-id", zero_gate_owner,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    zero_gate_manifest_bytes = zero_gate_manifest.read_bytes()
+    zero_gate_manifest.write_bytes(zero_gate_manifest_bytes + b"\ntampered-after-slice-close\n")
+    zero_gate_history_drift = run([sys.executable, str(happy_tool), "doctor"], ok=False)
+    check("候选 manifest SHA-256 不匹配" in zero_gate_history_drift.stderr,
+          "doctor accepted a zero-gate candidate manifest changed after slice close")
+    zero_gate_manifest.write_bytes(zero_gate_manifest_bytes)
+    run([sys.executable, str(happy_tool), "doctor"])
+    malformed_cold = happy_collab / "tasks" / "TASK-20260825-C0LD00.json"
+    malformed_cold.write_text('{"broken":', encoding="utf-8")
+    isolated_hot_list = run([sys.executable, str(happy_tool), "list"])
+    isolated_onboard = run([
+        sys.executable, str(happy_tool), "onboard-bundle", "--department", "开发部",
+    ])
+    explicit_cold_failure = run([
+        sys.executable, str(happy_tool), "list", "--include-cold",
+    ], ok=False)
+    full_doctor_failure = run([sys.executable, str(happy_tool), "doctor"], ok=False)
+    check(
+        isolated_hot_list.stdout.strip() == "NO_TASKS"
+        and isolated_onboard.stdout.startswith("ONBOARD_BUNDLE_OK")
+        and explicit_cold_failure.returncode != 0 and full_doctor_failure.returncode != 0,
+        "hot onboarding parsed cold history, or explicit full-history checks ignored corruption",
+    )
+    malformed_cold.unlink()
+    no_op_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(happy), "--upgrade-collaboration",
+    ])
+    check(
+        no_op_upgrade.stdout.startswith(f"UPGRADE_NOT_NEEDED | protocol:{PROTOCOL_VERSION}"),
+        "current runtime rejected a valid cold schema-2 history during no-op upgrade validation",
+    )
+
+    history_project = make_project(root, "protocol-150-history-bound")
+    scaffold(history_project)
+    history_collab = history_project / "docs" / "collaboration"
+    history_tool = history_collab / "scripts" / "agent_team_task.py"
+    ensure_lead_registered(history_tool)
+    run([sys.executable, str(history_tool), "rebuild-index"])
+    control_path = history_collab / ".locks" / "dispatch-control.json"
+    timestamp = dt.datetime.now().astimezone().isoformat(timespec="minutes")
+    history_events = [
+        {"at": timestamp, "action": "freeze" if index % 2 == 0 else "unfreeze",
+         "actor": "统筹部/lead-thread", "evidence": f"history-bound-{index}"}
+        for index in range(1000)
+    ]
+    control_path.write_text(json.dumps({
+        "schema_version": 1, "mode": "normal", "updated_at": timestamp, "history": history_events,
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run([
+        sys.executable, str(history_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "history-bound-1000",
+    ])
+    run([
+        sys.executable, str(history_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "history-bound-1001",
+    ])
+    bounded = json.loads(control_path.read_text(encoding="utf-8"))
+    check(len(bounded["history"]) == 1000 and bounded["history"][0]["action"] == "freeze",
+          "1001st freeze transition corrupted or misaligned bounded history")
+    run([sys.executable, str(history_tool), "doctor"])
+
+
+def verify_protocol_150_migration(root: Path) -> None:
+    missing_dispatch_project = make_project(root, "protocol-150-missing-dispatch")
+    scaffold(missing_dispatch_project)
+    missing_collab = missing_dispatch_project / "docs" / "collaboration"
+    missing_protocol = missing_collab / "协议版本.json"
+    missing_session = missing_collab / "会话启动状态.json"
+    for path in (missing_protocol, missing_session):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    missing_guide = missing_dispatch_project / "docs" / "agent-guide.md"
+    missing_guide.write_text(missing_guide.read_text(encoding="utf-8").replace(
+        f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+    ), encoding="utf-8")
+    (missing_collab / ".locks" / "slice-control.json").unlink()
+    (missing_collab / ".locks" / "hot-state.json").unlink(missing_ok=True)
+    (missing_collab / ".locks" / "dispatch-control.json").unlink()
+    missing_before = missing_protocol.read_bytes()
+    missing_dispatch_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(missing_dispatch_project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "P0_FREEZE_REQUIRED" in missing_dispatch_upgrade.stderr
+        and missing_protocol.read_bytes() == missing_before
+        and not (missing_collab / ".locks" / "dispatch-control.json").exists(),
+        "upgrade silently recreated a normal dispatch control when the P0 freeze truth was missing",
+    )
+
+    project = make_project(root, "protocol-150-migration")
+    scaffold(project)
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    ensure_lead_registered(task_tool)
+    legacy_task_id = enqueue(task_tool, "legacy 1.4.15 cold task")
+    legacy_task_path = collab / "tasks" / f"{legacy_task_id}.json"
+    legacy_payload = json.loads(legacy_task_path.read_text(encoding="utf-8"))
+    for field in ("slice_id", "task_kind", "gate_type", "gate_attempts", "ownership_history"):
+        legacy_payload.pop(field, None)
+    legacy_payload["schema_version"] = 1
+    legacy_task_path.write_text(
+        json.dumps(legacy_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    slice_path = collab / ".locks" / "slice-control.json"
+    slice_payload = json.loads(slice_path.read_text(encoding="utf-8"))
+    slice_payload["active_slice"] = None
+    slice_path.write_text(
+        json.dumps(slice_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    run([sys.executable, str(task_tool), "rebuild-index"])
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "migration-freeze",
+    ])
+    legacy_bytes = legacy_task_path.read_bytes()
+    for name in ("协议版本.json", "会话启动状态.json"):
+        path = collab / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if name == "协议版本.json":
+            payload["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+        else:
+            payload["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+        path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    guide = project / "docs" / "agent-guide.md"
+    guide.write_text(
+        guide.read_text(encoding="utf-8").replace(
+            f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+        ),
+        encoding="utf-8",
+    )
+    slice_path.unlink()
+    (collab / ".locks" / "hot-state.json").unlink(missing_ok=True)
+    missing_handoff = collab / "部门" / "执行部" / "交接班文档.md"
+    missing_handoff.unlink()
+    missing_output_directory = collab / "专项结论"
+    check(not any(missing_output_directory.iterdir()), "migration reverse-probe output directory was not empty")
+    missing_output_directory.rmdir()
+    upgraded = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    check(upgraded.stdout.startswith("UPGRADE_OK |"), "frozen 1.4.15 project did not upgrade to 1.5.0")
+    check(legacy_task_path.read_bytes() == legacy_bytes, "1.4.15 TASK bytes changed during 1.5 migration")
+    legacy_reactivation = run([
+        sys.executable, str(task_tool), "claim", "--task-id", legacy_task_id,
+        "--claimed-by", "执行部/legacy-thread",
+    ], ok=False)
+    check("LEGACY_TASK_COLD_ONLY" in legacy_reactivation.stderr,
+          "upgraded 1.4 history could be reactivated as a second owner")
+    backup_roots = sorted((collab / "升级备份").iterdir())
+    check(bool(backup_roots), "1.5 migration did not create a rollback backup")
+    manifest = backup_roots[-1] / "rollback-manifest.json"
+    manifest_payload = json.loads(manifest.read_text(encoding="utf-8"))
+    check(
+        manifest_payload["schema_version"] == 2
+        and manifest_payload["operation"] == "upgrade"
+        and manifest_payload["source_protocol"] == PREVIOUS_PROTOCOL_VERSION
+        and manifest_payload["target_protocol"] == PROTOCOL_VERSION,
+        "rollback manifest omitted unique operation/source/target protocol identity",
+    )
+    generated_handoff_bytes = missing_handoff.read_bytes()
+    missing_handoff.write_bytes(generated_handoff_bytes + "\n人工恢复判断：必须保留。\n".encode("utf-8"))
+    handoff_rollback = run([
+        sys.executable, str(SCAFFOLD), str(project), "--rollback-collaboration", str(manifest),
+    ], ok=False)
+    check(
+        handoff_rollback.returncode == 9
+        and "ROLLBACK_DENIED" in handoff_rollback.stderr
+        and missing_handoff.read_bytes().endswith("人工恢复判断：必须保留。\n".encode("utf-8"))
+        and not (collab / ".upgrade-transaction.json").exists()
+        and json.loads((collab / "协议版本.json").read_text(encoding="utf-8"))["protocol_version"]
+        == PROTOCOL_VERSION,
+        "rollback did not fail closed before deleting post-upgrade manual handoff content",
+    )
+    missing_handoff.write_bytes(generated_handoff_bytes)
+    migration_note = missing_output_directory / "migration-note.md"
+    migration_note.write_text("post-upgrade evidence\n", encoding="utf-8")
+    directory_rollback = run([
+        sys.executable, str(SCAFFOLD), str(project), "--rollback-collaboration", str(manifest),
+    ], ok=False)
+    check(
+        directory_rollback.returncode == 9
+        and "ROLLBACK_DENIED" in directory_rollback.stderr
+        and migration_note.read_text(encoding="utf-8") == "post-upgrade evidence\n"
+        and not (collab / ".upgrade-transaction.json").exists()
+        and json.loads((collab / "协议版本.json").read_text(encoding="utf-8"))["protocol_version"]
+        == PROTOCOL_VERSION,
+        "rollback did not reject an added child before mutating an upgrade-created directory",
+    )
+    migration_note.unlink()
+    rolled_back = run([
+        sys.executable, str(SCAFFOLD), str(project), "--rollback-collaboration", str(manifest),
+    ])
+    restored_protocol = json.loads((collab / "协议版本.json").read_text(encoding="utf-8"))
+    check(
+        rolled_back.stdout.startswith("ROLLBACK_OK |")
+        and restored_protocol["protocol_version"] == PREVIOUS_PROTOCOL_VERSION
+        and legacy_task_path.read_bytes() == legacy_bytes
+        and not slice_path.exists()
+        and not missing_handoff.exists()
+        and not missing_output_directory.exists(),
+        "explicit rollback did not restore exact 1.4.15 truth",
+    )
+    existing_backup_dirs = set((collab / "升级备份").iterdir())
+    second_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ])
+    new_backup_dirs = set((collab / "升级备份").iterdir()) - existing_backup_dirs
+    check(len(new_backup_dirs) == 1, "second upgrade did not create exactly one backup generation")
+    second_manifest = next(iter(new_backup_dirs)) / "rollback-manifest.json"
+    check(
+        second_upgrade.stdout.startswith("UPGRADE_OK |") and second_manifest != manifest,
+        "second upgrade did not establish a distinct rollback generation",
+    )
+    stale_rollback = run([
+        sys.executable, str(SCAFFOLD), str(project), "--rollback-collaboration", str(manifest),
+    ], ok=False)
+    check(
+        "不属于当前升级代次" in stale_rollback.stderr
+        and json.loads((collab / "协议版本.json").read_text(encoding="utf-8"))["protocol_version"]
+        == PROTOCOL_VERSION,
+        "an older rollback manifest was accepted after a newer upgrade generation",
+    )
+    second_rollback = run([
+        sys.executable, str(SCAFFOLD), str(project), "--rollback-collaboration", str(second_manifest),
+    ])
+    check(
+        second_rollback.stdout.startswith("ROLLBACK_OK |")
+        and json.loads((collab / "协议版本.json").read_text(encoding="utf-8"))["protocol_version"]
+        == PREVIOUS_PROTOCOL_VERSION,
+        "current rollback generation was rejected after the stale-generation reverse probe",
+    )
+
+    claimed_project = make_project(root, "protocol-150-claimed-migration-denied")
+    scaffold(claimed_project)
+    claimed_collab = claimed_project / "docs" / "collaboration"
+    claimed_tool = claimed_collab / "scripts" / "agent_team_task.py"
+    ensure_lead_registered(claimed_tool)
+    ensure_department_registered(claimed_tool, "执行部", "do-thread")
+    run([sys.executable, str(claimed_tool), "rebuild-index"])
+    claimed_task_id = enqueue(claimed_tool, "legacy claimed migration blocker")
+    run([
+        sys.executable, str(claimed_tool), "claim", "--task-id", claimed_task_id,
+        "--claimed-by", "执行部/do-thread",
+    ])
+    run([
+        sys.executable, str(claimed_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "claimed migration reverse probe",
+    ])
+    claimed_task_path = claimed_collab / "tasks" / f"{claimed_task_id}.json"
+    claimed_payload = json.loads(claimed_task_path.read_text(encoding="utf-8"))
+    for field in ("slice_id", "task_kind", "gate_type", "gate_attempts", "ownership_history"):
+        claimed_payload.pop(field, None)
+    claimed_payload["schema_version"] = 1
+    claimed_task_path.write_text(
+        json.dumps(claimed_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    claimed_bytes = claimed_task_path.read_bytes()
+    for name in ("协议版本.json", "会话启动状态.json"):
+        path = claimed_collab / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    claimed_guide = claimed_project / "docs" / "agent-guide.md"
+    claimed_guide.write_text(claimed_guide.read_text(encoding="utf-8").replace(
+        f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+    ), encoding="utf-8")
+    (claimed_collab / ".locks" / "slice-control.json").unlink()
+    (claimed_collab / ".locks" / "hot-state.json").unlink(missing_ok=True)
+    claimed_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(claimed_project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.4 TASK 仍在 claimed" in claimed_upgrade.stderr
+        and claimed_task_path.read_bytes() == claimed_bytes
+        and json.loads((claimed_collab / "协议版本.json").read_text(encoding="utf-8"))["protocol_version"]
+        == PREVIOUS_PROTOCOL_VERSION,
+        "migration accepted or rewrote an in-flight legacy owner",
+    )
+
+    post_task = make_project(root, "protocol-150-rollback-denied")
+    scaffold(post_task)
+    post_collab = post_task / "docs" / "collaboration"
+    post_tool = post_collab / "scripts" / "agent_team_task.py"
+    ensure_lead_registered(post_tool)
+    run([sys.executable, str(post_tool), "rebuild-index"])
+    # Create a synthetic valid backup by taking this project's current tree through the same
+    # frozen downgrade/upgrade path, then create a 1.5 TASK before requesting rollback.
+    run([
+        sys.executable, str(post_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "prepare rollback-denied probe",
+    ])
+    for name in ("协议版本.json", "会话启动状态.json"):
+        path = post_collab / name
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["protocol_version"] = PREVIOUS_PROTOCOL_VERSION
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    post_guide = post_task / "docs" / "agent-guide.md"
+    post_guide.write_text(post_guide.read_text(encoding="utf-8").replace(
+        f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{PREVIOUS_PROTOCOL_VERSION}",
+    ), encoding="utf-8")
+    (post_collab / ".locks" / "slice-control.json").unlink()
+    (post_collab / ".locks" / "hot-state.json").unlink(missing_ok=True)
+    run([sys.executable, str(SCAFFOLD), str(post_task), "--upgrade-collaboration"])
+    post_manifest = sorted((post_collab / "升级备份").iterdir())[-1] / "rollback-manifest.json"
+    run([
+        sys.executable, str(post_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "create post-upgrade task probe",
+    ])
+    created = enqueue(post_tool, "new 1.5 task blocks rollback")
+    run([
+        sys.executable, str(post_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "attempt explicit rollback after 1.5 task",
+    ])
+    denied = run([
+        sys.executable, str(SCAFFOLD), str(post_task), "--rollback-collaboration", str(post_manifest),
+    ], ok=False)
+    check(
+        created.startswith("TASK-") and (
+            "活动切片" in denied.stderr
+            or "已创建 1.5 TASK" in denied.stderr
+            or "受管状态不完整" in denied.stderr
+        ),
+        "explicit rollback failed open after a new 1.5 TASK existed",
+    )
+
+
+def verify_protocol_150_atomic_guards(root: Path) -> None:
+    project = make_project(root, "protocol-150-atomic-guards")
+    scaffold(project)
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    ensure_lead_registered(task_tool)
+    run([sys.executable, str(task_tool), "rebuild-index"])
+
+    slice_path = collab / ".locks" / "slice-control.json"
+    slice_bytes = slice_path.read_bytes()
+    slice_path.unlink()
+    missing_slice = run([
+        sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+        "--department", "执行部", "--from-department", "统筹部", "--title", "missing slice guard",
+        "--node", "guard", "--details", "must fail", "--acceptance-exit", "rejected",
+        "--failure-path", "slice control missing", "--authorization-state", "none",
+    ], ok=False)
+    slice_path.write_bytes(slice_bytes)
+    check("切片控制缺失" in missing_slice.stderr and not list((collab / "tasks").glob("TASK-*.json")),
+          "missing slice control failed open or left a TASK")
+
+    tasks = collab / "tasks"
+    safe_tasks = collab / "tasks-safe"
+    outside = root / "outside-protocol-150-tasks"
+    outside.mkdir()
+    tasks.rename(safe_tasks)
+    tasks.symlink_to(outside, target_is_directory=True)
+    try:
+        symlink_denied = run([
+            sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+            "--department", "执行部", "--from-department", "统筹部", "--title", "symlink guard",
+            "--node", "guard", "--details", "must fail", "--acceptance-exit", "rejected",
+            "--failure-path", "tasks symlink", "--authorization-state", "none",
+        ], ok=False)
+        check("不安全" in symlink_denied.stderr and not any(outside.iterdir()),
+              "1.5 enqueue wrote through a symlinked tasks root")
+    finally:
+        tasks.unlink()
+        safe_tasks.rename(tasks)
+
+    module_spec = importlib.util.spec_from_file_location("agent_team_enqueue_crash_probe", task_tool)
+    check(module_spec is not None and module_spec.loader is not None, "could not import enqueue crash runtime")
+    enqueue_module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(enqueue_module)
+    original_store_slice = enqueue_module.store_slice_control
+
+    def injected_slice_failure(payload: dict) -> None:
+        raise OSError("injected crash between TASK and slice control")
+
+    enqueue_module.store_slice_control = injected_slice_failure
+    try:
+        with enqueue_module.task_lock():
+            try:
+                enqueue_module.cmd_enqueue(argparse.Namespace(
+                    actor="统筹部/lead-thread", department="执行部", from_department="统筹部",
+                    title="enqueue crash owner", node="atomic guard", details="must recover",
+                    acceptance_exit="one owner", failure_path=["slice control write fails"],
+                    confirmation="无需额外确认", domain_stage="atomic guard", authorization_state="none",
+                    authorization_evidence="", pointer=[], task_kind="owner", slice_id="", gate_type="",
+                    required_gate=[],
+                ))
+            except OSError as exc:
+                check("injected crash" in str(exc), "enqueue fault injection raised an unexpected error")
+            else:
+                raise VerifyError("enqueue fault injection unexpectedly completed")
+    finally:
+        enqueue_module.store_slice_control = original_store_slice
+    enqueue_transaction = collab / ".locks" / "slice-enqueue-transaction.json"
+    transaction_payload = json.loads(enqueue_transaction.read_text(encoding="utf-8"))
+    crashed_task_id = transaction_payload["task"]["task_id"]
+    recovered_enqueue = run([sys.executable, str(task_tool), "work-mode"])
+    check(
+        "SLICE_ENQUEUE_RECOVERY_OK" in recovered_enqueue.stdout and not enqueue_transaction.exists()
+        and (collab / "tasks" / f"{crashed_task_id}.json").is_file(),
+        "enqueue recovery did not converge TASK and slice control",
+    )
+    run([
+        sys.executable, str(task_tool), "resolve", "--task-id", crashed_task_id,
+        "--state", "abandoned", "--expected-revision", "1", "--actor", "统筹部/lead-thread",
+        "--reason", "fault injection cleanup", "--evidence", "verified enqueue recovery",
+    ])
+
+    enqueue_args = [
+        sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+        "--department", "执行部", "--from-department", "统筹部", "--title", "race owner",
+        "--node", "race", "--details", "linearizable race", "--acceptance-exit", "one durable result",
+        "--failure-path", "freeze wins", "--authorization-state", "none",
+    ]
+    freeze_args = [
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "concurrent-freeze-probe",
+    ]
+    enqueue_process = subprocess.Popen(
+        enqueue_args, cwd=project, text=True, encoding="utf-8",
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    freeze_process = subprocess.Popen(
+        freeze_args, cwd=project, text=True, encoding="utf-8",
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+    )
+    enqueue_stdout, enqueue_stderr = enqueue_process.communicate(timeout=30)
+    freeze_stdout, freeze_stderr = freeze_process.communicate(timeout=30)
+    check(freeze_process.returncode == 0 and freeze_stdout.startswith("WORK_FREEZE_OK"),
+          f"concurrent freeze failed: {freeze_stderr}")
+    check(
+        (enqueue_process.returncode == 0 and enqueue_stdout.startswith("TASK_ENQUEUED"))
+        or (enqueue_process.returncode == 2 and "P0_FREEZE_ACTIVE" in enqueue_stderr),
+        "freeze/enqueue race was not linearizable",
+    )
+    denied_after = run(enqueue_args, ok=False)
+    check("P0_FREEZE_ACTIVE" in denied_after.stderr, "post-race frozen state accepted new work")
+    run([sys.executable, str(task_tool), "doctor"])
+    check(
+        "project-control.lock" in SCAFFOLD.read_text(encoding="utf-8")
+        and "project-control.lock" in (ROOT / "scripts" / "temporary_executor_runtime.py").read_text(encoding="utf-8"),
+        "scaffold/task/session/temporary runtimes did not converge on the project control lock",
+    )
+
+
+def verify_installed_2011_migration(root: Path, installed_root: Path) -> None:
+    installed_root = installed_root.expanduser().resolve()
+    fixture_manifest_path = installed_root / "fixture-manifest.json"
+    check(fixture_manifest_path.is_file() and not fixture_manifest_path.is_symlink(),
+          "2.0.11 fixture is missing its immutable fixture manifest")
+    try:
+        fixture_manifest = json.loads(fixture_manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise VerifyError(f"2.0.11 fixture manifest is unreadable: {exc}") from exc
+    check(
+        isinstance(fixture_manifest, dict)
+        and set(fixture_manifest) == {
+            "captured_on", "protocol_version", "runtime_files", "runtime_set_sha256",
+            "runtime_set_sha256_algorithm", "schema_version", "source_kind", "source_version",
+        }
+        and fixture_manifest.get("schema_version") == 1
+        and fixture_manifest.get("source_version") == "2.0.11"
+        and fixture_manifest.get("protocol_version") == PREVIOUS_PROTOCOL_VERSION
+        and fixture_manifest.get("source_kind") == "exact-installed-runtime-copy",
+        "2.0.11 fixture manifest identity is invalid",
+    )
+    declared_files = fixture_manifest.get("runtime_files")
+    check(isinstance(declared_files, dict) and set(declared_files) == set(RUNTIME_FILES),
+          "2.0.11 fixture manifest does not bind the exact five runtime files")
+    runtime_rows: list[str] = []
+    for relative in RUNTIME_FILES:
+        fixture_file = installed_root / relative
+        check(fixture_file.is_file() and not fixture_file.is_symlink(),
+              f"2.0.11 fixture runtime file is missing or unsafe: {relative}")
+        digest = hashlib.sha256(fixture_file.read_bytes()).hexdigest()
+        check(declared_files.get(relative) == digest,
+              f"2.0.11 fixture runtime hash mismatch: {relative}")
+        runtime_rows.append(f"{digest}  {relative}\n")
+    runtime_set_sha256 = hashlib.sha256("".join(runtime_rows).encode("utf-8")).hexdigest()
+    check(fixture_manifest.get("runtime_set_sha256") == runtime_set_sha256,
+          "2.0.11 fixture runtime-set identity is stale")
+    installed_skill = installed_root / "SKILL.md"
+    installed_scaffold = installed_root / "scripts" / "scaffold_team.py"
+    installed_temporary_runtime = installed_root / "scripts" / "temporary_executor_runtime.py"
+    check(installed_skill.is_file() and installed_scaffold.is_file() and installed_temporary_runtime.is_file(),
+          "2.0.11 fixture root does not contain the installed runtime files")
+    installed_frontmatter = yaml_frontmatter(installed_skill.read_text(encoding="utf-8"), label="2.0.11 fixture")
+    check(
+        isinstance(installed_frontmatter.get("metadata"), dict)
+        and installed_frontmatter["metadata"].get("version") == "2.0.11"
+        and 'PROTOCOL_VERSION = "1.4.15"' in installed_scaffold.read_text(encoding="utf-8"),
+        "legacy fixture is not the exact installed Agent-Team 2.0.11 / protocol 1.4.15 runtime",
+    )
+
+    project = make_project(root, "installed-2011-migration")
+    (project / ".gitignore").write_text("/.agent-team/\n", encoding="utf-8")
+    (project / "app").mkdir()
+    (project / "app" / "base.py").write_text("VALUE = 'legacy'\n", encoding="utf-8")
+    run(["git", "init", "-b", "main"], cwd=project)
+    run(["git", "config", "user.name", "Agent Team Verify"], cwd=project)
+    run(["git", "config", "user.email", "verify@example.invalid"], cwd=project)
+    run(["git", "add", "."], cwd=project)
+    run(["git", "commit", "-m", "legacy foundation"], cwd=project)
+    run([
+        sys.executable, str(installed_scaffold), str(project),
+        "--profile", "软件项目", "--roles", "lead,dev,test", "--session-mode", "manual",
+        "--foundation-file", "docs/spec.md",
+    ])
+    run(["git", "add", "."], cwd=project)
+    run(["git", "commit", "-m", "installed 2.0.11 collaboration"], cwd=project)
+
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    temporary_tool = collab / "scripts" / "agent_team_temporary.py"
+    ensure_department_registered(task_tool, "统筹部", "lead-thread")
+    ensure_department_registered(task_tool, "开发部", "dev-thread")
+    legacy_task = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--department", "开发部",
+        "--from-department", "统筹部", "--title", "2.0.11 legacy temporary",
+        "--node", "legacy migration", "--details", "verify exact installed migration",
+        "--acceptance-exit", "legacy truth preserved", "--failure-path", "freeze on ambiguity",
+        "--authorization-state", "user_confirmed",
+        "--authorization-evidence", "fixture-authorized-temporary",
+    ]))
+    run([
+        sys.executable, str(temporary_tool), "provision", "--task-id", legacy_task,
+        "--parent-department", "开发部", "--executor-id", "legacy-2011-temp",
+        "--display-name", "2.0.11 临时执行者", "--current-brief", "only app/legacy.py",
+        "--client-key", "legacy-2011-client", "--scan-boundary-evidence", "fixture scope checked",
+        "--base-revision", "HEAD", "--write-path", "app/legacy.py",
+    ])
+    run([
+        sys.executable, str(temporary_tool), "pause", "--task-id", legacy_task,
+        "--state", "blocked", "--reason", "prepare frozen migration fixture",
+    ])
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "exact 2.0.11 migration probe",
+    ])
+    onboarding_names = ("上岗引导.md", "岗位说明.md", "交接班文档.md", "收件箱.md")
+    legacy_onboarding_bytes = sum(
+        (collab / "部门" / "开发部" / name).stat().st_size for name in onboarding_names
+    )
+    legacy_task_path = collab / "tasks" / f"{legacy_task}.json"
+    legacy_bytes = legacy_task_path.read_bytes()
+    upgraded = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    closeout_index = json.loads(
+        (collab / ".locks" / "legacy-closeout-index.json").read_text(encoding="utf-8")
+    )
+    check(
+        upgraded.stdout.startswith("UPGRADE_OK |")
+        and legacy_task_path.read_bytes() == legacy_bytes
+        and legacy_task in closeout_index["task_ids"],
+        "exact installed 2.0.11 migration rewrote or lost its blocked temporary executor",
+    )
+    recovery_bundle = run([
+        sys.executable, str(task_tool), "onboard-bundle", "--department", "开发部",
+    ])
+    lead_recovery_bundle = run([
+        sys.executable, str(task_tool), "onboard-bundle", "--department", "统筹部",
+    ])
+    check(
+        "current_tasks=0 | recovery_tasks=1 | cold_history=not_loaded" in recovery_bundle.stdout
+        and f"===== BEGIN tasks/{legacy_task}.json =====" in recovery_bundle.stdout
+        and "冻结恢复任务" in recovery_bundle.stdout
+        and "current_tasks=0 | recovery_tasks=1 | cold_history=not_loaded" in lead_recovery_bundle.stdout,
+        "migrated legacy temporary blocker disappeared from department or lead onboarding",
+    )
+    closeout_index_path = collab / ".locks" / "legacy-closeout-index.json"
+    closeout_index_bytes = closeout_index_path.read_bytes()
+    tampered_index = json.loads(closeout_index_bytes)
+    tampered_index["task_ids"] = []
+    tampered_index["archive_recovery_task_ids"] = []
+    closeout_index_path.write_text(
+        json.dumps(tampered_index, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    tampered_index_unfreeze = run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "tampered index must fail closed",
+    ], ok=False)
+    closeout_index_path.write_bytes(closeout_index_bytes)
+    check("LEGACY_CLOSEOUT_INDEX_INTEGRITY" in tampered_index_unfreeze.stderr,
+          "a structurally valid but truncated closeout index allowed unfreeze")
+    current_onboarding_bytes = sum(
+        (collab / "部门" / "开发部" / name).stat().st_size for name in onboarding_names
+    )
+    denied_unfreeze = run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "probe must remain frozen until legacy closeout",
+    ], ok=False)
+    denied_resume = run([
+        sys.executable, str(temporary_tool), "resume", "--task-id", legacy_task,
+        "--evidence", "must not restore legacy development",
+    ], ok=False)
+    malformed_unrelated = collab / "tasks" / "TASK-20260825-C0LD99.json"
+    malformed_unrelated.write_text('{"broken":', encoding="utf-8")
+    hot_list = run([sys.executable, str(task_tool), "list"])
+    malformed_unrelated.unlink()
+    check(
+        "LEGACY_TEMPORARY_CLOSEOUT_REQUIRED" in denied_unfreeze.stderr
+        and (
+            "P0_FREEZE_ACTIVE" in denied_resume.stderr
+            or "P0_STOP_LOSS_ACTIVE" in denied_resume.stderr
+            or "LEGACY_TEMPORARY_CLOSEOUT_ONLY" in denied_resume.stderr
+        )
+        and "LEGACY_TEMPORARY_CLOSEOUT_REQUIRED" in hot_list.stdout,
+        "2.0.11 legacy temporary could resume, unfreeze, or force a full cold-history scan: "
+        f"unfreeze={denied_unfreeze.stderr.strip()!r}; resume={denied_resume.stderr.strip()!r}; "
+        f"list={hot_list.stdout.strip()!r}",
+    )
+    print(
+        "LEGACY_2011_MIGRATION_OK | task_bytes_preserved=true | "
+        f"four_docs_before={legacy_onboarding_bytes} | four_docs_after={current_onboarding_bytes} | "
+        "migration_token_claim=not_inferred_from_bytes"
+    )
+
+    archive_project = make_project(root, "installed-2011-invalid-archive")
+    (archive_project / ".gitignore").write_text("/.agent-team/\n", encoding="utf-8")
+    (archive_project / "app").mkdir()
+    (archive_project / "app" / "base.py").write_text("VALUE = 'archive'\n", encoding="utf-8")
+    run(["git", "init", "-b", "main"], cwd=archive_project)
+    run(["git", "config", "user.name", "Agent Team Verify"], cwd=archive_project)
+    run(["git", "config", "user.email", "verify@example.invalid"], cwd=archive_project)
+    run(["git", "add", "."], cwd=archive_project)
+    run(["git", "commit", "-m", "legacy archive foundation"], cwd=archive_project)
+    run([
+        sys.executable, str(installed_scaffold), str(archive_project),
+        "--profile", "软件项目", "--roles", "lead,dev,test", "--session-mode", "manual",
+        "--foundation-file", "docs/spec.md",
+    ])
+    run(["git", "add", "."], cwd=archive_project)
+    run(["git", "commit", "-m", "installed 2.0.11 archive fixture"], cwd=archive_project)
+    archive_collab = archive_project / "docs" / "collaboration"
+    archive_task_tool = archive_collab / "scripts" / "agent_team_task.py"
+    archive_temporary_tool = archive_collab / "scripts" / "agent_team_temporary.py"
+    ensure_department_registered(archive_task_tool, "统筹部", "lead-thread")
+    ensure_department_registered(archive_task_tool, "开发部", "dev-thread")
+    archive_task = task_id_from(run([
+        sys.executable, str(archive_task_tool), "enqueue", "--department", "开发部",
+        "--from-department", "统筹部", "--title", "2.0.11 invalid archived temporary",
+        "--node", "legacy archive migration", "--details", "preserve invalid archived truth",
+        "--acceptance-exit", "sidecar receipt verified", "--failure-path", "never rewrite legacy task",
+        "--authorization-state", "user_confirmed", "--authorization-evidence", "fixture archive probe",
+    ]))
+    run([
+        sys.executable, str(archive_temporary_tool), "provision", "--task-id", archive_task,
+        "--parent-department", "开发部", "--executor-id", "legacy-archive-temp",
+        "--display-name", "旧归档探针", "--current-brief", "only app/archive.py",
+        "--client-key", "legacy-archive-client", "--scan-boundary-evidence", "archive scope checked",
+        "--base-revision", "HEAD", "--write-path", "app/archive.py",
+    ])
+    archive_task_path = archive_collab / "tasks" / f"{archive_task}.json"
+    archive_payload = json.loads(archive_task_path.read_text(encoding="utf-8"))
+    rule_digest = archive_payload["temporary_executor"]["rule"]["digest"]
+    run([
+        sys.executable, str(archive_temporary_tool), "session-mark", "--task-id", archive_task,
+        "--state", "active", "--thread-id", "legacy-archive-thread",
+        "--rule-digest", rule_digest, "--evidence", "legacy session created",
+    ])
+    run([
+        sys.executable, str(archive_temporary_tool), "pause", "--task-id", archive_task,
+        "--state", "blocked", "--reason", "prepare invalid archived fixture",
+    ])
+    run([
+        sys.executable, str(archive_temporary_tool), "abandon", "--task-id", archive_task,
+        "--evidence", "fixture user abandoned legacy candidate",
+    ])
+    run([
+        sys.executable, str(archive_temporary_tool), "cleanup", "--task-id", archive_task,
+        "--evidence", "fixture workspace and branch removed",
+    ])
+    valid_legacy_receipt = "host=set_thread_archived thread_id=legacy-archive-thread archived=true"
+    run([
+        sys.executable, str(archive_temporary_tool), "session-mark", "--task-id", archive_task,
+        "--state", "archived", "--evidence", valid_legacy_receipt,
+    ])
+    archive_payload = json.loads(archive_task_path.read_text(encoding="utf-8"))
+    archive_payload["temporary_executor"]["temporary_session"].update(
+        state="archived", evidence="legacy-archive-without-a-verifiable-host-receipt",
+    )
+    archive_task_path.write_text(
+        json.dumps(archive_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    run([
+        sys.executable, str(archive_task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "invalid archived migration probe",
+    ])
+    invalid_archive_bytes = archive_task_path.read_bytes()
+    archive_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(archive_project), "--upgrade-collaboration",
+    ])
+    recovery_path = archive_collab / ".locks" / "legacy-archive-recovery.json"
+    recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+    pending_archive = run([sys.executable, str(archive_temporary_tool), "pending-archives"])
+    check(
+        archive_upgrade.stdout.startswith("UPGRADE_OK |")
+        and archive_task_path.read_bytes() == invalid_archive_bytes
+        and recovery["entries"][archive_task]["state"] == "pending"
+        and "ARCHIVE_THREAD_REQUIRED:legacy-archive-thread" in pending_archive.stdout,
+        "invalid legacy archived truth was rewritten, lost, or falsely certified during migration",
+    )
+    archive_receipt = "host=set_thread_archived thread_id=legacy-archive-thread archived=true"
+    run([
+        sys.executable, str(archive_temporary_tool), "session-mark", "--task-id", archive_task,
+        "--state", "archived", "--evidence", archive_receipt,
+    ])
+    verified_recovery = json.loads(recovery_path.read_text(encoding="utf-8"))
+    check(
+        archive_task_path.read_bytes() == invalid_archive_bytes
+        and verified_recovery["entries"][archive_task]["state"] == "verified"
+        and verified_recovery["entries"][archive_task]["receipt"] == archive_receipt,
+        "host archive receipt did not settle the sidecar without rewriting legacy TASK bytes",
+    )
+    archive_module_spec = importlib.util.spec_from_file_location(
+        "agent_team_legacy_recovery_required_probe", archive_task_tool,
+    )
+    check(archive_module_spec is not None and archive_module_spec.loader is not None,
+          "could not import task runtime for recovery-required probe")
+    archive_module = importlib.util.module_from_spec(archive_module_spec)
+    archive_module_spec.loader.exec_module(archive_module)
+    synthetic_terminal = json.loads(invalid_archive_bytes)
+    synthetic_terminal["execution_state"] = "acknowledged"
+    check(
+        archive_module.legacy_temporary_terminal(
+            synthetic_terminal, {}, archive_recovery_required=False,
+        )
+        and not archive_module.legacy_temporary_terminal(
+            synthetic_terminal, {}, archive_recovery_required=True,
+        ),
+        "a required archive recovery entry could disappear and still be treated as terminal",
+    )
+
+
+def verify_long_thread_actor_identity(root: Path) -> None:
+    project = make_project(root, "long-thread-actor-identity")
+    scaffold(project)
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    long_lead_thread_id = "l" * 300
+    lead_actor = f"统筹部/{long_lead_thread_id}"
+    ensure_lead_registered(task_tool, long_lead_thread_id)
+    long_thread_id = "t" * 300
+    ensure_department_registered(task_tool, "执行部", long_thread_id)
+    run([sys.executable, str(task_tool), "rebuild-index", "--actor", lead_actor])
+    task_id = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--actor", lead_actor,
+        "--department", "执行部", "--from-department", "统筹部",
+        "--title", "300 字符 thread identity probe", "--node", "单节点",
+        "--details", "完成确定性验证", "--acceptance-exit", "用户看到验证结果",
+        "--failure-path", "错误输入被明确拒绝", "--confirmation", "无需额外确认",
+        "--domain-stage", "实现验证", "--authorization-state", "none",
+    ]))
+    actor = f"执行部/{long_thread_id}"
+    claimed = run([
+        sys.executable, str(task_tool), "claim", "--task-id", task_id, "--claimed-by", actor,
+    ])
+    task = json.loads((collab / "tasks" / f"{task_id}.json").read_text(encoding="utf-8"))
+    check(
+        claimed.stdout.startswith("TASK_CLAIMED |")
+        and task["claimed_by"] == actor
+        and task["ownership_history"][-1]["actor"] == actor,
+        "a valid 300-character thread ID could not bind its ordinary TASK owner identity",
+    )
+    frozen = run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", lead_actor,
+        "--evidence", "300 字符统筹 thread 冻结探针",
+    ])
+    frozen_mode = run([sys.executable, str(task_tool), "work-mode"])
+    temporary_tool = collab / "scripts" / "agent_team_temporary.py"
+    temporary_spec = importlib.util.spec_from_file_location(
+        "agent_team_long_actor_temporary_probe", temporary_tool,
+    )
+    check(temporary_spec is not None and temporary_spec.loader is not None,
+          "could not import temporary runtime for long lead actor probe")
+    temporary_module = importlib.util.module_from_spec(temporary_spec)
+    temporary_spec.loader.exec_module(temporary_module)
+    scaffold_spec = importlib.util.spec_from_file_location(
+        "agent_team_long_actor_upgrade_probe", SCAFFOLD,
+    )
+    check(scaffold_spec is not None and scaffold_spec.loader is not None,
+          "could not import scaffold runtime for long lead actor probe")
+    scaffold_module = importlib.util.module_from_spec(scaffold_spec)
+    scaffold_spec.loader.exec_module(scaffold_module)
+    check(
+        frozen.stdout.startswith("WORK_FREEZE_OK |")
+        and "WORK_MODE | frozen" in frozen_mode.stdout
+        and temporary_module.work_mode() == "frozen"
+        and scaffold_module.collaboration_work_mode(collab) == "frozen",
+        "a valid 300-character lead thread poisoned a dispatch-control reader",
+    )
+    unfrozen = run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", lead_actor,
+        "--user-confirmation", "用户确认恢复 300 字符统筹 thread 探针",
+    ])
+    normal_mode = run([sys.executable, str(task_tool), "work-mode"])
+    check(
+        unfrozen.stdout.startswith("WORK_UNFREEZE_OK |")
+        and "WORK_MODE | normal" in normal_mode.stdout
+        and temporary_module.work_mode() == "normal"
+        and scaffold_module.collaboration_work_mode(collab) == "normal",
+        "a valid 300-character lead thread could not complete freeze/read/unfreeze/read",
+    )
+
+
 def main() -> int:
     compile_script(SCAFFOLD)
     verify_repository_contract()
@@ -3827,18 +5689,20 @@ def main() -> int:
         project = make_project(root, "main")
         scaffold(project)
         verify_generated(project)
+        verify_default_minimal_software_team(root)
         verify_foundation_contract(root)
-        verify_product_development_boundary(root)
-        verify_role_policy_upgrade_guard(root)
-        verify_tasks(project)
-        verify_log_and_session(project, root)
-        verify_temporary_executor(root)
-        verify_resume_admission_guards(root)
-        verify_upgrade_and_guards(root)
-        verify_transaction_recovery_attacks(root)
-        verify_task_supersede(root)
-        verify_protocol_149_guards(root)
-    print("VERIFY_OK | scaffold, task, temporary executor, tested-tree promotion, absorption, log, session, upgrade, migration, and path guards passed")
+        verify_protocol_150_core(root)
+        verify_protocol_150_migration(root)
+        verify_protocol_150_atomic_guards(root)
+        verify_long_thread_actor_identity(root)
+        legacy_fixture_root = Path(os.environ.get("AGENT_TEAM_LEGACY_2011_ROOT", LEGACY_2011_FIXTURE))
+        verify_installed_2011_migration(root, legacy_fixture_root)
+    print(
+        "VERIFY_OK | 2.1 single-slice, registered identity, candidate generations, gate freeze, "
+        "freshness, cold index, migration/rollback, unified-lock races, path guards, "
+        "manual host boundary, bounded history, "
+        "scaffold, package, and foundation guards passed"
+    )
     return 0
 
 

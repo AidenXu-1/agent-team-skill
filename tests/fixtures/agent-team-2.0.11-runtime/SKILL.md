@@ -2,7 +2,7 @@
 name: agent-team
 description: Build low-context multi-agent teams with durable handoff, independent review, and user gates. Use when a project needs separate management, execution, and review roles.
 metadata:
-  version: 2.1.0
+  version: 2.0.11
 ---
 
 # Agent Team
@@ -12,12 +12,12 @@ metadata:
 ## 默认热路径
 
 1. 判断交付物、项目结构和最小团队。
-2. 用户确认部门与会话模式后再创建协作层。
-3. 新部门会话首次读 `上岗引导.md` 后只运行一次 `agent_team_task.py onboard-bundle --department ...`；它校验 freshness，原样输出其余热入口和当前 TASK，不生成摘要、不读冷历史，后续不重复。
-4. 全项目同一时刻只有一个活动切片：一个执行 owner、最多两个审核 gate、一个当前候选。任务用唯一 ID 和原子状态工具流转，跨会话消息只发“任务 ID + 短状态”。
-5. 节点完成后提交产出、已验证/未验证和错题自检，以 `TASK_STATE_OK` 为完成收据；只记真实轨迹事件。
-6. 依后文评估工作集；只建议换班，用户明确同意后才创建新会话。
-7. 临时外包是低频旁路。协议 1.5 暂不允许它另开第二 owner TASK；用户主动提出时读取 `references/temporary-executor.md`，说明当前为 P2 宿主适配缺口，不绕过单 owner 闸门。
+2. 让用户确认部门配置与会话模式后再创建协作层。
+3. 每个新部门会话首次按四文档接班：`上岗引导.md → 岗位说明.md → 交接班文档.md → 收件箱.md`；同一会话只在首次开启时读取上岗引导，后续不重复读取。
+4. 手上只做一件；任务用唯一 ID 和原子状态工具流转，收件箱只是自动索引信息，跨会话消息只发“任务 ID + 短状态”。
+5. 节点完成后提交产出、已验证/未验证项和错题自检，以 `TASK_STATE_OK` 作为完成收据；只在真实轨迹事件发生时追加事实日志。
+6. 会话变重时说明原因并主动询问用户是否换班；只有用户明确同意或主动提出“换会话 / 换班”要求后，才创建全新会话接班。
+7. 临时外包是低频旁路：只有用户主动提出时才读取 `references/temporary-executor.md` 并判断；未触发时不加载其流程。
 
 ## 必守边界
 
@@ -47,27 +47,39 @@ metadata:
 
 ## 低上下文规则
 
-* 四文档是固定入口，不生成第五份摘要。`onboard-bundle` 把三个热入口和当前 TASK 合并为一次原样输出；交接班机器区块提供 freshness，区块外文字不能充当 TASK 身份。失败时停止接班，由已登记统筹 actor 运行 `rebuild-index`；`tasks/`/日志保存冷历史。
+* 四文档是新会话的固定入口，不生成第五份接班摘要。交接班文档保存当前摘要，`tasks/` 保存单任务真值，收件箱只显示活动任务索引，日志保存冷事件；四者不复制任务正文。
 
-* 新会话通过 freshness 后，只读取当前切片指向的 TASK JSON。不要展开 blocked、waiting、replacement 或已核收冷历史；doctor 才做全历史机械体检。
+* 新会话首次读完四文档后，只在收件箱或交接班文档指向当前任务时读取对应任务 JSON。处理任务期间不刷新收件箱；完成、阻断或需要选择下一件时再读。
 
 * 默认不读日志、长报告、决策正文、其他部门正文、代码 diff 或完整测试证据；当前任务明确依赖时再读。
 
-* 按任务、权威性和遗漏风险决定读取范围。只检查索引或元数据时，不得声称覆盖正文。
+* 根据任务、文档权威性、遗漏风险和当前可用能力自主决定读取范围，不限制文档数量，不规定正文必须全文或局部读取。只检查索引或元数据时，不得声称已经覆盖正文。
 
 * 只有反复出现、确定、需要一致性的机械操作才写入脚本；语义检索、正文理解和证据取舍由 Agent 负责。
 
-* 长期真值留在项目文件；会话只带当前工作集。
+* 会话出现反复遗忘边界、与项目文件矛盾、偏离当前任务或质量明显下降时，先告诉用户具体原因和继续使用旧会话的风险，再询问是否换班；未获明确同意不自动换会话。
 
 ## 事实日志
 
-日志默认不读，只记可核验轨迹；正式部门和临时外包分区保存，不写完整聊天或事后方法论。
+日志默认不读，只记可核验的轨迹事件。正式部门和临时外包共用部门 ISO 周文件但分区保存；不写完整聊天或事后方法论。
 
 只记录五类改变项目轨迹的事件：`MILESTONE`（可交付节点）、`CHANGE`（已确认的需求或边界变化）、`CORRECTION`（用户纠偏）、`DECISION`（关键方案选择）和 `INCIDENT`（值得倒查的失败或风险）。
 
-普通回复、工具调用、重复确认和不改变边界的调整不记。变化/纠偏/决策立即记录，里程碑在节点完成时记录，事故只记影响判断或进度的事件。
+普通回复、工具调用、重复确认、临时命令失败和不改变边界的措辞调整不记。`CHANGE`、`CORRECTION`、`DECISION` 发生后立即记录；`MILESTONE` 在节点完成时记录；`INCIDENT` 只记影响项目判断或进度的事件。
 
-写日志使用生成的 `agent_team_log.py append`，不先读取日志。脚本负责时间、事件 ID、周文件和原子追加，只返短收据。项目级事件由统筹部记，局部事件由发生部门记，其他部门只引用 ID；可复发的 `CORRECTION` 另写错题条目。
+写日志使用生成的确定性工具，不先读取日志：
+
+```bash
+python3 docs/collaboration/scripts/agent_team_log.py append \
+  --department "开发部" --task-id TASK-YYYYMMDD-XXXXXX \
+  --type CORRECTION --initiator user \
+  --fact "Agent 将内测包误写为可真实发码，用户要求区分两者" \
+  --trigger "用户明确纠偏" --impact "README 与后续派单口径" \
+  --result "已恢复预验证/内测/production 边界" \
+  --pointer "docs/spec.md"
+```
+
+脚本负责时间、事件 ID、周文件和原子追加，只返短收据。项目级事件由统筹部记，部门局部事件由发生部门记，其他部门只引用 ID；可复发的 `CORRECTION` 另写错题条目。
 
 临时外包写日志时还要传 `--executor-type temporary --executor-id ... --parent-department ...`。工具只允许它写入父部门的临时板块。正式吸收后，父部门只在正式板块增加一条引用 TASK、delivery 和正式证据的 MILESTONE，不复制外包原始日志。
 
@@ -115,39 +127,47 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 --foundation-resources "..." --foundation-risks "..."
 ```
 
-脚本生成协议、路由、四文档、部门/会话、切片/冻结、TASK、报告、日志和四个运行脚本。缺 heartbeat、lease、查询、等待、恢复或归档适配器即为 `manual-degraded`：不轮询、不承诺无人值守、不声称 Token 下降。
+脚本生成协议版本、路由表、四文档、部门表、会话启动状态、稳定路径的任务 JSON、共享报告模板和按需创建的日志目录，以及确定性的 `agent_team_log.py`、`agent_team_task.py`、`agent_team_session.py` 和 `agent_team_temporary.py`。脚本拒绝符号链接越界、并发覆盖、重复角色、缺三层和未确认会话模式；地基内容质量仍由调用脚本前的 Agent 负责。
 
 ## 任务事务
 
-* 派单、领取、阻断、等用户、恢复、候选绑定、gate verdict、完成和核收只通过 `agent_team_task.py`。普通 TASK 的 `claim / block / wait / resume / complete` 必须匹配所属部门当前已登记会话；换班后先 `rebind-owner`，doctor 会拒绝身份漂移。
+* 派单、领取、阻断、等用户、恢复、完成和核收只通过生成的 `agent_team_task.py`。收件箱禁止手工编辑。
 
 * 执行状态只用 `queued / claimed / blocked / waiting_input / completed / acknowledged`；业务阶段写入 `domain_stage`；用户授权记录写入 `authorization_state` 和证据指针。`user_required / user_rejected` 禁止领取。
 
-* `enqueue` 默认创建切片 owner，并用 `--required-gate test|security|...` 声明零到两个 gate。存在活动切片时拒绝第二 owner；固定候选后，gate 用同一 `--slice-id` 和 `--task-kind gate --gate-type ...` 创建，第三 gate 被拒绝。
+* 同一部门同时只有一条 `claimed`；`blocked / waiting_input` 不妨碍领取独立任务。恢复旧任务前必须先结束当前 `claimed`。
 
-* owner 用 `bind-candidate` 固定项目内候选 manifest 及 SHA-256。candidate ID 同时进入不随 100 条冷索引裁剪的永久账本，旧 ID 不能复用。返工绑定下一代 candidate ID，不新增 replacement owner TASK。gate 报告必须绑定当前 candidate ID 和报告 SHA-256；覆盖 final 报告后完成与 doctor 都失败。FAIL 追加在同一 gate TASK，同一 gate 跨两代连续 FAIL 会原子冻结。
+* 完成时校验本地产物真实存在且位于项目内；外部产物必须显式标记。任务完成必须提供产出、已验证、未验证和错题自检，收到 `TASK_STATE_OK` 后才能唤醒统筹部。
 
-* 审核报告必须位于本部门 `报告/`，带任务一致的 YAML、`status=final`、`decision=pass|fail`、`candidate_id` 和非占位摘要。只有当前候选的全部 gate PASS、用户出口为 `verified / not_applicable` 后，gate 和 owner 才能依次完成、核收并进入冷历史。
+* 审核层任务必须提交本部门 `报告/` 下的审核报告；报告必须带与任务一致的 YAML 元数据、`status=final`、`decision=pass|fail` 和非占位摘要，并同时列为本地产物。草稿或“待定”结论不能完成。
 
 * 统筹部只能核收 `completed` 任务；`acknowledged-by` 必须精确匹配会话状态中当前已登记的 `统筹部/会话ID`，用于防止普通部门误操作，核收后状态为 `acknowledged`。
 
-* 用户冻结、任务堆积、上下文/存储压力、同一 gate 跨两代连续 FAIL 或无用户出口时，立即 `freeze-new-work`；冻结、TASK、换班、增删部门和升级共用项目控制锁。冻结只准安全停下、记录 verdict/用户出口/指标、完成、核收、清账、交接、换班和保全证据；返工、派单、恢复、扩编仍被拒绝，仅凭用户证据解冻。
+* 正常模式只推进一个端到端切片：一个 owner，证据就绪再开安全/测试 gate；同范围返工原 TASK，不自动开下一切片。
 
-* 1.5 返工只换候选，不用 `supersede`；拒绝/放弃时先 block/wait，再 `resolve`。升级后的普通 1.4 TASK 只能清账、核收或 `--include-cold` 审计，禁止重新 claim/resume/complete；legacy temporary 也只能在 frozen、无活动切片时走专用恢复与收口白名单，完全终态前不得解冻或创建 1.5 owner。
+* 用户冻结、任务堆积、上下文/存储压力、同一终端闸门连续失败两次或无用户出口时，立即 `freeze-new-work`；只准在办收口、清账、核收、交接、换班和保全证据。仅凭用户证据解冻。
 
-* `enqueue / authorize / resolve / ack / record-user-exit / record-metrics / set-notification` 的 actor 必须匹配已登记统筹会话。actor 是防误操作和审计绑定，不是操作系统级认证。
+* 普通任务退出时保留原文和执行状态。后续主链取代用 `supersede`；用户拒绝或放弃用 `resolve`。`rejected_by_user` 会同步记录授权拒绝证据；`claimed` 先 `block` 再收口。
 
-* 测试遵守前述用户影响门；有界面任务先冒烟和安全探针，体验确认后回归；无界面任务按验收出口验证。
+* `enqueue / authorize / supersede / resolve / ack / set-notification` 的 actor 必须匹配已登记统筹会话；这只是防误操作的审计线索，不构成安全认证。
 
-## 用户闸门与汇报
+* 测试分两段：体验前做独立冒烟和安全探针；体验方向确认后做完整回归。无界面任务直接按验收出口完整验证。
 
-统筹不穷举场景，按用户意图、对当前 TASK 的影响，以及是否需用户独有信息、亲自体验/判断或授权分流：需则用户出口保持 `pending` 并停下；无依赖的纯代码/内部检查过自检和所需 gate 后记为 `not_applicable`，同一切片内继续，不开新切片或跳审核。临时提问/状态追问直接答并保留当前 TASK；同范围反馈续做，含义或实质影响不清再问。
+## 向用户汇报
 
-正式汇报用于体验、信息、选择、风险或阶段收口，稳定保留`结果`和`需要你做什么`，真实风险再写`还需注意`；未验出口写“当前不可确认可用”，体验给入口/操作顺序/预期结果/重点判断/已知限制。普通问答自然回复，不为凑格式制造空话；默认不展开 TASK ID、状态词、哈希、命令、日志或协议。
+部门仍向统筹部交“产出、已验证/未验证、`TASK_STATE_OK`、错题自检”四件套；统筹部只在需要拍板、需要体验、发生重要变化/风险或节点完成时主动找用户。默认用非程序员能看懂的三段短报：
+
+1. `结果`：说明是否完成、能否使用；未验真实出口时写“当前不可确认可用”，局部 PASS 不能代替。
+2. `需要你做什么`：明确写“无需操作 / 需要判断 / 需要体验”。需要体验时给入口、操作顺序、预期结果、重点判断和已知限制。
+3. `还需注意`：只写会影响用户判断的未验证项、风险或下一汇报点；没有就省略。
+
+默认不向用户展开 TASK ID、内部状态词、哈希、命令、测试日志或协议版本；只在排障、发布核验或用户追问时补充。错题自检有实际风险时翻译进“还需注意”，无命中时不单独展示。
 
 ## 单 TASK 临时外包（按需）
 
-只有用户主动提出临时外包、并行外包或 TASK 级临时会话时才读取参考文件。只维护升级前已 provision 的 1.4 legacy 恢复与收口，禁止恢复开发链；缺收据的旧 archived 记录由派生账本留证，不改写原 TASK。1.5 新建会返回 `TEMPORARY_EXECUTOR_P2_REQUIRED`，因宿主缺少第二执行者 lease、恢复和归档适配器。不得用普通 enqueue 或隐式子会话绕过。
+只有用户主动提出临时外包、并行外包或 TASK 级临时会话时，才完整读取 `references/temporary-executor.md`，再做预检、创建或任何生命周期操作。未触发时不要读取该文件，也不要主动扩容。
+
+用户只问“能不能并行”时只判断，通过后仍需确认；“如果可以就帮我开”才同时授权创建。统一模型是 `temporary_executor + parent_department + 单一 TASK`；当前只完整支持开发外包，其他父部门只做通用预检。机械操作只用 `agent_team_temporary.py`，不能跳过候选绑定、正式验证、吸收、reconcile 或会话归档收据。
 
 ## 会话模式与换班
 
@@ -157,15 +177,11 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 自动模式的每次外部调用后立即用 `agent_team_session.py` 记录 `created / onboarded / registered / failed`；重试先读状态，不重复创建已成功会话。
 
-* 项目文件存长期真值，会话只留当前工作集。统筹会话按项目阶段，执行会话按端到端切片；同一切片返工续用原会话，切片收口且下一项明显不同才建议换班。审核不继承执行长上下文，同一候选的审核复测可续用原会话。
+* 会话变重只触发“换班建议”：说明已观察到的问题、换班的好处和当前在办事项，询问用户是否执行。用户未回复或未明确同意时，保留当前会话。
 
-* 旧候选或身份串入、无关材料重复读取、压缩后很快再失焦是强信号。有可比宿主数据时，只比较同模型/推理/Skill/插件/附件下的输入、缓存输入、输出和工具调用；否则写“无法测量”，不用轮数、文件字节、响应时长或固定倍数阈值判断 Token。
+* 用户说“换会话 / 切换会话 / 换班”即授权同部门换班：旧会话先更新交接与必要事实日志，再创建同项目新会话，发送四文档路径。新会话确认接班并登记新 ID 后，最后归档旧会话。
 
-* 只建议换班并说明证据、收益和在办事项；用户未明确同意时不创建、登记或归档。
-
-* 用户说“换会话 / 切换会话 / 换班”即授权同部门换班：旧会话更新交接和必要日志后创建新会话，发送四文档路径；新会话接班并登记新 ID 后才归档旧会话。
-
-* `begin-switch` 后保留新旧 ID 到取得精确归档回执。新 ID 未产生可 `restore-old`；已登记则须先归档新会话并绑定回执。旧会话归档失败时保持换班真值并提醒，不覆盖 thread ID。正式与临时 ID 都须是结构化回执可用的单一 token：无空白、不以 `=` 开头、不超过 300 字符；归档收据存 evidence，通知设置不得覆盖。
+* `begin-switch` 后新旧 ID 必须同时保留到其中一个会话取得精确归档回执。新 ID 尚未产生时可直接 `restore-old`；新 ID 已登记时，只有先归档新会话并把该 ID 绑定到回执，才能恢复旧会话。旧会话归档失败时保持当前换班真值并提醒用户，不覆盖任一 thread ID。正式与临时 thread ID 都必须是可放入结构化回执的单一 token：不含空白、不以 `=` 开头且不超过 300 字符；换班收口后的归档收据保存在 evidence，修改通知模式不能覆盖它。
 
 * 不使用会复制旧历史的 fork。创建、发送、接班、登记或归档失败时保留旧会话。
 
@@ -177,7 +193,7 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 增加部门：`--add-roles "<ids>"` 同一事务更新真值与派生表；活跃部门重复添加保持幂等，已停用部门会复用原身份重新启用。
 
-* 当前运行协议为 `1.5.0`。跨协议升级先由统筹冻结，再用 `--upgrade-collaboration`；1.4 TASK 保持原字节并作为冷历史。升级生成带 operation/source/target 身份的回滚清单；只有无活动切片且尚未创建 1.5 TASK 时，才可 `--rollback-collaboration <manifest>`。
+* 当前运行协议为 `1.4.15`。旧层用 `--upgrade-collaboration` 显式升级；旧收件箱有正文或受管岗位说明漂移时停止。升级先写回滚标记；确认过的项目职责用只追加 JSON 和 `--role-policy-overlay-file` 迁移。
 
 * 停用部门：收口任务；已登记会话取得真实归档回执后先运行 `agent_team_session.py retire`，再运行 `--deactivate-roles ... --deactivation-evidence ...`。保留历史身份并维持三层结构。
 
@@ -185,4 +201,4 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 通知能力只在上岗/接班时登记一次；后续按部门表的自动/人工模式执行。
 
-* 修改本 Skill 后运行项目验证器、`quick_validate.py`、Python 编译和 diff 检查。同步全局安装、发布或逐项目升级都是独立授权动作；源码候选 PASS 不能冒充已安装、已发布或 Lulu 可用。
+* 修改本 Skill 后运行项目验证器、`quick_validate.py` 和 Python 编译检查；再同步并验证全局安装目录只包含 `SKILL.md`、`agents/openai.yaml`、`references/temporary-executor.md`、`scripts/scaffold_team.py` 和 `scripts/temporary_executor_runtime.py`。

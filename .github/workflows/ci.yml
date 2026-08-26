@@ -6,6 +6,24 @@ permissions:
 on:
   push:
   pull_request:
+  workflow_dispatch:
+    inputs:
+      release_version:
+        description: "Exact reviewed Skill version, for example 2.1.0"
+        required: true
+        type: string
+      reviewed_commit:
+        description: "Exact independently reviewed commit SHA"
+        required: true
+        type: string
+      reviewed_runtime_sha256:
+        description: "Exact independently reviewed runtime_set_sha256"
+        required: true
+        type: string
+      confirm_publish:
+        description: "Type PUBLISH v<version> to authorize a public Release"
+        required: true
+        type: string
 
 jobs:
   verify:
@@ -17,6 +35,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - name: Setup Python
         uses: actions/setup-python@v6
@@ -68,11 +88,12 @@ jobs:
           cp scripts/temporary_executor_runtime.py "${install_root}/scripts/temporary_executor_runtime.py"
           python scripts/verify_agent_team.py --check-installed-copy "${install_root}"
 
-  publish_latest:
-    name: Publish latest verified package
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  publish_release:
+    name: Publish explicitly authorized reviewed release
+    if: github.event_name == 'workflow_dispatch'
     needs: verify
     runs-on: ubuntu-latest
+    environment: agent-team-public-release
     permissions:
       contents: write
     steps:
@@ -89,90 +110,22 @@ jobs:
       - name: Install validation dependencies
         run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
 
-      - name: Check runtime changes since Latest
-        id: runtime
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Require reproducible Agent Team 2.0.11 migration fixture
         run: |
-          set -euo pipefail
-          latest_dir="${RUNNER_TEMP}/agent-team-latest"
-          latest_json="${latest_dir}/latest.json"
-          mkdir -p "${latest_dir}"
+          fixture="tests/fixtures/agent-team-2.0.11-runtime"
+          test -f "${fixture}/fixture-manifest.json"
+          test -f "${fixture}/SKILL.md"
+          test -f "${fixture}/agents/openai.yaml"
+          test -f "${fixture}/references/temporary-executor.md"
+          test -f "${fixture}/scripts/scaffold_team.py"
+          test -f "${fixture}/scripts/temporary_executor_runtime.py"
+          AGENT_TEAM_LEGACY_2011_ROOT="${fixture}" python scripts/verify_agent_team.py
 
-          # A query failure is not proof that a release is absent. Fail closed so a
-          # temporary API outage cannot create a duplicate public Release.
-          gh release view --repo "${GITHUB_REPOSITORY}" --json tagName,assets > "${latest_json}"
-          latest_tag="$(jq -r .tagName "${latest_json}")"
-
-          if ! git diff --quiet "${latest_tag}" "${GITHUB_SHA}" -- \
-              SKILL.md \
-              agents/openai.yaml \
-              references/temporary-executor.md \
-              scripts/scaffold_team.py \
-              scripts/temporary_executor_runtime.py; then
-            printf 'changed=true\n' >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          zip_name="agent-team-2.0-pure.zip"
-          checksum_name="agent-team-2.0-pure.zip.sha256"
-          if ! jq -e --arg zip "${zip_name}" --arg checksum "${checksum_name}" \
-              '([.assets[].name] | index($zip)) != null and ([.assets[].name] | index($checksum)) != null' \
-              "${latest_json}" >/dev/null; then
-            echo "Latest release is incomplete; publish a repaired verified package."
-            printf 'changed=true\n' >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          gh release download "${latest_tag}" \
-            --repo "${GITHUB_REPOSITORY}" \
-            --pattern "${zip_name}" \
-            --pattern "${checksum_name}" \
-            --dir "${latest_dir}"
-
-          set +e
-          python scripts/verify_agent_team.py --check-release-assets \
-            "${latest_json}" \
-            "${latest_dir}/${zip_name}" \
-            "${latest_dir}/${checksum_name}" \
-            "${GITHUB_WORKSPACE}"
-          asset_status=$?
-          set -e
-          if [[ "${asset_status}" -eq 3 ]]; then
-            echo "Latest release assets are invalid; publish a repaired verified package."
-            printf 'changed=true\n' >> "${GITHUB_OUTPUT}"
-          elif [[ "${asset_status}" -ne 0 ]]; then
-            echo "Latest release verification could not complete safely." >&2
-            exit "${asset_status}"
-          else
-            printf 'changed=false\n' >> "${GITHUB_OUTPUT}"
-            echo "Runtime bundle and verified Latest assets are unchanged; skip duplicate Release."
-          fi
-
-      - name: Build and verify pure runtime package
-        if: steps.runtime.outputs.changed == 'true'
-        id: package
+      - name: Verify explicit release authorization and review binding
+        id: release
         shell: bash
         run: |
           set -euo pipefail
-          release_dir="${RUNNER_TEMP}/agent-team-release"
-          extract_dir="${RUNNER_TEMP}/agent-team-extracted"
-          mkdir -p "${release_dir}" "${extract_dir}"
-          git archive --format=zip \
-            --output="${release_dir}/agent-team-2.0-pure.zip" \
-            "${GITHUB_SHA}" \
-            SKILL.md \
-            agents/openai.yaml \
-            references/temporary-executor.md \
-            scripts/scaffold_team.py \
-            scripts/temporary_executor_runtime.py
-          (
-            cd "${release_dir}"
-            sha256sum agent-team-2.0-pure.zip > agent-team-2.0-pure.zip.sha256
-          )
-          unzip -q "${release_dir}/agent-team-2.0-pure.zip" -d "${extract_dir}"
-          python scripts/verify_agent_team.py --check-installed-copy "${extract_dir}"
           version="$(python - <<'PY'
           import re
           from pathlib import Path
@@ -186,87 +139,128 @@ jobs:
           print(data["metadata"]["version"])
           PY
           )"
-          printf 'release_dir=%s\n' "${release_dir}" >> "${GITHUB_OUTPUT}"
+          manifest_version="$(jq -r .source_version candidate-manifest.json)"
+          runtime_sha="$(jq -r .runtime_set_sha256 candidate-manifest.json)"
+          candidate_status="$(jq -r .status candidate-manifest.json)"
+          [[ "${{ inputs.release_version }}" == "${version}" ]]
+          [[ "${manifest_version}" == "${version}" ]]
+          [[ "${{ inputs.reviewed_commit }}" == "${GITHUB_SHA}" ]]
+          [[ "${{ inputs.reviewed_runtime_sha256 }}" == "${runtime_sha}" ]]
+          [[ "${{ inputs.confirm_publish }}" == "PUBLISH v${version}" ]]
+          [[ "${candidate_status}" == "reviewed-release-candidate" ]]
+          git diff --quiet
+          tag="v${version}"
+          if git rev-parse --verify "refs/tags/${tag}" >/dev/null 2>&1; then
+            echo "Release tag already exists and is immutable: ${tag}" >&2
+            exit 1
+          fi
           printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
+          printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
+          printf 'zip_name=agent-team-%s-pure.zip\n' "${version}" >> "${GITHUB_OUTPUT}"
 
-      - name: Publish current main as Latest
-        if: steps.runtime.outputs.changed == 'true'
+      - name: Build and verify pure runtime package
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_dir="${RUNNER_TEMP}/agent-team-release"
+          extract_dir="${RUNNER_TEMP}/agent-team-extracted"
+          mkdir -p "${release_dir}" "${extract_dir}"
+          zip_name="${{ steps.release.outputs.zip_name }}"
+          git archive --format=zip \
+            --output="${release_dir}/${zip_name}" \
+            "${GITHUB_SHA}" \
+            SKILL.md \
+            agents/openai.yaml \
+            references/temporary-executor.md \
+            scripts/scaffold_team.py \
+            scripts/temporary_executor_runtime.py
+          (
+            cd "${release_dir}"
+            sha256sum "${zip_name}" > "${zip_name}.sha256"
+          )
+          unzip -q "${release_dir}/${zip_name}" -d "${extract_dir}"
+          python scripts/verify_agent_team.py --check-installed-copy "${extract_dir}"
+          fresh_clone="${RUNNER_TEMP}/agent-team-fresh-clone"
+          git clone --no-checkout "https://github.com/${GITHUB_REPOSITORY}.git" "${fresh_clone}"
+          git -C "${fresh_clone}" checkout --detach "${GITHUB_SHA}"
+          git -C "${fresh_clone}" tag "${{ steps.release.outputs.tag }}" "${GITHUB_SHA}"
+          fresh_install="${RUNNER_TEMP}/agent-team-fresh-installed"
+          mkdir -p "${fresh_install}/agents" "${fresh_install}/references" "${fresh_install}/scripts"
+          cp "${fresh_clone}/SKILL.md" "${fresh_install}/SKILL.md"
+          cp "${fresh_clone}/agents/openai.yaml" "${fresh_install}/agents/openai.yaml"
+          cp "${fresh_clone}/references/temporary-executor.md" "${fresh_install}/references/temporary-executor.md"
+          cp "${fresh_clone}/scripts/scaffold_team.py" "${fresh_install}/scripts/scaffold_team.py"
+          cp "${fresh_clone}/scripts/temporary_executor_runtime.py" "${fresh_install}/scripts/temporary_executor_runtime.py"
+          python scripts/verify_agent_team.py --check-installed-copy "${fresh_install}"
+          printf 'release_dir=%s\n' "${release_dir}" >> "${GITHUB_OUTPUT}"
+          printf 'fresh_clone=%s\n' "${fresh_clone}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload reviewed immutable draft and verify before publication
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_DIR: ${{ steps.package.outputs.release_dir }}
-          VERSION: ${{ steps.package.outputs.version }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+          ZIP_NAME: ${{ steps.release.outputs.zip_name }}
+          FRESH_CLONE: ${{ steps.package.outputs.fresh_clone }}
         run: |
           set -euo pipefail
           repo="${GITHUB_REPOSITORY}"
-          short_sha="${GITHUB_SHA:0:12}"
-          tag="build-${short_sha}"
-          remote_main="$(gh api "repos/${repo}/git/ref/heads/main" --jq .object.sha)"
-          if [[ "${remote_main}" != "${GITHUB_SHA}" ]]; then
-            echo "Skip obsolete run: remote main moved to ${remote_main}"
-            exit 0
-          fi
-
-          zip_digest="sha256:$(sha256sum "${RELEASE_DIR}/agent-team-2.0-pure.zip" | awk '{print $1}')"
-          checksum_digest="sha256:$(sha256sum "${RELEASE_DIR}/agent-team-2.0-pure.zip.sha256" | awk '{print $1}')"
-          existing_release="$(gh release view "${tag}" --repo "${repo}" --json isDraft --jq .isDraft 2>/dev/null || true)"
-
-          if [[ "${existing_release}" == "true" ]]; then
-            for attempt in {1..20}; do
-              sleep 3
-              existing_release="$(gh release view "${tag}" --repo "${repo}" --json isDraft --jq .isDraft 2>/dev/null || true)"
-              [[ "${existing_release}" == "false" ]] && break
-            done
-          fi
-
-          if [[ -z "${existing_release}" ]]; then
-            notes_file="${RUNNER_TEMP}/agent-team-release-notes.md"
-            printf '%s\n\n%s\n\n%s\n' \
-              "Agent Team ${VERSION} 的最新验证构建。" \
-              "源码提交：${GITHUB_SHA}" \
-              "该纯净包仅在 main 分支的完整 CI 通过后发布。" \
-              > "${notes_file}"
-
-            remote_main="$(gh api "repos/${repo}/git/ref/heads/main" --jq .object.sha)"
-            if [[ "${remote_main}" != "${GITHUB_SHA}" ]]; then
-              echo "Skip obsolete run: remote main moved to ${remote_main}"
-              exit 0
-            fi
-
-            if ! gh release create "${tag}" \
-                "${RELEASE_DIR}/agent-team-2.0-pure.zip" \
-                "${RELEASE_DIR}/agent-team-2.0-pure.zip.sha256" \
-                --repo "${repo}" \
-                --target "${GITHUB_SHA}" \
-                --title "Agent Team ${VERSION} · ${short_sha}" \
-                --notes-file "${notes_file}" \
-                --latest; then
-              echo "Release creation raced with another run; waiting for the same build tag"
-              for attempt in {1..20}; do
-                sleep 3
-                existing_release="$(gh release view "${tag}" --repo "${repo}" --json isDraft --jq .isDraft 2>/dev/null || true)"
-                [[ "${existing_release}" == "false" ]] && break
-              done
-              if [[ "${existing_release}" != "false" ]]; then
-                echo "The competing build release did not become public" >&2
-                exit 1
-              fi
-            fi
-          elif [[ "${existing_release}" == "true" ]]; then
-            echo "Existing build release is still a draft; refusing to publish it automatically" >&2
-            exit 1
-          else
-            remote_main="$(gh api "repos/${repo}/git/ref/heads/main" --jq .object.sha)"
-            if [[ "${remote_main}" != "${GITHUB_SHA}" ]]; then
-              echo "Skip obsolete run: remote main moved to ${remote_main}"
-              exit 0
-            fi
-            gh release edit "${tag}" --repo "${repo}" --latest
-          fi
-
-          published_tag="$(gh release view --repo "${repo}" --json tagName --jq .tagName)"
-          published_zip_digest="$(gh release view "${tag}" --repo "${repo}" --json assets --jq '.assets[] | select(.name == "agent-team-2.0-pure.zip") | .digest')"
-          published_checksum_digest="$(gh release view "${tag}" --repo "${repo}" --json assets --jq '.assets[] | select(.name == "agent-team-2.0-pure.zip.sha256") | .digest')"
-          [[ "${published_tag}" == "${tag}" ]]
-          [[ "${published_zip_digest}" == "${zip_digest}" ]]
-          [[ "${published_checksum_digest}" == "${checksum_digest}" ]]
+          zip_digest="sha256:$(sha256sum "${RELEASE_DIR}/${ZIP_NAME}" | awk '{print $1}')"
+          checksum_digest="sha256:$(sha256sum "${RELEASE_DIR}/${ZIP_NAME}.sha256" | awk '{print $1}')"
+          notes_file="${RUNNER_TEMP}/agent-team-release-notes.md"
+          printf '%s\n\n%s\n\n%s\n' \
+            "Agent Team ${VERSION} 的独立审查正式版本。" \
+            "源码提交：${GITHUB_SHA}" \
+            "运行集 SHA-256：${{ inputs.reviewed_runtime_sha256 }}" \
+            > "${notes_file}"
+          gh release create "${TAG}" \
+            "${RELEASE_DIR}/${ZIP_NAME}" \
+            "${RELEASE_DIR}/${ZIP_NAME}.sha256" \
+            --repo "${repo}" \
+            --target "${GITHUB_SHA}" \
+            --title "Agent Team ${VERSION}" \
+            --notes-file "${notes_file}" \
+            --draft
+          draft_target="$(gh api "repos/${repo}/releases/tags/${TAG}" --jq .target_commitish)"
+          [[ "${draft_target}" == "${GITHUB_SHA}" ]]
+          metadata="${RUNNER_TEMP}/agent-team-draft-release.json"
+          gh release view "${TAG}" --repo "${repo}" --json tagName,assets > "${metadata}"
+          python scripts/verify_agent_team.py --check-release-assets \
+            "${metadata}" \
+            "${RELEASE_DIR}/${ZIP_NAME}" \
+            "${RELEASE_DIR}/${ZIP_NAME}.sha256" \
+            "${FRESH_CLONE}"
+          draft_zip_digest="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq --arg name "${ZIP_NAME}" '.assets[] | select(.name == $name) | .digest')"
+          draft_checksum_digest="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq --arg name "${ZIP_NAME}.sha256" '.assets[] | select(.name == $name) | .digest')"
+          [[ "${draft_zip_digest}" == "${zip_digest}" ]]
+          [[ "${draft_checksum_digest}" == "${checksum_digest}" ]]
+          remote_tag_sha="$(gh api "repos/${repo}/git/ref/tags/${TAG}" --jq .object.sha)"
+          [[ "${remote_tag_sha}" == "${GITHUB_SHA}" ]]
+          gh release edit "${TAG}" --repo "${repo}" --draft=false --latest
+          published_tag_sha="$(gh api "repos/${repo}/git/ref/tags/${TAG}" --jq .object.sha)"
+          [[ "${published_tag_sha}" == "${GITHUB_SHA}" ]]
+          published_tag="$(gh release view "${TAG}" --repo "${repo}" --json tagName --jq .tagName)"
+          [[ "${published_tag}" == "${TAG}" ]]
+          latest_tag="$(gh api "repos/${repo}/releases/latest" --jq .tag_name)"
+          [[ "${latest_tag}" == "${TAG}" ]]
+          published_dir="${RUNNER_TEMP}/agent-team-published"
+          published_install="${RUNNER_TEMP}/agent-team-published-install"
+          mkdir -p "${published_dir}" "${published_install}"
+          gh release download "${TAG}" \
+            --repo "${repo}" \
+            --dir "${published_dir}" \
+            --pattern "${ZIP_NAME}" \
+            --pattern "${ZIP_NAME}.sha256" \
+            --clobber
+          (
+            cd "${published_dir}"
+            sha256sum -c "${ZIP_NAME}.sha256"
+          )
+          reviewed_zip_sha="$(sha256sum "${RELEASE_DIR}/${ZIP_NAME}" | awk '{print $1}')"
+          published_zip_sha="$(sha256sum "${published_dir}/${ZIP_NAME}" | awk '{print $1}')"
+          [[ "${published_zip_sha}" == "${reviewed_zip_sha}" ]]
+          unzip -q "${published_dir}/${ZIP_NAME}" -d "${published_install}"
+          python scripts/verify_agent_team.py --check-installed-copy "${published_install}"

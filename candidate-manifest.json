@@ -1,0 +1,19 @@
+{
+  "base_commit": "13c996ebb024cc55880958d8a4703d1eabf94570",
+  "candidate_id": "AT-2.1.0-RC-EA02DF33BF67",
+  "generated_on": "2026-08-26",
+  "protocol_version": "1.5.0",
+  "public_version_at_review": "2.0.6",
+  "runtime_files": {
+    "SKILL.md": "a4eea532d1155aabf5ce9d04d5c164dc64d839b99e1a7c81255e380d1081dbcc",
+    "agents/openai.yaml": "f80aae22d930f807492a91b65c287daf5b80997b7d3d4fbb45b6d8008e0b4676",
+    "references/temporary-executor.md": "5b3c3ec4c0c66851f61852a4483c38f4ad067831b72170aa6820b0c67d65012e",
+    "scripts/scaffold_team.py": "aaa4ae14211849604566738fdccf9b096a099851f483f6cfdf5b26f186db5680",
+    "scripts/temporary_executor_runtime.py": "aa86de22bad3a5d9d8c031d458ae3c0137061c17c8a6fcbb5bed077d4a10da42"
+  },
+  "runtime_set_sha256": "ea02df33bf675562ba89b6cc8d34d1a5da32f3754ad48153427bbf5aafd66e98",
+  "runtime_set_sha256_algorithm": "sha256 of ordered `shasum -a 256` output for runtime_files",
+  "schema_version": 1,
+  "source_version": "2.1.0",
+  "status": "reviewed-release-candidate"
+}

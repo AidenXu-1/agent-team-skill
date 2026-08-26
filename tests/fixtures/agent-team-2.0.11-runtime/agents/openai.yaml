@@ -1,0 +1,4 @@
+interface:
+  display_name: "Agent Team"
+  short_description: "搭建低上下文多会话团队、持久交接、原子任务与独立审核"
+  default_prompt: "使用 $agent-team 为当前项目诊断最小必要团队，搭建四文档接班、唯一任务真值和事实日志协作层；临时外包仅在我主动提出时按需加载。"
