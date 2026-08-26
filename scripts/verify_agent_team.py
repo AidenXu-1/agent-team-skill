@@ -739,6 +739,9 @@ def verify_repository_contract() -> None:
         and '--target "${GITHUB_SHA}" \\' in workflow
         and 'gh release upload "${TAG}" \\' in workflow
         and '--clobber' in workflow
+        and '| jq -r --arg zip' in workflow
+        and '| jq -r --arg name' in workflow
+        and '--jq --arg' not in workflow
         and "Tag appeared before publication" in workflow
         and "remote_tag_sha" not in workflow
         and 'releases/tags/${TAG}" --jq .target_commitish' not in workflow
