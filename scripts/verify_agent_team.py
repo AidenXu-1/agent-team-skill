@@ -696,8 +696,9 @@ def verify_repository_contract() -> None:
           "CI no longer verifies both Python 3.9 and 3.11")
     check(
         workflow.count("uses: actions/checkout@v7") == 2
-        and workflow.count("uses: actions/setup-python@v6") == 2,
-        "CI uses a deprecated GitHub Actions JavaScript runtime",
+        and workflow.count("uses: actions/setup-python@v6") == 2
+        and workflow.count("fetch-depth: 0") == 2,
+        "CI uses a deprecated action runtime or shallow history that breaks candidate ancestry",
     )
     check(
         "Publish explicitly authorized reviewed release" in workflow
