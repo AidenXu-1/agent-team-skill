@@ -236,7 +236,7 @@ jobs:
           draft_target="$(jq -r .targetCommitish <<<"${existing_release}")"
           [[ "${draft_is_draft}" == "true" ]]
           if [[ "${reused_release}" == "true" ]]; then
-            unexpected_asset_count="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq --arg zip "${ZIP_NAME}" --arg checksum "${ZIP_NAME}.sha256" '[.assets[] | select(.name != $zip and .name != $checksum)] | length')"
+            unexpected_asset_count="$(gh release view "${TAG}" --repo "${repo}" --json assets | jq -r --arg zip "${ZIP_NAME}" --arg checksum "${ZIP_NAME}.sha256" '[.assets[] | select(.name != $zip and .name != $checksum)] | length')"
             [[ "${unexpected_asset_count}" == "0" ]]
             if [[ "${draft_target}" != "${GITHUB_SHA}" ]]; then
               if ! git diff --quiet "${draft_target}" "${GITHUB_SHA}" -- \
@@ -274,8 +274,8 @@ jobs:
             "${RELEASE_DIR}/${ZIP_NAME}" \
             "${RELEASE_DIR}/${ZIP_NAME}.sha256" \
             "${FRESH_CLONE}"
-          draft_zip_digest="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq --arg name "${ZIP_NAME}" '.assets[] | select(.name == $name) | .digest')"
-          draft_checksum_digest="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq --arg name "${ZIP_NAME}.sha256" '.assets[] | select(.name == $name) | .digest')"
+          draft_zip_digest="$(gh release view "${TAG}" --repo "${repo}" --json assets | jq -r --arg name "${ZIP_NAME}" '.assets[] | select(.name == $name) | .digest')"
+          draft_checksum_digest="$(gh release view "${TAG}" --repo "${repo}" --json assets | jq -r --arg name "${ZIP_NAME}.sha256" '.assets[] | select(.name == $name) | .digest')"
           draft_asset_count="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq '.assets | length')"
           [[ "${draft_zip_digest}" == "${zip_digest}" ]]
           [[ "${draft_checksum_digest}" == "${checksum_digest}" ]]
