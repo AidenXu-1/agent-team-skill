@@ -524,12 +524,12 @@ def verify_repository_contract() -> None:
         and legacy_tokens.get("source_version") == "2.0.11"
         and legacy_tokens.get("runtime_set_sha256") == "171fae3f6cae4454a4cca5521a894e615431e323180d0344b7b2cf3eda4a28ec"
         and legacy_tokens.get("sample_count") == 2
-        and legacy_tokens.get("input_tokens_mean") == 137668.0
+        and legacy_tokens.get("input_tokens_mean") == 101929.0
         and legacy_tokens.get("tool_calls_mean") == 5.0
         and candidate_tokens.get("source_version") == SOURCE_VERSION
         and candidate_tokens.get("runtime_set_sha256") == runtime_set_sha256
         and candidate_tokens.get("sample_count") == 2
-        and candidate_tokens.get("input_tokens_mean") == 81903.5
+        and candidate_tokens.get("input_tokens_mean") == 75915.0
         and candidate_tokens.get("tool_calls_mean") == 2.0
         and token_fixture.get("cold_history_loaded") == 0
         and token_fixture.get("current_tasks_loaded") == 1
@@ -540,14 +540,21 @@ def verify_repository_contract() -> None:
         and token_fixture.get("builder") == "tests/build_token_ab_fixture.py"
         and token_fixture.get("builder_sha256")
         == hashlib.sha256((ROOT / token_fixture["builder"]).read_bytes()).hexdigest()
-        and token_conclusion.get("input_tokens_percent") == -40.5
-        and token_conclusion.get("pair_input_tokens_percent") == [-50.5, -25.4]
+        and token_conclusion.get("input_tokens_percent") == -25.5
+        and token_conclusion.get("pair_input_tokens_percent") == [-25.5, -25.5]
         and candidate_tokens.get("hot_context_bytes", 0) > legacy_tokens.get("hot_context_bytes", 0)
+        and any(
+            probe.get("status") == "invalid-comparison"
+            and probe.get("thread_id") == "01a03eb4-5e2b-7602-80d1-a63d0e2321ca"
+            and probe.get("tool_calls") == 8
+            for probe in token_ab.get("rejected_probes", [])
+        )
         and isinstance(token_ab.get("limitations"), list) and len(token_ab["limitations"]) >= 5,
         "real Token A/B evidence is stale, selective, or no longer bound to the candidate runtime",
     )
     check(
-        "137,668" in readme and "81,903.5" in readme and "40.5%" in readme
+        "101,929" in readme and "75,915" in readme and "25.5%" in readme
+        and "无效样本" in readme
         and "不代表 Lulu 业务全流程" in readme
         and "tests/token-ab-20260826.json" in readme,
         "README omitted the measured onboarding Token result or overstated its scope",
@@ -600,7 +607,7 @@ def verify_repository_contract() -> None:
             "status": "required-before-release",
             "scope": "semantic-boundaries",
         }
-        and all(f"S{index:02d}" in semantic_review for index in range(1, 41))
+        and all(f"S{index:02d}" in semantic_review for index in range(1, 48))
         and "自动测试通过不能替代" in readme
         and "本文件只保存稳定问题，不写某次执行结果" in semantic_review,
         "manual semantic release gate is missing or incomplete",
@@ -623,16 +630,27 @@ def verify_repository_contract() -> None:
     )
     check(
         all(term in skill for term in (
-            "## 向用户汇报", "需要你做什么", "还需注意",
-            "需要拍板", "需要体验", "重要变化/风险", "节点完成",
-            "入口、操作顺序、预期结果、重点判断和已知限制",
-            "默认不向用户展开 TASK ID",
+            "## 用户闸门与汇报", "需要你做什么", "还需注意",
+            "不穷举场景", "对当前 TASK 的影响", "用户出口保持 `pending`", "`not_applicable`",
+            "同一切片内继续", "普通问答自然回复", "不为凑格式制造空话",
+            "临时提问/状态追问直接答并保留当前 TASK",
+            "入口/操作顺序/预期结果/重点判断/已知限制",
+            "默认不展开 TASK ID",
             "全项目同一时刻只有一个活动切片",
             "freeze-new-work",
             "同一 gate 跨两代连续 FAIL",
             "当前不可确认可用",
         ))
-        and "结果 / 需要你做什么 / 还需注意" in readme,
+        and all(term in readme for term in (
+            "结果 / 需要你做什么 / 还需注意",
+            "不靠穷举场景", "亲自体验/判断", "纯代码或内部检查",
+            "临时提问和状态追问直接回答并保留当前 TASK",
+            "普通问答不套模板",
+        ))
+        and all(term in spec for term in (
+            "稳定但不死板", "不穷举用户场景", "用户出口保持 `pending`", "`not_applicable`",
+            "不得自动开启下一切片",
+        )),
         "user-facing reporting contract is missing from the Skill or repository guide",
     )
     check(
@@ -862,9 +880,12 @@ def verify_generated(project: Path) -> None:
     )
     check(
         all(term in collaboration_readme for term in (
-            "需要拍板", "需要体验", "重要变化/风险", "节点完成",
+            "不得依赖穷举场景", "对当前 TASK 的影响", "用户出口 `pending`",
+            "纯代码或内部检查", "`not_applicable`", "不强制汇报",
+            "临时提问、状态追问直接回答并保留当前 TASK",
             "结果 / 需要你做什么 / 还需注意",
             "入口、操作顺序、预期结果、重点判断和已知限制",
+            "普通问答不套模板", "不为格式制造空话",
             "内部任务号、状态词、哈希、命令、日志和协议默认不展开",
             "后台及普通低影响测试照常自动执行",
             "明显妨碍用户正常使用设备",
@@ -896,10 +917,10 @@ def verify_generated(project: Path) -> None:
     check("../../tasks/" in inbox, "inbox does not use stable clickable task path")
     check(
         all(term in lead_role_text for term in (
-            "需要拍板", "需要体验", "重要变化/风险", "节点完成",
+            "用户互动按意图、TASK 影响", "用户信息/体验判断/授权", "user_exit pending",
+            "本切片验证后 not_applicable 继续", "临时问题直接答并保留 TASK",
             "结果 / 需要你做什么 / 还需注意",
-            "入口、顺序、预期、判断点和限制",
-            "默认不展开 TASK ID",
+            "第三段按需", "普通问答不套模板",
             "后台及普通低影响测试照常自动执行",
             "明显妨碍用户正常使用设备",
             "前台独占或难以自行退出",
