@@ -650,7 +650,8 @@ def verify_repository_contract() -> None:
         ))
         and all(term in readme for term in (
             "项目资料保存长期信息", "会话只专注眼前任务",
-            "只有你同意后才换会话", "旧资料需要时再查",
+            "会话开始记混、反复翻旧资料", "你同意后，新会话带着现有进度接手",
+            "旧资料需要时再查",
         ))
         and all(term in spec for term in (
             "会话生命周期", "完整任务生命周期 A/B", "不新增自动换班状态机",
@@ -672,7 +673,11 @@ def verify_repository_contract() -> None:
         ))
         and all(term in readme for term in (
             "结果 / 需要你做什么 / 还需注意",
-            "需要你亲自体验", "纯技术检查", "普通问答不会套模板",
+            "专人干专活", "各部门分工协作，只干属于自己分内的事",
+            "该你出手时才找你", "纯代码检查由团队内部完成",
+            "压力大就换班", "并行任务招外包",
+            "能和主线分开的独立任务", "能安全并行",
+            "条件不够就直说", "普通问答不会套模板",
             "临时问一个问题", "不会打断正在做的事",
         ))
         and all(term in spec for term in (
