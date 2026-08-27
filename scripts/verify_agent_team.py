@@ -346,6 +346,7 @@ def verify_install_bundle_contract(root: Path) -> None:
 
 def verify_repository_contract() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    readme_lower = readme.casefold()
     spec = (ROOT / "docs" / "spec.md").read_text(encoding="utf-8")
     candidate_manifest = json.loads((ROOT / "candidate-manifest.json").read_text(encoding="utf-8"))
     token_ab = json.loads((ROOT / "tests" / "token-ab-20260826.json").read_text(encoding="utf-8"))
@@ -373,12 +374,13 @@ def verify_repository_contract() -> None:
     check(isinstance(metadata, dict) and metadata.get("version") == SOURCE_VERSION,
           "SKILL metadata did not identify the current source build")
     check(
-        "公开发布版、当前源码候选、本机全局安装副本、项目生成协议是四份独立真值" in readme
-        and f"源码候选为 `{SOURCE_VERSION}`" in readme
-        and f"生成协议为 `{PROTOCOL_VERSION}`" in readme
-        and "本机安装版也必须另行核验" in readme
-        and "candidate-manifest.json" in readme,
-        "README conflated or omitted public, source-build, installed-copy, or runtime protocol truths",
+        f"当前正式版：{SOURCE_VERSION} · 适用于 Codex" in readme
+        and "https://github.com/AidenXu-1/agent-team-skill/releases/latest" in readme
+        and "只下载安装标记为 Latest 的正式版本" in readme
+        and "安装到我的 Codex 全局 Skill 目录" in readme
+        and "安装完成后告诉我实际安装版本" in readme
+        and "等我确认后再创建团队" in readme,
+        "README omitted the current product version or complete copyable installation prompts",
     )
     runtime_hashes = {
         relative: hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
@@ -553,26 +555,54 @@ def verify_repository_contract() -> None:
         "real Token A/B evidence is stale, selective, or no longer bound to the candidate runtime",
     )
     check(
-        "101,929" in readme and "75,915" in readme and "25.5%" in readme
-        and "无效样本" in readme
-        and "不代表 Lulu 业务全流程" in readme
-        and "tests/token-ab-20260826.json" in readme,
-        "README omitted the measured onboarding Token result or overstated its scope",
+        all(term not in readme_lower for term in (
+            "lulu", "gpt-5.6", "token 实测", "candidate-manifest.json",
+            "reviewed-release-candidate", "runtime_set_sha256",
+        ))
+        and all(term not in readme for term in (
+            "101,929", "75,915", "25.5%", "SHA-256", "协议版本", "TASK_STATE_OK",
+        ))
+        and re.search(r"\bS\d{1,2}\b", readme) is None,
+        "README leaked project-specific experiments, model names, internal IDs, or release mechanics",
     )
     check(
-        "https://github.com/AidenXu-1/agent-team-skill/releases" in readme
-        and "releases/download/v${VERSION}/agent-team-${VERSION}-pure.zip" in readme
-        and "agent-team-${VERSION}-pure.zip.sha256" in readme
-        and f"releases/latest/download/agent-team-{SOURCE_VERSION}-pure.zip" not in readme,
-        "README omitted the truthful Releases route or advertised an unpublished candidate asset",
+        "https://github.com/AidenXu-1/agent-team-skill/releases/latest" in readme
+        and "releases/download/" not in readme
+        and ".zip" not in readme
+        and ".sha256" not in readme_lower,
+        "README installation entry is stale or exposes low-level package mechanics",
     )
     check(
-        "`main` 是唯一公开主干" in readme
-        and "push 和 pull request 只运行验证，不创建 Release" in readme
-        and "手动触发" in readme
-        and "reviewed-release-candidate" in readme
-        and f"agent-team-{SOURCE_VERSION}-pure.zip" in readme,
-        "README omitted the manual reviewed versioned publication contract",
+        all(term in readme for term in (
+            "## 安装提示", "## 怎么使用", "## 快捷指令",
+            "## 协作资料为什么这样设计", "## 适合什么项目", "## 必要说明",
+            "### 它会怎样向你汇报",
+        ))
+        and all(term in readme for term in (
+            "`接班`", "`先接班，不要开始任务`", "`交班`", "`换班` / `换会话`",
+            "`汇报进度`", "`先回答问题，不要改变当前任务`", "`继续当前任务`",
+            "`这件事适合外包吗？`", "`外包` / `临时外包`",
+            "不等于授权创建", "当前环境不能安全创建第二个执行会话",
+        ))
+        and all(term not in readme_lower for term in (
+            "维护者", "运行文件", "公开主干", "pull request", "workflow", "fixture",
+        ))
+        and readme.count("\n## ") <= 7
+        and "<details>" not in readme,
+        "README is missing the plain-language product journey or has regrown developer documentation",
+    )
+    check(
+        all(term in readme for term in (
+            "部门表", "岗位说明", "上岗引导", "交接班文档", "收件箱",
+            "任务记录", "错题集", "日志", "报告",
+            "部门表回答“谁在做”", "任务记录回答“现在做什么”",
+            "交接班文档回答“做到哪里”", "日志回答“发生过什么”",
+            "报告回答“真正检查过什么”",
+        ))
+        and "同一件事只保留一份正式记录" in readme
+        and "普通小任务不强制写长报告" in readme
+        and "普通的一次性小问题不会全部塞进去" in readme,
+        "README omitted the purpose and separation of generated collaboration materials",
     )
     check(
         set(reference_frontmatter) == {"title", "status"}
@@ -608,7 +638,6 @@ def verify_repository_contract() -> None:
             "scope": "semantic-boundaries",
         }
         and all(f"S{index:02d}" in semantic_review for index in range(1, 48))
-        and "自动测试通过不能替代" in readme
         and "本文件只保存稳定问题，不写某次执行结果" in semantic_review,
         "manual semantic release gate is missing or incomplete",
     )
@@ -620,8 +649,8 @@ def verify_repository_contract() -> None:
             "无法测量", "固定倍数阈值", "只建议换班",
         ))
         and all(term in readme for term in (
-            "项目文件保存长期真值", "会话只保留眼前施工所需的工作集",
-            "不能按聊天轮数", "不能自动换班",
+            "项目资料保存长期信息", "会话只专注眼前任务",
+            "只有你同意后才换会话", "旧资料需要时再查",
         ))
         and all(term in spec for term in (
             "会话生命周期", "完整任务生命周期 A/B", "不新增自动换班状态机",
@@ -643,9 +672,8 @@ def verify_repository_contract() -> None:
         ))
         and all(term in readme for term in (
             "结果 / 需要你做什么 / 还需注意",
-            "不靠穷举场景", "亲自体验/判断", "纯代码或内部检查",
-            "临时提问和状态追问直接回答并保留当前 TASK",
-            "普通问答不套模板",
+            "需要你亲自体验", "纯技术检查", "普通问答不会套模板",
+            "临时问一个问题", "不会打断正在做的事",
         ))
         and all(term in spec for term in (
             "稳定但不死板", "不穷举用户场景", "用户出口保持 `pending`", "`not_applicable`",
