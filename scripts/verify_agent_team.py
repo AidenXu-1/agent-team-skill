@@ -6498,6 +6498,197 @@ def verify_protocol_151_user_exit_supersession(root: Path) -> None:
         )
 
 
+def verify_protocol_151_completed_revision_reopen(root: Path) -> None:
+    project, collab, task_tool, owner, candidate_1, gates, manifest_1 = protocol_151_edge_slice(
+        root, "protocol-151-completed-revision-reopen", ("test",),
+    )
+    gate = gates["test"]
+    report = protocol_151_edge_report(
+        collab, gate, candidate_1, "测试部", "pass", "completed-revision-reopen-pass",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate_1, "--decision", "pass",
+        "--report", str(report.relative_to(project)),
+        "--evidence", "第一代当前候选测试通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_1, "--status", "verified",
+        "--evidence", "用户先确认第一代", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", gate,
+        "--actor", "测试部/test-thread", "--artifact", str(report.relative_to(project)),
+        "--report", str(report.relative_to(project)), "--verified", "第一代 gate 已固定",
+        "--unverified", "无", "--mistake-check", "未把 PASS 冒充发布",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest_1.relative_to(project)),
+        "--verified", "第一代候选已固定", "--unverified", "无",
+        "--mistake-check", "等待统筹最终核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_1, "--status", "needs_revision",
+        "--evidence", "用户在切片关闭前撤回验收并要求修订", "--actor", "统筹部/lead-thread",
+    ])
+    action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=OWNER_REOPEN_REQUIRED" in action.stdout
+        and f"target_task={owner}" in action.stdout
+        and "allowed=resume,next-action" in action.stdout,
+        "a completed owner with a user revision was not routed to reopen",
+    )
+    denied_ack = run([
+        sys.executable, str(task_tool), "ack", "--task-id", owner,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ], ok=False)
+    check("用户修订" in denied_ack.stderr,
+          "owner acknowledgement closed a slice after the user requested revision")
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ])
+
+    candidate_2 = "CAND-20260829-RPN002"
+    artifact_2 = project / "docs" / "completed-revision-candidate-2.txt"
+    artifact_2.write_text("completed revision generation 2\n", encoding="utf-8")
+    manifest_2 = project / "docs" / "completed-revision-manifest-2.json"
+    manifest_2.write_text(json.dumps({
+        "schema_version": 1,
+        "candidate_id": candidate_2,
+        "artifact": {
+            "path": artifact_2.relative_to(project).as_posix(),
+            "sha256": file_sha256(artifact_2), "kind": "file",
+        },
+        "source_revision": "verify-completed-revision-generation-2",
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_2, "--manifest", str(manifest_2.relative_to(project)),
+        "--sha256", file_sha256(manifest_2), "--actor", "开发部/dev-thread",
+    ])
+    gate_action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=GATE_TASK_REOPEN_REQUIRED" in gate_action.stdout
+        and f"target_task={gate}" in gate_action.stdout
+        and "allowed=resume,next-action" in gate_action.stdout,
+        "a next-generation owner did not route an acknowledged gate back to its original TASK",
+    )
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", gate,
+        "--actor", "测试部/test-thread",
+    ])
+    owner_payload = json.loads((collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8"))
+    gate_payload = json.loads((collab / "tasks" / f"{gate}.json").read_text(encoding="utf-8"))
+    check(
+        owner_payload["execution_state"] == "claimed"
+        and gate_payload["execution_state"] == "claimed"
+        and owner_payload["completion_history"][-1]["candidate_id"] == candidate_1
+        and gate_payload["completion_history"][-1]["report"] == str(report.relative_to(project))
+        and gate_payload["completion_history"][-1]["acknowledged_by"] == "统筹部/lead-thread"
+        and not owner_payload["artifacts"]
+        and not gate_payload["artifacts"],
+        "reopen did not preserve prior completion evidence before clearing the live delivery fields",
+    )
+
+    report_2 = protocol_151_edge_report(
+        collab, gate, candidate_2, "测试部", "pass", "completed-revision-reopen-pass-2",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate_2, "--decision", "pass",
+        "--report", str(report_2.relative_to(project)),
+        "--evidence", "第二代当前候选测试通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_2, "--status", "verified",
+        "--evidence", "用户确认第二代", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", gate,
+        "--actor", "测试部/test-thread", "--artifact", str(report_2.relative_to(project)),
+        "--report", str(report_2.relative_to(project)), "--verified", "第二代 gate 已固定",
+        "--unverified", "无", "--mistake-check", "未把第二代 PASS 冒充发布",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest_2.relative_to(project)),
+        "--verified", "第二代候选已固定", "--unverified", "无",
+        "--mistake-check", "等待统筹最终核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", owner,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    closed = json.loads(
+        (collab / ".locks" / "slice-control.json").read_text(encoding="utf-8")
+    )
+    close_entry = closed["history"][-1]
+    check(
+        closed["active_slice"] is None
+        and close_entry["user_exit"]["candidate_id"] == candidate_2
+        and close_entry["revision_requests"][-1]["source_candidate_id"] == candidate_1
+        and close_entry["revision_requests"][-1]["status"] == "consumed"
+        and close_entry["revision_requests"][-1]["evidence"] == "用户在切片关闭前撤回验收并要求修订",
+        "slice close discarded the consumed user revision evidence from cold history",
+    )
+
+
+def verify_protocol_151_gate_error_recovery_and_blocked_routing(root: Path) -> None:
+    project, collab, task_tool, owner, candidate, gates, _ = protocol_151_edge_slice(
+        root, "protocol-151-gate-error-recovery", ("test",),
+    )
+    gate = gates["test"]
+    run([
+        sys.executable, str(task_tool), "block", "--task-id", gate,
+        "--reason", "gate 等待独立证据", "--actor", "测试部/test-thread",
+    ])
+    owner_action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=GATE_TASK_RESUME_REQUIRED" in owner_action.stdout
+        and f"target_task={gate}" in owner_action.stdout
+        and "allowed=resume,next-action" in owner_action.stdout,
+        "owner next-action targeted itself or verdict while its only pending gate was blocked",
+    )
+    report = protocol_151_edge_report(
+        collab, gate, candidate, "测试部", "pass", "blocked-gate-invalid-verdict",
+    )
+    denied = run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate, "--decision", "pass",
+        "--report", str(report.relative_to(project)),
+        "--evidence", "blocked gate 不得 verdict", "--actor", "测试部/test-thread",
+    ], ok=False)
+    marker = collab / ".locks" / "gate-verdict-transaction.json"
+    after = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "claimed gate" in denied.stderr
+        and not marker.exists()
+        and "HOT_STATE_BUSY" not in after.stdout,
+        "an invalid gate verdict left a persistent transaction marker or blocked next-action",
+    )
+
+
 def verify_protocol_151_user_revision(root: Path) -> None:
     def tree_snapshot(path: Path) -> dict[str, str]:
         return {
@@ -7284,6 +7475,8 @@ def main() -> int:
         verify_protocol_151_identity_priority(root)
         verify_protocol_151_state_retry_actor_identity(root)
         verify_protocol_151_user_exit_supersession(root)
+        verify_protocol_151_completed_revision_reopen(root)
+        verify_protocol_151_gate_error_recovery_and_blocked_routing(root)
         verify_protocol_151_user_revision(root)
         verify_protocol_151_active_migration(root)
         verify_protocol_150_migration(root)
