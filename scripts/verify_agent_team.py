@@ -6648,6 +6648,21 @@ def verify_protocol_151_completed_revision_reopen(root: Path) -> None:
         and close_entry["revision_requests"][-1]["evidence"] == "用户在切片关闭前撤回验收并要求修订",
         "slice close discarded the consumed user revision evidence from cold history",
     )
+    forged = json.loads(
+        (collab / ".locks" / "slice-control.json").read_text(encoding="utf-8")
+    )
+    forged["history"][-1]["revision_requests"][-1]["consumed_by_candidate_id"] = (
+        "CAND-20260829-FORGED"
+    )
+    (collab / ".locks" / "slice-control.json").write_text(
+        json.dumps(forged, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    forged_doctor = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check("冷历史已消费用户修订记录无效" in forged_doctor.stderr,
+          "doctor accepted a forged consumed candidate identity in cold revision history")
 
 
 def verify_protocol_151_gate_error_recovery_and_blocked_routing(root: Path) -> None:

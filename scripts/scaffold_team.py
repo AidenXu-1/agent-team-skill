@@ -2701,9 +2701,118 @@ def load_slice_control() -> dict:
                 or user_exit.get("status") not in {"pending", "needs_revision", "verified", "not_applicable"}
                 or not isinstance(revision_requests, list)
                 or len(revision_requests) > 100
-                or any(not isinstance(request, dict) for request in revision_requests)
             ):
                 raise ValueError("切片冷历史用户出口或修订证据无效")
+            user_candidate = user_exit.get("candidate_id")
+            user_generation = user_exit.get("generation")
+            if candidate_id:
+                if (
+                    user_candidate != candidate_id
+                    or isinstance(user_generation, bool)
+                    or not isinstance(user_generation, int)
+                    or user_generation < 1
+                    or not all(isinstance(user_exit.get(field), str) for field in ("evidence", "actor", "at"))
+                    or (
+                        user_exit["status"] == "pending"
+                        and any(user_exit[field] for field in ("evidence", "actor", "at"))
+                    )
+                    or (
+                        user_exit["status"] != "pending"
+                        and not all(user_exit[field] for field in ("evidence", "actor", "at"))
+                    )
+                ):
+                    raise ValueError("切片冷历史用户出口与最终候选不一致")
+                if user_exit["status"] != "pending":
+                    parse_task_timestamp(user_exit, "at")
+            elif user_exit != {
+                "status": "pending", "evidence": "", "actor": "", "at": "",
+                "candidate_id": "", "generation": 0,
+            } or revision_requests:
+                raise ValueError("无候选切片的冷历史用户出口或修订证据无效")
+
+            expected_revision_fields = {
+                "source_candidate_id", "source_generation", "evidence", "actor", "at", "status",
+                "consumed_by_candidate_id", "consumed_generation", "consumed_at", "superseded_user_exit",
+            }
+            seen_revision_sources: set[tuple[str, int]] = set()
+            pending_revision = None
+            source_generations: list[int] = []
+            for request in revision_requests:
+                if not isinstance(request, dict) or set(request) != expected_revision_fields:
+                    raise ValueError("切片冷历史用户修订记录结构无效")
+                source = (request.get("source_candidate_id"), request.get("source_generation"))
+                if (
+                    not isinstance(source[0], str) or not CANDIDATE_ID_RE.fullmatch(source[0])
+                    or isinstance(source[1], bool) or not isinstance(source[1], int) or source[1] < 1
+                    or source in seen_revision_sources or source[0] not in candidate_ids
+                    or not all(
+                        isinstance(request.get(field), str) and request[field]
+                        for field in ("evidence", "actor", "at")
+                    )
+                    or request.get("status") not in {"pending", "consumed"}
+                ):
+                    raise ValueError("切片冷历史用户修订记录内容无效")
+                parse_task_timestamp(request, "at")
+                superseded = request["superseded_user_exit"]
+                if (
+                    not isinstance(superseded, dict)
+                    or set(superseded) != {"status", "evidence", "actor", "at", "candidate_id", "generation"}
+                    or superseded.get("status") not in {"pending", "verified", "not_applicable"}
+                    or superseded.get("candidate_id") != source[0]
+                    or superseded.get("generation") != source[1]
+                    or not all(isinstance(superseded.get(field), str) for field in ("evidence", "actor", "at"))
+                    or (
+                        superseded["status"] == "pending"
+                        and any(superseded[field] for field in ("evidence", "actor", "at"))
+                    )
+                    or (
+                        superseded["status"] != "pending"
+                        and not all(superseded[field] for field in ("evidence", "actor", "at"))
+                    )
+                ):
+                    raise ValueError("切片冷历史未保全被替代的用户出口")
+                if superseded["status"] != "pending":
+                    parse_task_timestamp(superseded, "at")
+                seen_revision_sources.add(source)
+                source_generations.append(source[1])
+                if request["status"] == "pending":
+                    if (
+                        request["consumed_by_candidate_id"] != ""
+                        or request["consumed_generation"] != 0
+                        or request["consumed_at"] != ""
+                        or pending_revision is not None
+                    ):
+                        raise ValueError("切片冷历史待消费用户修订记录无效")
+                    pending_revision = request
+                else:
+                    consumed_id = request.get("consumed_by_candidate_id")
+                    consumed_generation = request.get("consumed_generation")
+                    if (
+                        not isinstance(consumed_id, str) or not CANDIDATE_ID_RE.fullmatch(consumed_id)
+                        or consumed_id not in candidate_ids or consumed_id == source[0]
+                        or isinstance(consumed_generation, bool)
+                        or not isinstance(consumed_generation, int)
+                        or consumed_generation != source[1] + 1
+                        or consumed_generation > user_generation
+                        or not isinstance(request.get("consumed_at"), str)
+                        or not request["consumed_at"]
+                    ):
+                        raise ValueError("切片冷历史已消费用户修订记录无效")
+                    parse_task_timestamp(request, "consumed_at")
+            if source_generations != sorted(source_generations):
+                raise ValueError("切片冷历史用户修订代次顺序无效")
+            if pending_revision is not None:
+                if (
+                    "resolution" not in entry
+                    or user_exit["status"] != "needs_revision"
+                    or pending_revision["source_candidate_id"] != user_candidate
+                    or pending_revision["source_generation"] != user_generation
+                ):
+                    raise ValueError("切片冷历史待消费修订与最终用户出口不一致")
+            elif user_exit["status"] == "needs_revision":
+                raise ValueError("切片冷历史 needs_revision 缺少待消费记录")
+            if "resolution" not in entry and user_exit["status"] not in {"verified", "not_applicable"}:
+                raise ValueError("正常核收的切片冷历史缺少最终用户出口")
     active = payload.get("active_slice")
     if active is None:
         return payload
