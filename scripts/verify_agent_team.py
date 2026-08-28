@@ -6601,6 +6601,18 @@ def verify_protocol_151_completed_revision_reopen(root: Path) -> None:
         and not gate_payload["artifacts"],
         "reopen did not preserve prior completion evidence before clearing the live delivery fields",
     )
+    manifest_1_bytes = manifest_1.read_bytes()
+    manifest_1.write_bytes(manifest_1_bytes + b" ")
+    drifted_history = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "候选 manifest SHA-256 不匹配" in drifted_history.stderr
+        and "full_history_validated=true" not in drifted_history.stdout,
+        "doctor accepted a completion_history candidate manifest that drifted after reopen",
+    )
+    manifest_1.write_bytes(manifest_1_bytes)
+    run([sys.executable, str(task_tool), "doctor"])
 
     report_2 = protocol_151_edge_report(
         collab, gate, candidate_2, "测试部", "pass", "completed-revision-reopen-pass-2",

@@ -2134,6 +2134,9 @@ def validate_task_payload(payload: object, path: Path) -> dict:
             or not re.fullmatch(r"[0-9a-f]{64}", entry.get("candidate_sha256", ""))
         ):
             raise ValueError(f"任务 completion_history 候选或版本无效: {path.name}")
+        candidate_manifest(
+            entry["candidate_manifest"], entry["candidate_id"], entry["candidate_sha256"],
+        )
         for field, max_chars, allow_empty in (
             ("candidate_manifest", 500, False), ("reopened_by", ACTOR_MAX_CHARS, False),
             ("reason", 1000, False), ("mistake_check", 2000, False),
