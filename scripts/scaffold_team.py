@@ -2714,7 +2714,7 @@ def load_slice_control() -> dict:
     for request in revision_requests:
         expected_fields = {
             "source_candidate_id", "source_generation", "evidence", "actor", "at", "status",
-            "consumed_by_candidate_id", "consumed_generation", "consumed_at",
+            "consumed_by_candidate_id", "consumed_generation", "consumed_at", "superseded_user_exit",
         }
         if not isinstance(request, dict) or set(request) != expected_fields:
             raise ValueError("用户修订记录结构无效")
@@ -2727,6 +2727,24 @@ def load_slice_control() -> dict:
             or request.get("status") not in {"pending", "consumed"}
         ):
             raise ValueError("用户修订记录内容无效")
+        superseded = request["superseded_user_exit"]
+        if (
+            not isinstance(superseded, dict)
+            or set(superseded) != {"status", "evidence", "actor", "at", "candidate_id", "generation"}
+            or superseded.get("status") not in {"pending", "verified", "not_applicable"}
+            or superseded.get("candidate_id") != source[0]
+            or superseded.get("generation") != source[1]
+            or not all(isinstance(superseded.get(field), str) for field in ("evidence", "actor", "at"))
+            or (
+                superseded["status"] == "pending"
+                and any(superseded[field] for field in ("evidence", "actor", "at"))
+            )
+            or (
+                superseded["status"] != "pending"
+                and not all(superseded[field] for field in ("evidence", "actor", "at"))
+            )
+        ):
+            raise ValueError("用户修订记录未保全被替代的用户出口")
         seen_revision_sources.add(source)
         if request["status"] == "pending":
             if (
@@ -2950,7 +2968,8 @@ def render_handoff_hot_block(
             ) + "`",
             f"- 用户出口：`{active['user_exit']['status']}`",
             f"- 阻断原因：`{owner.get('block_reason') or 'none'}`",
-            f"- 下一合法动作：`{decision['allowed'][0] if decision['allowed'] else 'none'}`",
+            f"- 下一合法动作：`{decision['allowed'][0] if decision['allowed'] else 'none'}`"
+            + (f" · 目标 `{decision['target_task_id']}`" if decision.get("target_task_id") else ""),
         ])
     lines.extend(visible or ["- 本部门当前没有活动切片 TASK"])
     if recovery:
@@ -3764,7 +3783,6 @@ def cmd_wait(args) -> int:
 def cmd_resume(args) -> int:
     state, current_path, current = locate(args.task_id)
     require_current_slice_task(current, "resume")
-    require_new_work_open("resume")
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
     actor = require_task_actor(current, args.actor)
@@ -3773,6 +3791,7 @@ def cmd_resume(args) -> int:
         require_identical_state_retry(current, "resume", actor, "", "claimed", generation)
         print(f"TASK_STATE_NOOP | claimed | {current['task_id']} | {current_path.relative_to(PROJECT)}")
         return 0
+    require_new_work_open("resume")
     require_department(current["department"])
     authorization = current["authorization_state"]
     if authorization in {"user_required", "user_rejected"}:
@@ -4146,6 +4165,46 @@ def task_owner_is_current(task: dict) -> bool:
     return task.get("claimed_by") == registered_department_actor(task["department"])
 
 
+def gate_task_completion_priority(active: dict, *, frozen: bool) -> dict[str, object] | None:
+    for gate in active["required_gates"]:
+        gate_task_id = active["gate_tasks"].get(gate)
+        if not gate_task_id:
+            continue
+        gate_state, _, gate_task = locate(gate_task_id)
+        if gate_state in {"completed", "acknowledged"}:
+            continue
+        if not task_owner_is_current(gate_task):
+            decision = owner_rebind_priority()
+            decision["target_task_id"] = gate_task_id
+            return decision
+        if gate_state == "claimed":
+            return {
+                "first_blocker": "GATE_TASK_COMPLETION_REQUIRED",
+                "target_task_id": gate_task_id,
+                "allowed": ["complete", "next-action"],
+                "forbidden": ["owner-complete", "bind-candidate"],
+                "user_decision": False,
+            }
+        if gate_state in {"blocked", "waiting_input"}:
+            return {
+                "first_blocker": "P0_FREEZE_ACTIVE" if frozen else "GATE_TASK_RESUME_REQUIRED",
+                "target_task_id": gate_task_id,
+                "allowed": ["unfreeze-new-work", "next-action"] if frozen else ["resume", "next-action"],
+                "forbidden": ["resume", "owner-complete", "bind-candidate"] if frozen else [
+                    "owner-complete", "bind-candidate",
+                ],
+                "user_decision": frozen,
+            }
+        return {
+            "first_blocker": "GATE_TASK_STATE_INVALID",
+            "target_task_id": gate_task_id,
+            "allowed": ["next-action"],
+            "forbidden": ["owner-complete", "bind-candidate"],
+            "user_decision": False,
+        }
+    return None
+
+
 def slice_progress_priority(
     state: str, task: dict, active: dict, *, frozen: bool,
 ) -> dict[str, object] | None:
@@ -4175,6 +4234,14 @@ def slice_progress_priority(
         return owner_rebind_priority()
     if not candidate or any(value == "fail" for value in gate_states.values()):
         return None
+    if (
+        task["task_kind"] == "owner"
+        and all(value == "pass" for value in gate_states.values())
+        and active["user_exit"]["status"] in {"verified", "not_applicable"}
+    ):
+        completion = gate_task_completion_priority(active, frozen=frozen)
+        if completion is not None:
+            return completion
 
     claimed_pending_gates: set[str] = set()
     for gate, gate_status in gate_states.items():
@@ -4312,7 +4379,7 @@ def cmd_next_action(args) -> int:
         return 0
     state, task_path, task = locate(args.task_id)
     control = load_slice_control()
-    watched = [DISPATCH_CONTROL, SLICE_CONTROL, task_path]
+    watched = [DISPATCH_CONTROL, SLICE_CONTROL, SESSION_STATE, task_path]
     active = control.get("active_slice")
     if active:
         watched.extend(task_path_for_id for task_path_for_id in (
@@ -4332,9 +4399,10 @@ def cmd_next_action(args) -> int:
     allowed = ",".join(decision["allowed"]) or "none"
     forbidden = ",".join(decision["forbidden"]) or "none"
     user_decision = "yes" if decision["user_decision"] else "no"
+    target_task = decision.get("target_task_id", task["task_id"])
     print(
         f"NEXT_ACTION | task={task['task_id']} | state={state} | "
-        f"first_blocker={decision['first_blocker']} | allowed={allowed} | "
+        f"first_blocker={decision['first_blocker']} | target_task={target_task} | allowed={allowed} | "
         f"forbidden={forbidden} | user_decision={user_decision}"
     )
     return 0
@@ -4358,7 +4426,10 @@ def cmd_record_user_exit(args) -> int:
     if all(current.get(field) == value for field, value in requested.items()):
         print(f"USER_EXIT_NOOP | {active['slice_id']} | {candidate['candidate_id']} | {status}")
         return 0
-    if current["status"] != "pending":
+    superseding_revision = (
+        status == "needs_revision" and current["status"] in {"verified", "not_applicable"}
+    )
+    if current["status"] != "pending" and not superseding_revision:
         raise ValueError("用户出口已记录；不同状态、证据、actor 或候选代次构成冲突")
     timestamp = now_iso()
     if status == "needs_revision":
@@ -4369,6 +4440,7 @@ def cmd_record_user_exit(args) -> int:
             "source_generation": candidate["generation"],
             "evidence": evidence, "actor": actor, "at": timestamp, "status": "pending",
             "consumed_by_candidate_id": "", "consumed_generation": 0, "consumed_at": "",
+            "superseded_user_exit": dict(current),
         })
     active["user_exit"] = {**requested, "at": timestamp}
     store_slice_control(control)

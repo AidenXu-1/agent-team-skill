@@ -6014,6 +6014,15 @@ def verify_protocol_151_fail_and_ack_priorities(root: Path) -> None:
         "--candidate-id", ack_candidate, "--status", "not_applicable",
         "--evidence", "纯代码候选无需人工体验", "--actor", "统筹部/lead-thread",
     ])
+    incomplete_gate_action = run([
+        sys.executable, str(ack_tool), "next-action", "--task-id", ack_owner,
+    ])
+    check(
+        "first_blocker=GATE_TASK_COMPLETION_REQUIRED" in incomplete_gate_action.stdout
+        and f"target_task={ack_gates['test']}" in incomplete_gate_action.stdout
+        and "allowed=complete,next-action" in incomplete_gate_action.stdout,
+        "owner next-action suggested owner completion before the PASS gate TASK was completed",
+    )
     run([
         sys.executable, str(ack_tool), "complete", "--task-id", ack_gates["test"],
         "--actor", "测试部/test-thread",
@@ -6395,6 +6404,20 @@ def verify_protocol_151_state_retry_actor_identity(root: Path) -> None:
     ])
     check(repeated_resume.stdout.startswith("TASK_STATE_NOOP"),
           "the same actor's identical resume retry did not remain a NOOP")
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "verify frozen identical resume retry",
+    ])
+    frozen_resume = run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread-v2",
+    ])
+    check(frozen_resume.stdout.startswith("TASK_STATE_NOOP"),
+          "an identical resume retry was rejected only because work became frozen")
+    run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "verify resume retry fixture continues",
+    ])
 
     switch_and_rebind("dev-thread-v2", "dev-thread-v3")
     inherited_resume = run([
@@ -6425,6 +6448,54 @@ def verify_protocol_151_state_retry_actor_identity(root: Path) -> None:
     ])
     check(final_resume.stdout.startswith("TASK_STATE_NOOP"),
           "the rebound actor's own resume retry did not remain a NOOP")
+
+
+def verify_protocol_151_user_exit_supersession(root: Path) -> None:
+    for prior_status in ("verified", "not_applicable"):
+        project, collab, task_tool, owner, candidate, gates, _ = protocol_151_edge_slice(
+            root, f"protocol-151-user-exit-supersede-{prior_status}", ("test",),
+        )
+        report = protocol_151_edge_report(
+            collab, gates["test"], candidate, "测试部", "pass",
+            f"user-exit-supersede-{prior_status}",
+        )
+        run([
+            sys.executable, str(task_tool), "gate-verdict", "--task-id", gates["test"],
+            "--candidate-id", candidate, "--decision", "pass",
+            "--report", str(report.relative_to(project)),
+            "--evidence", "当前候选测试通过", "--actor", "测试部/test-thread",
+        ])
+        prior_evidence = f"用户原先记录 {prior_status}"
+        run([
+            sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+            "--candidate-id", candidate, "--status", prior_status,
+            "--evidence", prior_evidence, "--actor", "统筹部/lead-thread",
+        ])
+        revised = run([
+            sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+            "--candidate-id", candidate, "--status", "needs_revision",
+            "--evidence", "用户随后要求同一候选继续修订", "--actor", "统筹部/lead-thread",
+        ])
+        control = json.loads(
+            (collab / ".locks" / "slice-control.json").read_text(encoding="utf-8")
+        )
+        active = control["active_slice"]
+        request = active["revision_requests"][-1]
+        superseded = request["superseded_user_exit"]
+        action = run([
+            sys.executable, str(task_tool), "next-action", "--task-id", owner,
+        ])
+        check(
+            revised.stdout.startswith("USER_EXIT_RECORDED")
+            and active["user_exit"]["status"] == "needs_revision"
+            and request["status"] == "pending"
+            and superseded["status"] == prior_status
+            and superseded["evidence"] == prior_evidence
+            and superseded["candidate_id"] == candidate
+            and superseded["generation"] == 1
+            and "first_blocker=USER_REVISION_READY" in action.stdout,
+            f"{prior_status} user exit could not be superseded by a preserved user revision",
+        )
 
 
 def verify_protocol_151_user_revision(root: Path) -> None:
@@ -7111,6 +7182,13 @@ summary: 迁移前当前代独立审核通过
         sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
         "--evidence", "1.5.0 到 1.5.1 迁移冻结",
     ])
+    for task_path in task_paths:
+        payload = json.loads(task_path.read_text(encoding="utf-8"))
+        payload.pop("state_action_receipt", None)
+        task_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
     preserved = {
         path: path.read_bytes() for path in [artifact, manifest, *gate_paths, *task_paths]
     }
@@ -7159,6 +7237,20 @@ summary: 迁移前当前代独立审核通过
     run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
     second_manifest = next(iter(set((collab / "升级备份").iterdir()) - existing_backups)) / "rollback-manifest.json"
     run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "旧 1.5.0 TASK 首次新协议状态动作", "--actor", "开发部/dev-thread",
+    ])
+    migrated_owner = json.loads((collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8"))
+    repeated_block = run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "旧 1.5.0 TASK 首次新协议状态动作", "--actor", "开发部/dev-thread",
+    ])
+    check(
+        migrated_owner["state_action_receipt"]["action"] == "block"
+        and repeated_block.stdout.startswith("TASK_STATE_NOOP"),
+        "a migrated 1.5.0 TASK without a receipt did not safely acquire one on its first transition",
+    )
+    run([
         sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
         "--candidate-id", candidate_id, "--status", "needs_revision",
         "--evidence", "用户要求迁移后修订", "--actor", "统筹部/lead-thread",
@@ -7191,6 +7283,7 @@ def main() -> int:
         verify_protocol_151_authorization_priority(root)
         verify_protocol_151_identity_priority(root)
         verify_protocol_151_state_retry_actor_identity(root)
+        verify_protocol_151_user_exit_supersession(root)
         verify_protocol_151_user_revision(root)
         verify_protocol_151_active_migration(root)
         verify_protocol_150_migration(root)
