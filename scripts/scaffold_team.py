@@ -2625,6 +2625,48 @@ def default_slice_control() -> dict:
     }
 
 
+def slice_candidate_lineage(active: dict) -> list[dict[str, object]]:
+    """Rebuild one slice's generation-to-candidate map from redundant hot evidence."""
+    by_generation: dict[int, str] = {}
+
+    def record(candidate_id: object, generation: object) -> None:
+        if (
+            not isinstance(candidate_id, str) or not CANDIDATE_ID_RE.fullmatch(candidate_id)
+            or isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
+        ):
+            raise ValueError("切片候选谱系条目无效")
+        previous = by_generation.get(generation)
+        if previous is not None and previous != candidate_id:
+            raise ValueError("同一候选代次绑定了冲突身份")
+        if candidate_id in by_generation.values() and previous != candidate_id:
+            raise ValueError("候选身份跨代次重复")
+        by_generation[generation] = candidate_id
+
+    candidate = active.get("candidate")
+    if candidate is not None:
+        record(candidate.get("candidate_id"), candidate.get("generation"))
+    for request in active.get("revision_requests", []):
+        if isinstance(request, dict):
+            record(request.get("source_candidate_id"), request.get("source_generation"))
+            if request.get("status") == "consumed":
+                record(request.get("consumed_by_candidate_id"), request.get("consumed_generation"))
+    for task_id in active.get("gate_tasks", {}).values():
+        _, _, gate_task = locate(task_id)
+        for attempt in gate_task.get("gate_attempts", []):
+            record(attempt.get("candidate_id"), attempt.get("generation"))
+    if candidate is None:
+        if by_generation:
+            raise ValueError("无当前候选的切片不得保留候选谱系")
+        return []
+    generation = candidate["generation"]
+    if sorted(by_generation) != list(range(1, generation + 1)):
+        raise ValueError("切片候选谱系代次不连续")
+    return [
+        {"candidate_id": by_generation[index], "generation": index}
+        for index in range(1, generation + 1)
+    ]
+
+
 def load_slice_control() -> dict:
     if SLICE_CONTROL.is_symlink() or not SLICE_CONTROL.is_file():
         raise ValueError("切片控制缺失或不安全；运行协议升级或重新生成协作层")
@@ -2651,12 +2693,14 @@ def load_slice_control() -> dict:
         raise ValueError("候选永久身份账本无效")
     seen_slices: set[str] = set()
     seen_candidates: set[str] = set()
+    managed_history_candidate_ids: list[str] = []
+    managed_history_started = False
     for entry in history:
         base_fields = {
             "slice_id", "owner_task_id", "candidate_id", "candidate_manifest",
             "candidate_sha256", "closed_at", "metrics",
         }
-        evidence_fields = {"user_exit", "revision_requests"}
+        evidence_fields = {"user_exit", "revision_requests", "candidate_lineage"}
         accepted_fields = {
             frozenset(base_fields),
             frozenset(base_fields | {"resolution"}),
@@ -2665,6 +2709,11 @@ def load_slice_control() -> dict:
         }
         if not isinstance(entry, dict) or frozenset(entry) not in accepted_fields:
             raise ValueError("切片冷历史条目结构无效")
+        managed_entry = evidence_fields <= set(entry)
+        if managed_entry:
+            managed_history_started = True
+        elif managed_history_started:
+            raise ValueError("受管冷历史之后不得追加无候选谱系的旧格式条目")
         if (
             not SLICE_ID_RE.fullmatch(entry.get("slice_id", ""))
             or not TASK_ID_RE.fullmatch(entry.get("owner_task_id", ""))
@@ -2692,17 +2741,36 @@ def load_slice_control() -> dict:
             raise ValueError("切片冷历史 resolution 无效")
         if not isinstance(entry.get("metrics"), list):
             raise ValueError("切片冷历史 metrics 无效")
-        if evidence_fields <= set(entry):
+        if managed_entry:
             user_exit = entry["user_exit"]
             revision_requests = entry["revision_requests"]
+            lineage = entry["candidate_lineage"]
             if (
                 not isinstance(user_exit, dict)
                 or set(user_exit) != {"status", "evidence", "actor", "at", "candidate_id", "generation"}
                 or user_exit.get("status") not in {"pending", "needs_revision", "verified", "not_applicable"}
                 or not isinstance(revision_requests, list)
                 or len(revision_requests) > 100
+                or not isinstance(lineage, list)
+                or len(lineage) > 100
             ):
                 raise ValueError("切片冷历史用户出口或修订证据无效")
+            lineage_by_generation: dict[int, str] = {}
+            lineage_ids: list[str] = []
+            for position, item in enumerate(lineage, start=1):
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"candidate_id", "generation"}
+                    or item.get("generation") != position
+                    or not isinstance(item.get("candidate_id"), str)
+                    or not CANDIDATE_ID_RE.fullmatch(item["candidate_id"])
+                    or item["candidate_id"] not in candidate_ids
+                    or item["candidate_id"] in lineage_ids
+                ):
+                    raise ValueError("切片冷历史候选谱系无效")
+                lineage_by_generation[position] = item["candidate_id"]
+                lineage_ids.append(item["candidate_id"])
+            managed_history_candidate_ids.extend(lineage_ids)
             user_candidate = user_exit.get("candidate_id")
             user_generation = user_exit.get("generation")
             if candidate_id:
@@ -2711,6 +2779,8 @@ def load_slice_control() -> dict:
                     or isinstance(user_generation, bool)
                     or not isinstance(user_generation, int)
                     or user_generation < 1
+                    or lineage_by_generation.get(user_generation) != candidate_id
+                    or user_generation != len(lineage)
                     or not all(isinstance(user_exit.get(field), str) for field in ("evidence", "actor", "at"))
                     or (
                         user_exit["status"] == "pending"
@@ -2727,7 +2797,7 @@ def load_slice_control() -> dict:
             elif user_exit != {
                 "status": "pending", "evidence": "", "actor": "", "at": "",
                 "candidate_id": "", "generation": 0,
-            } or revision_requests:
+            } or revision_requests or lineage:
                 raise ValueError("无候选切片的冷历史用户出口或修订证据无效")
 
             expected_revision_fields = {
@@ -2750,6 +2820,7 @@ def load_slice_control() -> dict:
                         for field in ("evidence", "actor", "at")
                     )
                     or request.get("status") not in {"pending", "consumed"}
+                    or lineage_by_generation.get(source[1]) != source[0]
                 ):
                     raise ValueError("切片冷历史用户修订记录内容无效")
                 parse_task_timestamp(request, "at")
@@ -2794,6 +2865,7 @@ def load_slice_control() -> dict:
                         or not isinstance(consumed_generation, int)
                         or consumed_generation != source[1] + 1
                         or consumed_generation > user_generation
+                        or lineage_by_generation.get(consumed_generation) != consumed_id
                         or not isinstance(request.get("consumed_at"), str)
                         or not request["consumed_at"]
                     ):
@@ -2815,6 +2887,8 @@ def load_slice_control() -> dict:
                 raise ValueError("正常核收的切片冷历史缺少最终用户出口")
     active = payload.get("active_slice")
     if active is None:
+        if managed_history_candidate_ids and candidate_ids[-len(managed_history_candidate_ids):] != managed_history_candidate_ids:
+            raise ValueError("切片冷历史候选谱系与永久身份账本顺序不一致")
         return payload
     required = {
         "slice_id", "owner_task_id", "required_gates", "gate_tasks", "candidate",
@@ -2965,6 +3039,12 @@ def load_slice_control() -> dict:
             for field in expected_metric_fields - {"at", "actor", "source"}
         ) or any(not isinstance(metric[field], str) or not metric[field] for field in ("at", "actor", "source")):
             raise ValueError("切片 metric 内容无效")
+    active_lineage = slice_candidate_lineage(active)
+    managed_candidate_ids = managed_history_candidate_ids + [
+        item["candidate_id"] for item in active_lineage
+    ]
+    if managed_candidate_ids and candidate_ids[-len(managed_candidate_ids):] != managed_candidate_ids:
+        raise ValueError("活动与冷历史候选谱系不构成永久身份账本的连续后缀")
     return payload
 
 
@@ -4956,6 +5036,7 @@ def slice_close_entry(active: dict, timestamp: str, resolution_state: str | None
         "closed_at": timestamp, "metrics": active["metrics"],
         "user_exit": active["user_exit"],
         "revision_requests": active["revision_requests"],
+        "candidate_lineage": slice_candidate_lineage(active),
     }
     if resolution_state is not None:
         entry["resolution"] = resolution_state
@@ -5049,6 +5130,7 @@ def validate_slice_close_transaction(payload: object) -> dict:
     base_fields = {
         "slice_id", "owner_task_id", "candidate_id", "candidate_manifest",
         "candidate_sha256", "closed_at", "metrics", "user_exit", "revision_requests",
+        "candidate_lineage",
     }
     expected_entry_fields = base_fields if payload["action"] == "ack" else base_fields | {"resolution"}
     if not isinstance(entry, dict) or set(entry) != expected_entry_fields:

@@ -6704,6 +6704,156 @@ def verify_protocol_151_gate_error_recovery_and_blocked_routing(root: Path) -> N
     )
 
 
+def verify_protocol_151_cross_slice_candidate_lineage(root: Path) -> None:
+    project, collab, task_tool, owner_a, candidate_a1, gates, _ = protocol_151_edge_slice(
+        root, "protocol-151-cross-slice-lineage", ("test",),
+    )
+    gate = gates["test"]
+    report_a1 = protocol_151_edge_report(
+        collab, gate, candidate_a1, "测试部", "pass", "lineage-a1-pass",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate_a1, "--decision", "pass",
+        "--report", str(report_a1.relative_to(project)),
+        "--evidence", "切片 A 第一代通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner_a,
+        "--candidate-id", candidate_a1, "--status", "needs_revision",
+        "--evidence", "切片 A 要求第二代", "--actor", "统筹部/lead-thread",
+    ])
+    candidate_a2 = "CAND-20260829-XLN002"
+    artifact_a2 = project / "docs" / "lineage-a2.txt"
+    artifact_a2.write_text("lineage A generation 2\n", encoding="utf-8")
+    manifest_a2 = project / "docs" / "lineage-a2-manifest.json"
+    manifest_a2.write_text(json.dumps({
+        "schema_version": 1, "candidate_id": candidate_a2,
+        "artifact": {
+            "path": artifact_a2.relative_to(project).as_posix(),
+            "sha256": file_sha256(artifact_a2), "kind": "file",
+        },
+        "source_revision": "verify-lineage-a2",
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner_a,
+        "--candidate-id", candidate_a2, "--manifest", str(manifest_a2.relative_to(project)),
+        "--sha256", file_sha256(manifest_a2), "--actor", "开发部/dev-thread",
+    ])
+    report_a2 = protocol_151_edge_report(
+        collab, gate, candidate_a2, "测试部", "pass", "lineage-a2-pass",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate_a2, "--decision", "pass",
+        "--report", str(report_a2.relative_to(project)),
+        "--evidence", "切片 A 第二代通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner_a,
+        "--candidate-id", candidate_a2, "--status", "verified",
+        "--evidence", "切片 A 第二代确认", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", gate,
+        "--actor", "测试部/test-thread", "--artifact", str(report_a2.relative_to(project)),
+        "--report", str(report_a2.relative_to(project)), "--verified", "A2 gate 已固定",
+        "--unverified", "无", "--mistake-check", "等待核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner_a,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest_a2.relative_to(project)),
+        "--verified", "A2 owner 已固定", "--unverified", "无", "--mistake-check", "等待核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", owner_a,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+
+    owner_b = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+        "--department", "开发部", "--from-department", "统筹部",
+        "--title", "cross-slice lineage B", "--node", "2.1.1 cold lineage",
+        "--details", "创建第二切片合法候选，验证不得串入第一切片",
+        "--acceptance-exit", "跨切片候选替换被 doctor 拒绝",
+        "--failure-path", "候选谱系可跨切片替换", "--authorization-state", "none",
+        "--task-kind", "owner",
+    ]))
+    run([
+        sys.executable, str(task_tool), "claim", "--task-id", owner_b,
+        "--claimed-by", "开发部/dev-thread",
+    ])
+    candidate_b = "CAND-20260829-XLN003"
+    artifact_b = project / "docs" / "lineage-b.txt"
+    artifact_b.write_text("lineage B\n", encoding="utf-8")
+    manifest_b = project / "docs" / "lineage-b-manifest.json"
+    manifest_b.write_text(json.dumps({
+        "schema_version": 1, "candidate_id": candidate_b,
+        "artifact": {
+            "path": artifact_b.relative_to(project).as_posix(),
+            "sha256": file_sha256(artifact_b), "kind": "file",
+        },
+        "source_revision": "verify-lineage-b",
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner_b,
+        "--candidate-id", candidate_b, "--manifest", str(manifest_b.relative_to(project)),
+        "--sha256", file_sha256(manifest_b), "--actor", "开发部/dev-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner_b,
+        "--candidate-id", candidate_b, "--status", "not_applicable",
+        "--evidence", "第二切片为纯协议验证", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner_b,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest_b.relative_to(project)),
+        "--verified", "B owner 已固定", "--unverified", "无", "--mistake-check", "等待核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", owner_b,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    control_path = collab / ".locks" / "slice-control.json"
+    clean_control = json.loads(control_path.read_text(encoding="utf-8"))
+    check(
+        clean_control["history"][-2]["candidate_lineage"] == [
+            {"candidate_id": candidate_a1, "generation": 1},
+            {"candidate_id": candidate_a2, "generation": 2},
+        ]
+        and clean_control["history"][-1]["candidate_lineage"] == [
+            {"candidate_id": candidate_b, "generation": 1},
+        ],
+        "slice close did not persist its own ordered candidate lineage",
+    )
+    for field in ("source", "consumed"):
+        forged = json.loads(json.dumps(clean_control, ensure_ascii=False))
+        request = forged["history"][-2]["revision_requests"][0]
+        if field == "source":
+            request["source_candidate_id"] = candidate_b
+            request["superseded_user_exit"]["candidate_id"] = candidate_b
+        else:
+            request["consumed_by_candidate_id"] = candidate_b
+        control_path.write_text(
+            json.dumps(forged, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        denied = run([sys.executable, str(task_tool), "doctor"], ok=False)
+        check(
+            denied.stderr.startswith("TASK_ERROR") and "full_history_validated=true" not in denied.stdout,
+            f"doctor accepted a {field} candidate borrowed from another closed slice",
+        )
+    control_path.write_text(
+        json.dumps(clean_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    run([sys.executable, str(task_tool), "doctor"])
+
+
 def verify_protocol_151_acknowledged_owner_revision_reopen(root: Path) -> None:
     project, collab, task_tool, owner, candidate, gates, manifest = protocol_151_edge_slice(
         root, "protocol-151-acknowledged-owner-revision", ("test",),
@@ -7647,6 +7797,7 @@ def main() -> int:
         verify_protocol_151_user_exit_supersession(root)
         verify_protocol_151_completed_revision_reopen(root)
         verify_protocol_151_gate_error_recovery_and_blocked_routing(root)
+        verify_protocol_151_cross_slice_candidate_lineage(root)
         verify_protocol_151_acknowledged_owner_revision_reopen(root)
         verify_protocol_151_gate_ack_order(root)
         verify_protocol_151_user_revision(root)
