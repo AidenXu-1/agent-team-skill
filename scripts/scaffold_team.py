@@ -1733,7 +1733,7 @@ TASK_FIELDS = {
 }
 OPTIONAL_TASK_FIELDS = {
     "acknowledged_by", "impact_declaration", "temporary_executor", "temporary_operation_history", "resolution",
-    "ownership_history",
+    "ownership_history", "state_action_receipt",
     "slice_id", "task_kind", "gate_type", "gate_attempts",
 }
 TRANSITIONS = {
@@ -2240,6 +2240,28 @@ def validate_task_payload(payload: object, path: Path) -> dict:
         raise ValueError(f"已核收任务缺失 acknowledged_by: {path.name}")
     if state != "acknowledged" and payload.get("acknowledged_by", "").strip():
         raise ValueError(f"未核收任务不得预填 acknowledged_by: {path.name}")
+    state_action_receipt = payload.get("state_action_receipt")
+    if state_action_receipt is not None:
+        if not isinstance(state_action_receipt, dict) or set(state_action_receipt) != {
+            "action", "actor", "reason", "target_state", "candidate_generation",
+        }:
+            raise ValueError(f"任务 state_action_receipt 结构无效: {path.name}")
+        action = state_action_receipt.get("action")
+        target_state = state_action_receipt.get("target_state")
+        expected_states = {
+            "claim": "claimed", "block": "blocked", "wait": "waiting_input", "resume": "claimed",
+        }
+        if action not in expected_states or target_state != expected_states[action]:
+            raise ValueError(f"任务 state_action_receipt 动作或目标状态无效: {path.name}")
+        require_task_text(state_action_receipt, "actor", max_chars=ACTOR_MAX_CHARS)
+        reason = require_task_text(state_action_receipt, "reason", allow_empty=True, max_chars=2000)
+        if (action in {"block", "wait"}) != bool(reason):
+            raise ValueError(f"任务 state_action_receipt 原因与动作不一致: {path.name}")
+        generation = state_action_receipt.get("candidate_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ValueError(f"任务 state_action_receipt 候选代次无效: {path.name}")
+        if state in {"claimed", "blocked", "waiting_input"} and target_state != state:
+            raise ValueError(f"任务 state_action_receipt 与当前状态不一致: {path.name}")
     if state in {"completed", "acknowledged"}:
         if not payload["artifacts"] and not payload["external_artifacts"]:
             raise ValueError(f"已完成任务缺失产物: {path.name}")
@@ -3609,6 +3631,48 @@ def recover_slice_enqueue_transaction() -> bool:
     return True
 
 
+def current_candidate_generation(task: dict) -> int:
+    control = load_slice_control()
+    active = control.get("active_slice")
+    if not isinstance(active, dict) or active.get("slice_id") != task.get("slice_id"):
+        return 0
+    candidate = active.get("candidate")
+    if not isinstance(candidate, dict):
+        return 0
+    generation = candidate.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError("当前候选代次无效")
+    return generation
+
+
+def state_action_signature(
+    action: str, actor: str, reason: str, target_state: str, candidate_generation: int,
+) -> dict:
+    return {
+        "action": action,
+        "actor": actor,
+        "reason": reason,
+        "target_state": target_state,
+        "candidate_generation": candidate_generation,
+    }
+
+
+def record_state_action(
+    task: dict, action: str, actor: str, reason: str, target_state: str, candidate_generation: int,
+) -> None:
+    task["state_action_receipt"] = state_action_signature(
+        action, actor, reason, target_state, candidate_generation,
+    )
+
+
+def require_identical_state_retry(
+    task: dict, action: str, actor: str, reason: str, target_state: str, candidate_generation: int,
+) -> None:
+    expected = state_action_signature(action, actor, reason, target_state, candidate_generation)
+    if task.get("state_action_receipt") != expected:
+        raise ValueError(f"{action} 重试与已记录动作签名冲突")
+
+
 def cmd_claim(args) -> int:
     _, current_path, current = locate(args.task_id)
     require_current_slice_task(current, "claim")
@@ -3633,6 +3697,8 @@ def cmd_claim(args) -> int:
     if actor != expected_actor:
         raise ValueError(f"claimed-by 必须匹配当前已登记部门会话: {expected_actor}")
 
+    generation = current_candidate_generation(current)
+
     def mutate(item: dict) -> None:
         item["claimed_by"] = actor
         history = list(item.get("ownership_history", []))
@@ -3641,6 +3707,7 @@ def cmd_claim(args) -> int:
             "previous_actor": "", "evidence": "registered-session-claim",
         })
         item["ownership_history"] = history
+        record_state_action(item, "claim", actor, "", "claimed", generation)
 
     task, path = transition(args.task_id, "claim", mutate)
     refresh_inboxes()
@@ -3653,14 +3720,19 @@ def cmd_block(args) -> int:
     require_current_slice_task(current, "block")
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
-    require_task_actor(current, args.actor)
+    actor = require_task_actor(current, args.actor)
     reason = clean("reason", args.reason)
+    generation = current_candidate_generation(current)
     if state == "blocked":
-        if current.get("block_reason") != reason:
-            raise ValueError("block 重试与已记录原因冲突")
+        require_identical_state_retry(current, "block", actor, reason, "blocked", generation)
         print(f"TASK_STATE_NOOP | blocked | {current['task_id']} | {path.relative_to(PROJECT)}")
         return 0
-    task, path = transition(args.task_id, "block", lambda item: item.update(block_reason=reason))
+
+    def mutate(item: dict) -> None:
+        item["block_reason"] = reason
+        record_state_action(item, "block", actor, reason, "blocked", generation)
+
+    task, path = transition(args.task_id, "block", mutate)
     refresh_inboxes()
     print(f"TASK_BLOCKED | {task['task_id']} | {path.relative_to(PROJECT)}")
     return 0
@@ -3671,14 +3743,19 @@ def cmd_wait(args) -> int:
     require_current_slice_task(current, "wait")
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
-    require_task_actor(current, args.actor)
+    actor = require_task_actor(current, args.actor)
     reason = clean("reason", args.reason)
+    generation = current_candidate_generation(current)
     if state == "waiting_input":
-        if current.get("block_reason") != reason:
-            raise ValueError("wait 重试与已记录原因冲突")
+        require_identical_state_retry(current, "wait", actor, reason, "waiting_input", generation)
         print(f"TASK_STATE_NOOP | waiting_input | {current['task_id']} | {path.relative_to(PROJECT)}")
         return 0
-    task, path = transition(args.task_id, "wait", lambda item: item.update(block_reason=reason))
+
+    def mutate(item: dict) -> None:
+        item["block_reason"] = reason
+        record_state_action(item, "wait", actor, reason, "waiting_input", generation)
+
+    task, path = transition(args.task_id, "wait", mutate)
     refresh_inboxes()
     print(f"TASK_WAITING_INPUT | {task['task_id']} | {path.relative_to(PROJECT)}")
     return 0
@@ -3690,10 +3767,10 @@ def cmd_resume(args) -> int:
     require_new_work_open("resume")
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
-    require_task_actor(current, args.actor)
+    actor = require_task_actor(current, args.actor)
+    generation = current_candidate_generation(current)
     if state == "claimed":
-        if current.get("block_reason"):
-            raise ValueError("resume 重试与 claimed TASK 的 block_reason 冲突")
+        require_identical_state_retry(current, "resume", actor, "", "claimed", generation)
         print(f"TASK_STATE_NOOP | claimed | {current['task_id']} | {current_path.relative_to(PROJECT)}")
         return 0
     require_department(current["department"])
@@ -3704,7 +3781,11 @@ def cmd_resume(args) -> int:
     if other:
         raise ValueError("本部门已有其他在办任务: " + ", ".join(other))
     require_formal_temporary_compatibility(current, current_path)
-    task, path = transition(args.task_id, "resume", lambda item: item.update(block_reason=""))
+    def mutate(item: dict) -> None:
+        item["block_reason"] = ""
+        record_state_action(item, "resume", actor, "", "claimed", generation)
+
+    task, path = transition(args.task_id, "resume", mutate)
     refresh_inboxes()
     print(f"TASK_RESUMED | {task['task_id']} | {path.relative_to(PROJECT)}")
     return 0
@@ -7126,7 +7207,7 @@ UPGRADE_TASK_REQUIRED_FIELDS = {
 }
 UPGRADE_TASK_OPTIONAL_FIELDS = {
     "acknowledged_by", "impact_declaration", "temporary_executor", "temporary_operation_history", "resolution",
-    "ownership_history", "slice_id", "task_kind", "gate_type", "gate_attempts",
+    "ownership_history", "state_action_receipt", "slice_id", "task_kind", "gate_type", "gate_attempts",
 }
 UPGRADE_TASK_ID_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
 
@@ -7469,6 +7550,35 @@ def validate_upgrade_task_payload(payload: object, source: Path, departments: se
             for item in ownership
         ):
             raise ValueError(f"TASK ownership_history 无效: {source}")
+        state_action_receipt = payload.get("state_action_receipt")
+        if state_action_receipt is not None:
+            expected_states = {
+                "claim": "claimed", "block": "blocked", "wait": "waiting_input", "resume": "claimed",
+            }
+            action = state_action_receipt.get("action") if isinstance(state_action_receipt, dict) else None
+            reason = state_action_receipt.get("reason") if isinstance(state_action_receipt, dict) else None
+            generation = (
+                state_action_receipt.get("candidate_generation")
+                if isinstance(state_action_receipt, dict) else None
+            )
+            if (
+                not isinstance(state_action_receipt, dict)
+                or set(state_action_receipt) != {
+                    "action", "actor", "reason", "target_state", "candidate_generation",
+                }
+                or action not in expected_states
+                or state_action_receipt.get("target_state") != expected_states[action]
+                or not isinstance(state_action_receipt.get("actor"), str)
+                or not state_action_receipt["actor"]
+                or len(state_action_receipt["actor"]) > ACTOR_MAX_CHARS
+                or not isinstance(reason, str)
+                or len(reason) > 2000
+                or ((action in {"block", "wait"}) != bool(reason))
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 0
+            ):
+                raise ValueError(f"TASK state_action_receipt 无效: {source}")
         attempts = payload.get("gate_attempts", [])
         if payload["task_kind"] == "owner" and attempts:
             raise ValueError(f"owner TASK 不得含 gate_attempts: {source}")
