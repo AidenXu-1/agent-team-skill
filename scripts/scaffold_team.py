@@ -4313,7 +4313,7 @@ def terminal_reopen_priority(
         candidate = active.get("candidate")
         user_exit = active["user_exit"]
         reopen_required = (
-            state == "completed"
+            state in {"completed", "acknowledged"}
             and isinstance(candidate, dict)
             and user_exit["status"] == "needs_revision"
             and user_exit["candidate_id"] == candidate["candidate_id"]

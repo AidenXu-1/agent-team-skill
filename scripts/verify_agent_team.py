@@ -6689,6 +6689,77 @@ def verify_protocol_151_gate_error_recovery_and_blocked_routing(root: Path) -> N
     )
 
 
+def verify_protocol_151_acknowledged_owner_revision_reopen(root: Path) -> None:
+    project, collab, task_tool, owner, candidate, gates, manifest = protocol_151_edge_slice(
+        root, "protocol-151-acknowledged-owner-revision", ("test",),
+    )
+    gate = gates["test"]
+    report = protocol_151_edge_report(
+        collab, gate, candidate, "测试部", "pass", "acknowledged-owner-revision-pass",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate, "--decision", "pass",
+        "--report", str(report.relative_to(project)),
+        "--evidence", "当前候选测试通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate, "--status", "verified",
+        "--evidence", "用户先确认当前代", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", gate,
+        "--actor", "测试部/test-thread", "--artifact", str(report.relative_to(project)),
+        "--report", str(report.relative_to(project)), "--verified", "gate 已固定",
+        "--unverified", "无", "--mistake-check", "等待统筹核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest.relative_to(project)),
+        "--verified", "owner 已固定", "--unverified", "无",
+        "--mistake-check", "等待统筹核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", owner,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate, "--status", "needs_revision",
+        "--evidence", "owner 已核收但 gate 未核收时用户要求返工",
+        "--actor", "统筹部/lead-thread",
+    ])
+    action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "state=acknowledged" in action.stdout
+        and "first_blocker=OWNER_REOPEN_REQUIRED" in action.stdout
+        and f"target_task={owner}" in action.stdout
+        and "allowed=resume,next-action" in action.stdout,
+        "an acknowledged owner with an active user revision was hidden behind TASK_TERMINAL",
+    )
+    denied_gate_ack = run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ], ok=False)
+    check("用户修订" in denied_gate_ack.stderr,
+          "gate acknowledgement closed a slice after an acknowledged owner received a revision")
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ])
+    reopened = json.loads((collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8"))
+    check(
+        reopened["execution_state"] == "claimed"
+        and reopened["completion_history"][-1]["from_state"] == "acknowledged"
+        and reopened["completion_history"][-1]["acknowledged_by"] == "统筹部/lead-thread"
+        and reopened["completion_history"][-1]["candidate_id"] == candidate,
+        "acknowledged owner reopen did not preserve the prior acceptance evidence",
+    )
+
+
 def verify_protocol_151_user_revision(root: Path) -> None:
     def tree_snapshot(path: Path) -> dict[str, str]:
         return {
@@ -7477,6 +7548,7 @@ def main() -> int:
         verify_protocol_151_user_exit_supersession(root)
         verify_protocol_151_completed_revision_reopen(root)
         verify_protocol_151_gate_error_recovery_and_blocked_routing(root)
+        verify_protocol_151_acknowledged_owner_revision_reopen(root)
         verify_protocol_151_user_revision(root)
         verify_protocol_151_active_migration(root)
         verify_protocol_150_migration(root)
