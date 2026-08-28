@@ -6715,14 +6715,35 @@ def verify_protocol_151_acknowledged_owner_revision_reopen(root: Path) -> None:
         "--unverified", "无", "--mistake-check", "等待统筹核收",
     ])
     run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
         sys.executable, str(task_tool), "complete", "--task-id", owner,
         "--actor", "开发部/dev-thread", "--artifact", str(manifest.relative_to(project)),
         "--verified", "owner 已固定", "--unverified", "无",
         "--mistake-check", "等待统筹核收",
     ])
+    gate_path = collab / "tasks" / f"{gate}.json"
+    legacy_gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    legacy_gate["execution_state"] = "completed"
+    legacy_gate.pop("acknowledged_by", None)
+    legacy_gate["revision"] += 1
+    gate_path.write_text(
+        json.dumps(legacy_gate, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    owner_path = collab / "tasks" / f"{owner}.json"
+    acknowledged_owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    acknowledged_owner["execution_state"] = "acknowledged"
+    acknowledged_owner["acknowledged_by"] = "统筹部/lead-thread"
+    acknowledged_owner["revision"] += 1
+    owner_path.write_text(
+        json.dumps(acknowledged_owner, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     run([
-        sys.executable, str(task_tool), "ack", "--task-id", owner,
-        "--acknowledged-by", "统筹部/lead-thread",
+        sys.executable, str(task_tool), "rebuild-index", "--actor", "统筹部/lead-thread",
     ])
     run([
         sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
@@ -6758,6 +6779,65 @@ def verify_protocol_151_acknowledged_owner_revision_reopen(root: Path) -> None:
         and reopened["completion_history"][-1]["candidate_id"] == candidate,
         "acknowledged owner reopen did not preserve the prior acceptance evidence",
     )
+
+
+def verify_protocol_151_gate_ack_order(root: Path) -> None:
+    project, collab, task_tool, owner, candidate, gates, manifest = protocol_151_edge_slice(
+        root, "protocol-151-gate-ack-order", ("test",),
+    )
+    gate = gates["test"]
+    report = protocol_151_edge_report(
+        collab, gate, candidate, "测试部", "pass", "gate-ack-order-pass",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate, "--decision", "pass",
+        "--report", str(report.relative_to(project)),
+        "--evidence", "当前候选测试通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate, "--status", "not_applicable",
+        "--evidence", "纯协议探针无需真实用户出口", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", gate,
+        "--actor", "测试部/test-thread", "--artifact", str(report.relative_to(project)),
+        "--report", str(report.relative_to(project)), "--verified", "gate 已固定",
+        "--unverified", "无", "--mistake-check", "等待统筹核收",
+    ])
+    action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=GATE_TASK_ACK_REQUIRED" in action.stdout
+        and f"target_task={gate}" in action.stdout
+        and "allowed=ack,next-action" in action.stdout,
+        "owner next-action did not route a completed gate to acknowledgement",
+    )
+    premature_complete = run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest.relative_to(project)),
+        "--verified", "owner 已固定", "--unverified", "无",
+        "--mistake-check", "不得跳过 gate 核收",
+    ], ok=False)
+    check("尚未核收" in premature_complete.stderr,
+          "owner completed before all required gate tasks were acknowledged")
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    ready = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check("first_blocker=NONE" in ready.stdout and "allowed=complete,next-action" in ready.stdout,
+          "owner was not released after every required gate was acknowledged")
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest.relative_to(project)),
+        "--verified", "owner 已固定", "--unverified", "无",
+        "--mistake-check", "gate 已先核收",
+    ])
 
 
 def verify_protocol_151_user_revision(root: Path) -> None:
@@ -7347,6 +7427,10 @@ summary: 当前代候选已完成独立审核
             "--verified", "第二代审核通过", "--unverified", "无",
             "--mistake-check", "已检查", "--report", str(report.relative_to(project)),
         ])
+        run([
+            sys.executable, str(task_tool), "ack", "--task-id", gate,
+            "--acknowledged-by", "统筹部/lead-thread",
+        ])
     completed = owner_complete(ok=True)
     check(completed.stdout.startswith("TASK_STATE_OK"),
           "generation 2 did not complete after two fresh PASS verdicts and verified user exit")
@@ -7549,6 +7633,7 @@ def main() -> int:
         verify_protocol_151_completed_revision_reopen(root)
         verify_protocol_151_gate_error_recovery_and_blocked_routing(root)
         verify_protocol_151_acknowledged_owner_revision_reopen(root)
+        verify_protocol_151_gate_ack_order(root)
         verify_protocol_151_user_revision(root)
         verify_protocol_151_active_migration(root)
         verify_protocol_150_migration(root)

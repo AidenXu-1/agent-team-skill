@@ -4357,8 +4357,16 @@ def gate_task_completion_priority(active: dict, *, frozen: bool) -> dict[str, ob
         if not gate_task_id:
             continue
         gate_state, _, gate_task = locate(gate_task_id)
-        if gate_state in {"completed", "acknowledged"}:
+        if gate_state == "acknowledged":
             continue
+        if gate_state == "completed":
+            return {
+                "first_blocker": "GATE_TASK_ACK_REQUIRED",
+                "target_task_id": gate_task_id,
+                "allowed": ["ack", "next-action"],
+                "forbidden": ["owner-complete", "owner-ack", "bind-candidate"],
+                "user_decision": False,
+            }
         if not task_owner_is_current(gate_task):
             decision = owner_rebind_priority()
             decision["target_task_id"] = gate_task_id
@@ -4501,6 +4509,10 @@ def next_action_decision(task_id: str) -> dict[str, object]:
     terminal_reopen = terminal_reopen_priority(state, task, active, frozen=mode == "frozen")
     if terminal_reopen is not None:
         return terminal_reopen
+    if task["task_kind"] == "owner" and state in {"completed", "acknowledged"}:
+        gate_close = gate_task_completion_priority(active, frozen=mode == "frozen")
+        if gate_close is not None:
+            return gate_close
     authorization = authorization_priority(state, task, frozen=mode == "frozen")
     if authorization is not None:
         return authorization
@@ -5115,10 +5127,10 @@ def cmd_complete(args) -> int:
                 raise ValueError("owner 完成必须提交当前候选 manifest 作为本地产物")
             incomplete_gates = [
                 task_id for task_id in active["gate_tasks"].values()
-                if locate(task_id)[0] not in {"completed", "acknowledged"}
+                if locate(task_id)[0] != "acknowledged"
             ]
             if incomplete_gates:
-                raise ValueError("gate TASK 尚未完成: " + ", ".join(incomplete_gates))
+                raise ValueError("gate TASK 尚未核收: " + ", ".join(incomplete_gates))
     if current.get("completion_class") == "audit" or audit_department(current["department"]):
         report_path = audit_report(
             args.report, current["department"], current["task_id"],
@@ -5164,6 +5176,13 @@ def cmd_ack(args) -> int:
         _, active = require_active_slice_task(current, current["task_kind"])
         if active["user_exit"]["status"] == "needs_revision":
             raise ValueError("用户修订尚未完成，不能核收或关闭当前切片")
+        if current["task_kind"] == "owner":
+            unacknowledged_gates = [
+                task_id for task_id in active["gate_tasks"].values()
+                if locate(task_id)[0] != "acknowledged"
+            ]
+            if unacknowledged_gates:
+                raise ValueError("gate TASK 尚未核收，不能先核收 owner: " + ", ".join(unacknowledged_gates))
     timestamp = now_iso()
     close_transaction = prepare_slice_close_transaction(
         action="ack", task=current, actor=actor, timestamp=timestamp,
