@@ -6866,6 +6866,85 @@ def verify_protocol_151_cross_slice_candidate_lineage(root: Path) -> None:
     run([sys.executable, str(task_tool), "doctor"])
 
 
+def verify_protocol_151_candidate_binding_provenance(root: Path) -> None:
+    project, collab, task_tool, owner, _, _, _ = protocol_151_edge_slice(
+        root, "protocol-151-candidate-binding-provenance", (),
+    )
+    control_path = collab / ".locks" / "slice-control.json"
+    clean_control = json.loads(control_path.read_text(encoding="utf-8"))
+    missing_actor_control = json.loads(json.dumps(clean_control, ensure_ascii=False))
+    missing_actor_control["active_slice"]["candidate"]["bound_by"] = ""
+    control_path.write_text(
+        json.dumps(missing_actor_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    missing_actor = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "活动候选绑定 actor 无效" in missing_actor.stderr,
+        "doctor accepted an active candidate without a binding actor",
+    )
+    invalid_time_control = json.loads(json.dumps(clean_control, ensure_ascii=False))
+    invalid_time_control["active_slice"]["candidate"]["bound_at"] = "not-a-time"
+    control_path.write_text(
+        json.dumps(invalid_time_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    invalid_time = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "活动候选绑定时间无效" in invalid_time.stderr,
+        "doctor accepted an active candidate with an invalid binding timestamp",
+    )
+    forged_actor_control = json.loads(json.dumps(clean_control, ensure_ascii=False))
+    forged_actor_control["active_slice"]["candidate"]["bound_by"] = "开发部/forged-thread"
+    control_path.write_text(
+        json.dumps(forged_actor_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    forged_actor = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "活动候选绑定 actor 不在 owner 身份历史中" in forged_actor.stderr,
+        "doctor accepted a binding actor absent from the owner identity history",
+    )
+    predated_binding_control = json.loads(json.dumps(clean_control, ensure_ascii=False))
+    predated_binding_control["active_slice"]["candidate"]["bound_at"] = "2000-01-01T00:00:00+00:00"
+    control_path.write_text(
+        json.dumps(predated_binding_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    predated_binding = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "活动候选绑定时间早于 actor 身份生效" in predated_binding.stderr,
+        "doctor accepted a candidate binding that predates its owner identity",
+    )
+    control_path.write_text(
+        json.dumps(clean_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    protocol_151_switch_session(collab, "开发部", "dev-thread", "dev-thread-v2")
+    owner_payload = json.loads(
+        (collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8")
+    )
+    run([
+        sys.executable, str(task_tool), "rebind-owner", "--task-id", owner,
+        "--expected-revision", str(owner_payload["revision"]),
+        "--actor", "开发部/dev-thread-v2", "--previous-actor", "开发部/dev-thread",
+        "--evidence", "candidate provenance shift regression",
+    ])
+    shifted = run([sys.executable, str(task_tool), "doctor"])
+    check(
+        shifted.stdout.startswith("TASK_DOCTOR_OK"),
+        "doctor rejected a valid candidate because the owner later changed shifts",
+    )
+
+
 def verify_protocol_151_acknowledged_owner_revision_reopen(root: Path) -> None:
     project, collab, task_tool, owner, candidate, gates, manifest = protocol_151_edge_slice(
         root, "protocol-151-acknowledged-owner-revision", ("test",),
@@ -7733,6 +7812,64 @@ summary: 迁移前当前代独立审核通过
         f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{IMMEDIATE_PREVIOUS_PROTOCOL_VERSION}",
     ), encoding="utf-8")
 
+    valid_150_slice = slice_path.read_bytes()
+    missing_bound_actor = json.loads(valid_150_slice.decode("utf-8"))
+    missing_bound_actor["active_slice"]["candidate"]["bound_by"] = ""
+    slice_path.write_text(
+        json.dumps(missing_bound_actor, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    invalid_binding_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.5.0 活动候选绑定 actor 无效" in invalid_binding_upgrade.stderr,
+        "1.5.0 migration accepted an active candidate without a binding actor",
+    )
+    slice_path.write_bytes(valid_150_slice)
+    invalid_bound_time = json.loads(valid_150_slice.decode("utf-8"))
+    invalid_bound_time["active_slice"]["candidate"]["bound_at"] = "not-a-time"
+    slice_path.write_text(
+        json.dumps(invalid_bound_time, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    invalid_time_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.5.0 活动候选绑定时间无效" in invalid_time_upgrade.stderr,
+        "1.5.0 migration accepted an invalid candidate binding timestamp",
+    )
+    slice_path.write_bytes(valid_150_slice)
+    forged_bound_actor = json.loads(valid_150_slice.decode("utf-8"))
+    forged_bound_actor["active_slice"]["candidate"]["bound_by"] = "开发部/forged-thread"
+    slice_path.write_text(
+        json.dumps(forged_bound_actor, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    forged_actor_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.5.0 活动候选绑定 actor 不在 owner 身份历史中" in forged_actor_upgrade.stderr,
+        "1.5.0 migration accepted a binding actor absent from owner history",
+    )
+    slice_path.write_bytes(valid_150_slice)
+    predated_bound_time = json.loads(valid_150_slice.decode("utf-8"))
+    predated_bound_time["active_slice"]["candidate"]["bound_at"] = "2000-01-01T00:00:00+00:00"
+    slice_path.write_text(
+        json.dumps(predated_bound_time, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    predated_time_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.5.0 活动候选绑定时间早于 actor 身份生效" in predated_time_upgrade.stderr,
+        "1.5.0 migration accepted a binding time before owner identity activation",
+    )
+    slice_path.write_bytes(valid_150_slice)
+
     upgraded = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
     migrated = json.loads(slice_path.read_text(encoding="utf-8"))
     check(
@@ -7809,6 +7946,7 @@ def main() -> int:
         verify_protocol_151_user_exit_supersession(root)
         verify_protocol_151_completed_revision_reopen(root)
         verify_protocol_151_gate_error_recovery_and_blocked_routing(root)
+        verify_protocol_151_candidate_binding_provenance(root)
         verify_protocol_151_cross_slice_candidate_lineage(root)
         verify_protocol_151_acknowledged_owner_revision_reopen(root)
         verify_protocol_151_gate_ack_order(root)

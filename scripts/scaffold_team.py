@@ -2924,6 +2924,28 @@ def load_slice_control() -> dict:
             or candidate["generation"] < 1
         ):
             raise ValueError("候选身份字段无效")
+        bound_by = candidate.get("bound_by")
+        if (
+            not isinstance(bound_by, str)
+            or not bound_by
+            or bound_by != bound_by.strip()
+            or len(bound_by) > ACTOR_MAX_CHARS
+            or any(char.isspace() for char in bound_by)
+        ):
+            raise ValueError("活动候选绑定 actor 无效")
+        try:
+            bound_at = parse_task_timestamp(candidate, "bound_at")
+        except ValueError as exc:
+            raise ValueError("活动候选绑定时间无效") from exc
+        _, _, owner_task = locate(active["owner_task_id"])
+        binding_actor_events = [
+            entry for entry in owner_task.get("ownership_history", [])
+            if entry["actor"] == bound_by
+        ]
+        if not binding_actor_events:
+            raise ValueError("活动候选绑定 actor 不在 owner 身份历史中")
+        if not any(parse_task_timestamp(entry, "at") <= bound_at for entry in binding_actor_events):
+            raise ValueError("活动候选绑定时间早于 actor 身份生效")
         if candidate["candidate_id"] not in candidate_ids:
             raise ValueError("活动候选未登记到永久身份账本")
     user_exit = active.get("user_exit")
@@ -8742,6 +8764,32 @@ def migrated_slice_control(
             or candidate["generation"] < 1
         ):
             raise ValueError("1.5.0 活动候选身份无效")
+        if candidate is not None:
+            bound_by = candidate.get("bound_by")
+            if (
+                not isinstance(bound_by, str)
+                or not bound_by
+                or bound_by != bound_by.strip()
+                or len(bound_by) > ACTOR_MAX_CHARS
+                or any(char.isspace() for char in bound_by)
+            ):
+                raise ValueError("1.5.0 活动候选绑定 actor 无效")
+            try:
+                bound_at = validate_upgrade_task_timestamp(candidate.get("bound_at"), "candidate.bound_at")
+            except ValueError as exc:
+                raise ValueError("1.5.0 活动候选绑定时间无效") from exc
+            owner_task = by_id[active["owner_task_id"]]
+            binding_actor_events = [
+                entry for entry in owner_task.get("ownership_history", [])
+                if isinstance(entry, dict) and entry.get("actor") == bound_by
+            ]
+            if not binding_actor_events:
+                raise ValueError("1.5.0 活动候选绑定 actor 不在 owner 身份历史中")
+            if not any(
+                validate_upgrade_task_timestamp(entry.get("at"), "ownership_history.at") <= bound_at
+                for entry in binding_actor_events
+            ):
+                raise ValueError("1.5.0 活动候选绑定时间早于 actor 身份生效")
         user_exit = active.get("user_exit")
         if (
             not isinstance(user_exit, dict)
