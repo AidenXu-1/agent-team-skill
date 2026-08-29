@@ -6943,6 +6943,25 @@ def verify_protocol_151_candidate_binding_provenance(root: Path) -> None:
         shifted.stdout.startswith("TASK_DOCTOR_OK"),
         "doctor rejected a valid candidate because the owner later changed shifts",
     )
+    shifted_control = json.loads(control_path.read_text(encoding="utf-8"))
+    shifted_owner = json.loads(
+        (collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8")
+    )
+    rebound_at = dt.datetime.fromisoformat(shifted_owner["ownership_history"][-1]["at"])
+    shifted_control["active_slice"]["candidate"]["bound_at"] = (
+        rebound_at + dt.timedelta(minutes=1)
+    ).isoformat(timespec="minutes")
+    control_path.write_text(
+        json.dumps(shifted_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    stale_actor_binding = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "活动候选绑定时间不在 actor 负责区间" in stale_actor_binding.stderr,
+        "doctor accepted an old owner as the binding actor after a later rebind",
+    )
 
 
 def verify_protocol_151_acknowledged_owner_revision_reopen(root: Path) -> None:
@@ -7868,6 +7887,44 @@ summary: 迁移前当前代独立审核通过
         "1.5.0 活动候选绑定时间早于 actor 身份生效" in predated_time_upgrade.stderr,
         "1.5.0 migration accepted a binding time before owner identity activation",
     )
+    slice_path.write_bytes(valid_150_slice)
+    owner_path = collab / "tasks" / f"{owner}.json"
+    valid_150_owner = owner_path.read_bytes()
+    rebound_owner = json.loads(valid_150_owner.decode("utf-8"))
+    valid_150_control = json.loads(valid_150_slice.decode("utf-8"))
+    original_bound_at = dt.datetime.fromisoformat(
+        valid_150_control["active_slice"]["candidate"]["bound_at"]
+    )
+    rebound_at = original_bound_at + dt.timedelta(minutes=1)
+    rebound_owner["ownership_history"].append({
+        "at": rebound_at.isoformat(timespec="minutes"),
+        "action": "rebind",
+        "actor": "开发部/dev-thread-v2",
+        "previous_actor": "开发部/dev-thread",
+        "evidence": "migration candidate provenance interval probe",
+    })
+    rebound_owner["claimed_by"] = "开发部/dev-thread-v2"
+    rebound_owner["updated_at"] = rebound_at.isoformat(timespec="minutes")
+    rebound_owner["revision"] += 1
+    owner_path.write_text(
+        json.dumps(rebound_owner, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    valid_150_control["active_slice"]["candidate"]["bound_at"] = (
+        rebound_at + dt.timedelta(minutes=1)
+    ).isoformat(timespec="minutes")
+    slice_path.write_text(
+        json.dumps(valid_150_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    stale_actor_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.5.0 活动候选绑定时间不在 actor 负责区间" in stale_actor_upgrade.stderr,
+        "1.5.0 migration accepted an old binding actor after a later rebind",
+    )
+    owner_path.write_bytes(valid_150_owner)
     slice_path.write_bytes(valid_150_slice)
 
     upgraded = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
