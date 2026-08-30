@@ -27,7 +27,7 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.5.0"
+PROTOCOL_VERSION = "1.5.1"
 PROTOCOL_FILE = "协议版本.json"
 ADD_TRANSACTION_FILE = ".add-roles-transaction.json"
 DEACTIVATE_TRANSACTION_FILE = ".deactivate-roles-transaction.json"
@@ -560,6 +560,23 @@ def rollback_surface_state_sha256(project: Path, manifest: dict) -> str:
             rows.append(row)
         else:
             raise ValueError(f"升级回滚目录状态表面类型无效: {relative}")
+    tasks_root = project / "docs" / "collaboration" / "tasks"
+    if tasks_root.is_symlink():
+        raise ValueError("升级回滚 TASK 状态表面不能是符号链接")
+    if tasks_root.exists():
+        if not plain_path_within(tasks_root, project, kind="dir"):
+            raise ValueError("升级回滚 TASK 状态表面不安全")
+        task_rows = []
+        for task_path in sorted(tasks_root.glob("TASK-*.json")):
+            relative = task_path.relative_to(project).as_posix()
+            if task_path.is_symlink() or not plain_path_within(task_path, project, kind="file"):
+                raise ValueError(f"升级回滚 TASK 状态表面不安全: {relative}")
+            task_rows.append({
+                "path": relative,
+                "sha256": hashlib.sha256(task_path.read_bytes()).hexdigest(),
+                "mode": f"{stat.S_IMODE(task_path.stat().st_mode):04o}",
+            })
+        rows.append({"kind": "task-state-guard", "tasks": task_rows})
     return hashlib.sha256(
         json.dumps(rows, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     ).hexdigest()
@@ -783,8 +800,10 @@ def current_runtime_complete(collab: Path) -> bool:
             return False
         task_payloads = iter_upgrade_task_payloads(collab)
         validate_session_thread_identities(state_payload, task_payloads)
-        _, archive_recovery = load_legacy_archive_recovery(collab, task_payloads)
-        load_legacy_closeout_index(collab, task_payloads, archive_recovery["entries"])
+        _, archive_recovery = load_legacy_archive_recovery(collab, task_payloads, PROTOCOL_VERSION)
+        load_legacy_closeout_index(
+            collab, task_payloads, archive_recovery["entries"], PROTOCOL_VERSION,
+        )
         expected_paths = managed_relative_paths(roles)
         manifest = protocol.get("managed_files")
         if not isinstance(manifest, dict) or sorted(manifest) != expected_paths:
@@ -1688,7 +1707,7 @@ LEGACY_ARCHIVE_RECOVERY = LOCKS / "legacy-archive-recovery.json"
 LEGACY_CLOSEOUT_INDEX = LOCKS / "legacy-closeout-index.json"
 SCHEMA_VERSION = 2
 LEGACY_SCHEMA_VERSION = 1
-PROTOCOL_VERSION = "1.5.0"
+PROTOCOL_VERSION = "1.5.1"
 STATES = ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowledged")
 THREAD_ID_MAX_CHARS = 300
 ACTOR_MAX_CHARS = 400
@@ -1714,14 +1733,17 @@ TASK_FIELDS = {
 }
 OPTIONAL_TASK_FIELDS = {
     "acknowledged_by", "impact_declaration", "temporary_executor", "temporary_operation_history", "resolution",
-    "ownership_history",
+    "ownership_history", "state_action_receipt", "completion_history",
     "slice_id", "task_kind", "gate_type", "gate_attempts",
 }
 TRANSITIONS = {
     "claim": {"queued": "claimed"},
     "block": {"claimed": "blocked"},
     "wait": {"claimed": "waiting_input", "blocked": "waiting_input"},
-    "resume": {"blocked": "claimed", "waiting_input": "claimed"},
+    "resume": {
+        "blocked": "claimed", "waiting_input": "claimed",
+        "completed": "claimed", "acknowledged": "claimed",
+    },
     "complete": {"claimed": "completed"},
     "ack": {"completed": "acknowledged"},
 }
@@ -2089,6 +2111,54 @@ def validate_task_payload(payload: object, path: Path) -> dict:
             raise ValueError(f"任务 rebind 身份历史不连续: {path.name}")
         previous_owner = actor
 
+    completion_history = payload.get("completion_history", [])
+    completion_fields = {
+        "from_state", "completed_revision", "completed_at", "reopened_at", "reopened_by", "reason",
+        "candidate_id", "candidate_manifest", "candidate_sha256", "generation", "artifacts",
+        "external_artifacts", "verified", "unverified", "mistake_check", "report", "event_receipts",
+        "acknowledged_by",
+    }
+    if not isinstance(completion_history, list) or len(completion_history) > 100:
+        raise ValueError(f"任务 completion_history 无效: {path.name}")
+    for entry in completion_history:
+        if not isinstance(entry, dict) or set(entry) != completion_fields:
+            raise ValueError(f"任务 completion_history 条目无效: {path.name}")
+        if entry.get("from_state") not in {"completed", "acknowledged"}:
+            raise ValueError(f"任务 completion_history 原状态无效: {path.name}")
+        completed_revision = entry.get("completed_revision")
+        generation = entry.get("generation")
+        if (
+            isinstance(completed_revision, bool) or not isinstance(completed_revision, int) or completed_revision < 1
+            or isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
+            or not CANDIDATE_ID_RE.fullmatch(entry.get("candidate_id", ""))
+            or not re.fullmatch(r"[0-9a-f]{64}", entry.get("candidate_sha256", ""))
+        ):
+            raise ValueError(f"任务 completion_history 候选或版本无效: {path.name}")
+        candidate_manifest(
+            entry["candidate_manifest"], entry["candidate_id"], entry["candidate_sha256"],
+        )
+        for field, max_chars, allow_empty in (
+            ("candidate_manifest", 500, False), ("reopened_by", ACTOR_MAX_CHARS, False),
+            ("reason", 1000, False), ("mistake_check", 2000, False),
+            ("report", 500, False), ("acknowledged_by", ACTOR_MAX_CHARS, True),
+        ):
+            require_task_text(entry, field, allow_empty=allow_empty, max_chars=max_chars)
+        parse_task_timestamp(entry, "completed_at")
+        parse_task_timestamp(entry, "reopened_at")
+        for field, max_chars in (
+            ("artifacts", 500), ("external_artifacts", 1000), ("verified", 2000),
+            ("unverified", 2000), ("event_receipts", 1000),
+        ):
+            require_task_text_list(entry, field, max_chars=max_chars)
+        if not entry["artifacts"] and not entry["external_artifacts"]:
+            raise ValueError(f"任务 completion_history 缺少历史产物: {path.name}")
+        if not entry["verified"] or not entry["unverified"]:
+            raise ValueError(f"任务 completion_history 缺少历史验证记录: {path.name}")
+        if entry["from_state"] == "acknowledged" and not entry["acknowledged_by"]:
+            raise ValueError(f"任务 completion_history 缺少历史核收人: {path.name}")
+        if entry["from_state"] == "completed" and entry["acknowledged_by"]:
+            raise ValueError(f"任务 completion_history 未核收状态不得带核收人: {path.name}")
+
     require_task_text_list(payload, "failure_paths", min_items=1, max_items=3, max_chars=1000)
     for field, max_chars in (
         ("pointers", 500), ("artifacts", 500), ("external_artifacts", 1000),
@@ -2221,6 +2291,28 @@ def validate_task_payload(payload: object, path: Path) -> dict:
         raise ValueError(f"已核收任务缺失 acknowledged_by: {path.name}")
     if state != "acknowledged" and payload.get("acknowledged_by", "").strip():
         raise ValueError(f"未核收任务不得预填 acknowledged_by: {path.name}")
+    state_action_receipt = payload.get("state_action_receipt")
+    if state_action_receipt is not None:
+        if not isinstance(state_action_receipt, dict) or set(state_action_receipt) != {
+            "action", "actor", "reason", "target_state", "candidate_generation",
+        }:
+            raise ValueError(f"任务 state_action_receipt 结构无效: {path.name}")
+        action = state_action_receipt.get("action")
+        target_state = state_action_receipt.get("target_state")
+        expected_states = {
+            "claim": "claimed", "block": "blocked", "wait": "waiting_input", "resume": "claimed",
+        }
+        if action not in expected_states or target_state != expected_states[action]:
+            raise ValueError(f"任务 state_action_receipt 动作或目标状态无效: {path.name}")
+        require_task_text(state_action_receipt, "actor", max_chars=ACTOR_MAX_CHARS)
+        reason = require_task_text(state_action_receipt, "reason", allow_empty=True, max_chars=2000)
+        if (action in {"block", "wait"}) != bool(reason):
+            raise ValueError(f"任务 state_action_receipt 原因与动作不一致: {path.name}")
+        generation = state_action_receipt.get("candidate_generation")
+        if isinstance(generation, bool) or not isinstance(generation, int) or generation < 0:
+            raise ValueError(f"任务 state_action_receipt 候选代次无效: {path.name}")
+        if state in {"claimed", "blocked", "waiting_input"} and target_state != state:
+            raise ValueError(f"任务 state_action_receipt 与当前状态不一致: {path.name}")
     if state in {"completed", "acknowledged"}:
         if not payload["artifacts"] and not payload["external_artifacts"]:
             raise ValueError(f"已完成任务缺失产物: {path.name}")
@@ -2536,6 +2628,48 @@ def default_slice_control() -> dict:
     }
 
 
+def slice_candidate_lineage(active: dict) -> list[dict[str, object]]:
+    """Rebuild one slice's generation-to-candidate map from redundant hot evidence."""
+    by_generation: dict[int, str] = {}
+
+    def record(candidate_id: object, generation: object) -> None:
+        if (
+            not isinstance(candidate_id, str) or not CANDIDATE_ID_RE.fullmatch(candidate_id)
+            or isinstance(generation, bool) or not isinstance(generation, int) or generation < 1
+        ):
+            raise ValueError("切片候选谱系条目无效")
+        previous = by_generation.get(generation)
+        if previous is not None and previous != candidate_id:
+            raise ValueError("同一候选代次绑定了冲突身份")
+        if candidate_id in by_generation.values() and previous != candidate_id:
+            raise ValueError("候选身份跨代次重复")
+        by_generation[generation] = candidate_id
+
+    candidate = active.get("candidate")
+    if candidate is not None:
+        record(candidate.get("candidate_id"), candidate.get("generation"))
+    for request in active.get("revision_requests", []):
+        if isinstance(request, dict):
+            record(request.get("source_candidate_id"), request.get("source_generation"))
+            if request.get("status") == "consumed":
+                record(request.get("consumed_by_candidate_id"), request.get("consumed_generation"))
+    for task_id in active.get("gate_tasks", {}).values():
+        _, _, gate_task = locate(task_id)
+        for attempt in gate_task.get("gate_attempts", []):
+            record(attempt.get("candidate_id"), attempt.get("generation"))
+    if candidate is None:
+        if by_generation:
+            raise ValueError("无当前候选的切片不得保留候选谱系")
+        return []
+    generation = candidate["generation"]
+    if sorted(by_generation) != list(range(1, generation + 1)):
+        raise ValueError("切片候选谱系代次不连续")
+    return [
+        {"candidate_id": by_generation[index], "generation": index}
+        for index in range(1, generation + 1)
+    ]
+
+
 def load_slice_control() -> dict:
     if SLICE_CONTROL.is_symlink() or not SLICE_CONTROL.is_file():
         raise ValueError("切片控制缺失或不安全；运行协议升级或重新生成协作层")
@@ -2562,13 +2696,27 @@ def load_slice_control() -> dict:
         raise ValueError("候选永久身份账本无效")
     seen_slices: set[str] = set()
     seen_candidates: set[str] = set()
+    managed_history_candidate_ids: list[str] = []
+    managed_history_started = False
     for entry in history:
         base_fields = {
             "slice_id", "owner_task_id", "candidate_id", "candidate_manifest",
             "candidate_sha256", "closed_at", "metrics",
         }
-        if not isinstance(entry, dict) or frozenset(entry) not in {frozenset(base_fields), frozenset(base_fields | {"resolution"})}:
+        evidence_fields = {"user_exit", "revision_requests", "candidate_lineage"}
+        accepted_fields = {
+            frozenset(base_fields),
+            frozenset(base_fields | {"resolution"}),
+            frozenset(base_fields | evidence_fields),
+            frozenset(base_fields | evidence_fields | {"resolution"}),
+        }
+        if not isinstance(entry, dict) or frozenset(entry) not in accepted_fields:
             raise ValueError("切片冷历史条目结构无效")
+        managed_entry = evidence_fields <= set(entry)
+        if managed_entry:
+            managed_history_started = True
+        elif managed_history_started:
+            raise ValueError("受管冷历史之后不得追加无候选谱系的旧格式条目")
         if (
             not SLICE_ID_RE.fullmatch(entry.get("slice_id", ""))
             or not TASK_ID_RE.fullmatch(entry.get("owner_task_id", ""))
@@ -2596,12 +2744,158 @@ def load_slice_control() -> dict:
             raise ValueError("切片冷历史 resolution 无效")
         if not isinstance(entry.get("metrics"), list):
             raise ValueError("切片冷历史 metrics 无效")
+        if managed_entry:
+            user_exit = entry["user_exit"]
+            revision_requests = entry["revision_requests"]
+            lineage = entry["candidate_lineage"]
+            if (
+                not isinstance(user_exit, dict)
+                or set(user_exit) != {"status", "evidence", "actor", "at", "candidate_id", "generation"}
+                or user_exit.get("status") not in {"pending", "needs_revision", "verified", "not_applicable"}
+                or not isinstance(revision_requests, list)
+                or len(revision_requests) > 100
+                or not isinstance(lineage, list)
+                or len(lineage) > 100
+            ):
+                raise ValueError("切片冷历史用户出口或修订证据无效")
+            lineage_by_generation: dict[int, str] = {}
+            lineage_ids: list[str] = []
+            for position, item in enumerate(lineage, start=1):
+                if (
+                    not isinstance(item, dict)
+                    or set(item) != {"candidate_id", "generation"}
+                    or item.get("generation") != position
+                    or not isinstance(item.get("candidate_id"), str)
+                    or not CANDIDATE_ID_RE.fullmatch(item["candidate_id"])
+                    or item["candidate_id"] not in candidate_ids
+                    or item["candidate_id"] in lineage_ids
+                ):
+                    raise ValueError("切片冷历史候选谱系无效")
+                lineage_by_generation[position] = item["candidate_id"]
+                lineage_ids.append(item["candidate_id"])
+            managed_history_candidate_ids.extend(lineage_ids)
+            user_candidate = user_exit.get("candidate_id")
+            user_generation = user_exit.get("generation")
+            if candidate_id:
+                if (
+                    user_candidate != candidate_id
+                    or isinstance(user_generation, bool)
+                    or not isinstance(user_generation, int)
+                    or user_generation < 1
+                    or lineage_by_generation.get(user_generation) != candidate_id
+                    or user_generation != len(lineage)
+                    or not all(isinstance(user_exit.get(field), str) for field in ("evidence", "actor", "at"))
+                    or (
+                        user_exit["status"] == "pending"
+                        and any(user_exit[field] for field in ("evidence", "actor", "at"))
+                    )
+                    or (
+                        user_exit["status"] != "pending"
+                        and not all(user_exit[field] for field in ("evidence", "actor", "at"))
+                    )
+                ):
+                    raise ValueError("切片冷历史用户出口与最终候选不一致")
+                if user_exit["status"] != "pending":
+                    parse_task_timestamp(user_exit, "at")
+            elif user_exit != {
+                "status": "pending", "evidence": "", "actor": "", "at": "",
+                "candidate_id": "", "generation": 0,
+            } or revision_requests or lineage:
+                raise ValueError("无候选切片的冷历史用户出口或修订证据无效")
+
+            expected_revision_fields = {
+                "source_candidate_id", "source_generation", "evidence", "actor", "at", "status",
+                "consumed_by_candidate_id", "consumed_generation", "consumed_at", "superseded_user_exit",
+            }
+            seen_revision_sources: set[tuple[str, int]] = set()
+            pending_revision = None
+            source_generations: list[int] = []
+            for request in revision_requests:
+                if not isinstance(request, dict) or set(request) != expected_revision_fields:
+                    raise ValueError("切片冷历史用户修订记录结构无效")
+                source = (request.get("source_candidate_id"), request.get("source_generation"))
+                if (
+                    not isinstance(source[0], str) or not CANDIDATE_ID_RE.fullmatch(source[0])
+                    or isinstance(source[1], bool) or not isinstance(source[1], int) or source[1] < 1
+                    or source in seen_revision_sources or source[0] not in candidate_ids
+                    or not all(
+                        isinstance(request.get(field), str) and request[field]
+                        for field in ("evidence", "actor", "at")
+                    )
+                    or request.get("status") not in {"pending", "consumed"}
+                    or lineage_by_generation.get(source[1]) != source[0]
+                ):
+                    raise ValueError("切片冷历史用户修订记录内容无效")
+                parse_task_timestamp(request, "at")
+                superseded = request["superseded_user_exit"]
+                if (
+                    not isinstance(superseded, dict)
+                    or set(superseded) != {"status", "evidence", "actor", "at", "candidate_id", "generation"}
+                    or superseded.get("status") not in {"pending", "verified", "not_applicable"}
+                    or superseded.get("candidate_id") != source[0]
+                    or superseded.get("generation") != source[1]
+                    or not all(isinstance(superseded.get(field), str) for field in ("evidence", "actor", "at"))
+                    or (
+                        superseded["status"] == "pending"
+                        and any(superseded[field] for field in ("evidence", "actor", "at"))
+                    )
+                    or (
+                        superseded["status"] != "pending"
+                        and not all(superseded[field] for field in ("evidence", "actor", "at"))
+                    )
+                ):
+                    raise ValueError("切片冷历史未保全被替代的用户出口")
+                if superseded["status"] != "pending":
+                    parse_task_timestamp(superseded, "at")
+                seen_revision_sources.add(source)
+                source_generations.append(source[1])
+                if request["status"] == "pending":
+                    if (
+                        request["consumed_by_candidate_id"] != ""
+                        or request["consumed_generation"] != 0
+                        or request["consumed_at"] != ""
+                        or pending_revision is not None
+                    ):
+                        raise ValueError("切片冷历史待消费用户修订记录无效")
+                    pending_revision = request
+                else:
+                    consumed_id = request.get("consumed_by_candidate_id")
+                    consumed_generation = request.get("consumed_generation")
+                    if (
+                        not isinstance(consumed_id, str) or not CANDIDATE_ID_RE.fullmatch(consumed_id)
+                        or consumed_id not in candidate_ids or consumed_id == source[0]
+                        or isinstance(consumed_generation, bool)
+                        or not isinstance(consumed_generation, int)
+                        or consumed_generation != source[1] + 1
+                        or consumed_generation > user_generation
+                        or lineage_by_generation.get(consumed_generation) != consumed_id
+                        or not isinstance(request.get("consumed_at"), str)
+                        or not request["consumed_at"]
+                    ):
+                        raise ValueError("切片冷历史已消费用户修订记录无效")
+                    parse_task_timestamp(request, "consumed_at")
+            if source_generations != sorted(source_generations):
+                raise ValueError("切片冷历史用户修订代次顺序无效")
+            if pending_revision is not None:
+                if (
+                    "resolution" not in entry
+                    or user_exit["status"] != "needs_revision"
+                    or pending_revision["source_candidate_id"] != user_candidate
+                    or pending_revision["source_generation"] != user_generation
+                ):
+                    raise ValueError("切片冷历史待消费修订与最终用户出口不一致")
+            elif user_exit["status"] == "needs_revision":
+                raise ValueError("切片冷历史 needs_revision 缺少待消费记录")
+            if "resolution" not in entry and user_exit["status"] not in {"verified", "not_applicable"}:
+                raise ValueError("正常核收的切片冷历史缺少最终用户出口")
     active = payload.get("active_slice")
     if active is None:
+        if managed_history_candidate_ids and candidate_ids[-len(managed_history_candidate_ids):] != managed_history_candidate_ids:
+            raise ValueError("切片冷历史候选谱系与永久身份账本顺序不一致")
         return payload
     required = {
         "slice_id", "owner_task_id", "required_gates", "gate_tasks", "candidate",
-        "user_exit", "created_at", "metrics",
+        "user_exit", "revision_requests", "created_at", "metrics",
     }
     if not isinstance(active, dict) or set(active) != required:
         raise ValueError("活动切片结构无效")
@@ -2630,13 +2924,145 @@ def load_slice_control() -> dict:
             or candidate["generation"] < 1
         ):
             raise ValueError("候选身份字段无效")
+        bound_by = candidate.get("bound_by")
+        if (
+            not isinstance(bound_by, str)
+            or not bound_by
+            or bound_by != bound_by.strip()
+            or len(bound_by) > ACTOR_MAX_CHARS
+            or any(char.isspace() for char in bound_by)
+        ):
+            raise ValueError("活动候选绑定 actor 无效")
+        try:
+            bound_at = parse_task_timestamp(candidate, "bound_at")
+        except ValueError as exc:
+            raise ValueError("活动候选绑定时间无效") from exc
+        _, _, owner_task = locate(active["owner_task_id"])
+        ownership_history = owner_task.get("ownership_history", [])
+        ownership_times = [parse_task_timestamp(entry, "at") for entry in ownership_history]
+        if ownership_times != sorted(ownership_times):
+            raise ValueError("活动候选 owner 身份历史时间顺序无效")
+        binding_actor_indexes = [
+            index for index, entry in enumerate(ownership_history)
+            if entry["actor"] == bound_by
+        ]
+        if not binding_actor_indexes:
+            raise ValueError("活动候选绑定 actor 不在 owner 身份历史中")
+        if bound_at < min(ownership_times[index] for index in binding_actor_indexes):
+            raise ValueError("活动候选绑定时间早于 actor 身份生效")
+        if not any(
+            ownership_times[index] <= bound_at
+            and (
+                index + 1 == len(ownership_times)
+                or bound_at <= ownership_times[index + 1]
+            )
+            for index in binding_actor_indexes
+        ):
+            raise ValueError("活动候选绑定时间不在 actor 负责区间")
         if candidate["candidate_id"] not in candidate_ids:
             raise ValueError("活动候选未登记到永久身份账本")
     user_exit = active.get("user_exit")
-    if not isinstance(user_exit, dict) or set(user_exit) != {"status", "evidence", "actor", "at"}:
+    if not isinstance(user_exit, dict) or set(user_exit) != {
+        "status", "evidence", "actor", "at", "candidate_id", "generation",
+    }:
         raise ValueError("用户出口结构无效")
-    if user_exit.get("status") not in {"pending", "verified", "not_applicable"}:
+    if user_exit.get("status") not in {"pending", "needs_revision", "verified", "not_applicable"}:
         raise ValueError("用户出口状态无效")
+    if (
+        not isinstance(user_exit.get("candidate_id"), str)
+        or isinstance(user_exit.get("generation"), bool)
+        or not isinstance(user_exit.get("generation"), int)
+        or not all(isinstance(user_exit.get(field), str) for field in ("evidence", "actor", "at"))
+    ):
+        raise ValueError("用户出口字段无效")
+    if candidate is None:
+        if user_exit != {
+            "status": "pending", "evidence": "", "actor": "", "at": "",
+            "candidate_id": "", "generation": 0,
+        }:
+            raise ValueError("无候选切片的用户出口必须保持初始 pending")
+    elif (
+        user_exit["candidate_id"] != candidate["candidate_id"]
+        or user_exit["generation"] != candidate["generation"]
+        or (
+            user_exit["status"] == "pending"
+            and any(user_exit[field] for field in ("evidence", "actor", "at"))
+        )
+        or (
+            user_exit["status"] != "pending"
+            and not all(user_exit[field] for field in ("evidence", "actor", "at"))
+        )
+    ):
+        raise ValueError("用户出口与当前候选代次不一致")
+    revision_requests = active.get("revision_requests")
+    if not isinstance(revision_requests, list) or len(revision_requests) > 100:
+        raise ValueError("用户修订记录无效")
+    seen_revision_sources: set[tuple[str, int]] = set()
+    pending_revision = None
+    for request in revision_requests:
+        expected_fields = {
+            "source_candidate_id", "source_generation", "evidence", "actor", "at", "status",
+            "consumed_by_candidate_id", "consumed_generation", "consumed_at", "superseded_user_exit",
+        }
+        if not isinstance(request, dict) or set(request) != expected_fields:
+            raise ValueError("用户修订记录结构无效")
+        source = (request.get("source_candidate_id"), request.get("source_generation"))
+        if (
+            not isinstance(source[0], str) or not CANDIDATE_ID_RE.fullmatch(source[0])
+            or isinstance(source[1], bool) or not isinstance(source[1], int) or source[1] < 1
+            or source in seen_revision_sources or source[0] not in candidate_ids
+            or not all(isinstance(request.get(field), str) and request[field] for field in ("evidence", "actor", "at"))
+            or request.get("status") not in {"pending", "consumed"}
+        ):
+            raise ValueError("用户修订记录内容无效")
+        superseded = request["superseded_user_exit"]
+        if (
+            not isinstance(superseded, dict)
+            or set(superseded) != {"status", "evidence", "actor", "at", "candidate_id", "generation"}
+            or superseded.get("status") not in {"pending", "verified", "not_applicable"}
+            or superseded.get("candidate_id") != source[0]
+            or superseded.get("generation") != source[1]
+            or not all(isinstance(superseded.get(field), str) for field in ("evidence", "actor", "at"))
+            or (
+                superseded["status"] == "pending"
+                and any(superseded[field] for field in ("evidence", "actor", "at"))
+            )
+            or (
+                superseded["status"] != "pending"
+                and not all(superseded[field] for field in ("evidence", "actor", "at"))
+            )
+        ):
+            raise ValueError("用户修订记录未保全被替代的用户出口")
+        seen_revision_sources.add(source)
+        if request["status"] == "pending":
+            if (
+                request["consumed_by_candidate_id"] != ""
+                or request["consumed_generation"] != 0
+                or request["consumed_at"] != ""
+                or pending_revision is not None
+            ):
+                raise ValueError("待消费用户修订记录无效")
+            pending_revision = request
+        elif (
+            not CANDIDATE_ID_RE.fullmatch(request["consumed_by_candidate_id"])
+            or request["consumed_by_candidate_id"] not in candidate_ids
+            or isinstance(request["consumed_generation"], bool)
+            or request["consumed_generation"] != request["source_generation"] + 1
+            or not isinstance(request["consumed_at"], str) or not request["consumed_at"]
+        ):
+            raise ValueError("已消费用户修订记录无效")
+    if user_exit["status"] == "needs_revision":
+        if (
+            pending_revision is None
+            or pending_revision["source_candidate_id"] != candidate["candidate_id"]
+            or pending_revision["source_generation"] != candidate["generation"]
+            or pending_revision["evidence"] != user_exit["evidence"]
+            or pending_revision["actor"] != user_exit["actor"]
+            or pending_revision["at"] != user_exit["at"]
+        ):
+            raise ValueError("用户修订出口缺少同代审计记录")
+    elif pending_revision is not None:
+        raise ValueError("待消费用户修订记录与用户出口状态冲突")
     if not isinstance(active.get("metrics"), list) or len(active["metrics"]) > 100:
         raise ValueError("切片 metrics 无效")
     for metric in active["metrics"]:
@@ -2651,6 +3077,12 @@ def load_slice_control() -> dict:
             for field in expected_metric_fields - {"at", "actor", "source"}
         ) or any(not isinstance(metric[field], str) or not metric[field] for field in ("at", "actor", "source")):
             raise ValueError("切片 metric 内容无效")
+    active_lineage = slice_candidate_lineage(active)
+    managed_candidate_ids = managed_history_candidate_ids + [
+        item["candidate_id"] for item in active_lineage
+    ]
+    if managed_candidate_ids and candidate_ids[-len(managed_candidate_ids):] != managed_candidate_ids:
+        raise ValueError("活动与冷历史候选谱系不构成永久身份账本的连续后缀")
     return payload
 
 
@@ -2818,6 +3250,21 @@ def render_handoff_hot_block(
         f"- 工作模式：`{mode}`",
         f"- 活动切片：`{active['slice_id'] if active else 'none'}`",
     ]
+    if active:
+        candidate = active.get("candidate") or {}
+        gate_states = current_generation_gate_states(active)
+        owner_state, _, owner = locate(active["owner_task_id"])
+        decision = next_action_decision(active["owner_task_id"])
+        lines.extend([
+            f"- 候选：`{candidate.get('candidate_id') or 'none'}` · generation `{candidate.get('generation', 0)}`",
+            "- 当前代 gate：`" + ", ".join(
+                f"{gate}={gate_states.get(gate, 'pending')}" for gate in active["required_gates"]
+            ) + "`",
+            f"- 用户出口：`{active['user_exit']['status']}`",
+            f"- 阻断原因：`{owner.get('block_reason') or 'none'}`",
+            f"- 下一合法动作：`{decision['allowed'][0] if decision['allowed'] else 'none'}`"
+            + (f" · 目标 `{decision['target_task_id']}`" if decision.get("target_task_id") else ""),
+        ])
     lines.extend(visible or ["- 本部门当前没有活动切片 TASK"])
     if recovery:
         lines.extend(["", "### 冻结恢复任务", ""])
@@ -3394,6 +3841,7 @@ def cmd_enqueue(args) -> int:
         "task_kind": args.task_kind,
         "gate_type": gate_type,
         "gate_attempts": [],
+        "completion_history": [],
     }
     validate_task_payload(task, task_path(task_id))
     target_control = json.loads(json.dumps(slice_control, ensure_ascii=False))
@@ -3404,7 +3852,11 @@ def cmd_enqueue(args) -> int:
             "required_gates": required_gates,
             "gate_tasks": {},
             "candidate": None,
-            "user_exit": {"status": "pending", "evidence": "", "actor": "", "at": ""},
+            "user_exit": {
+                "status": "pending", "evidence": "", "actor": "", "at": "",
+                "candidate_id": "", "generation": 0,
+            },
+            "revision_requests": [],
             "created_at": timestamp,
             "metrics": [],
         }
@@ -3493,6 +3945,48 @@ def recover_slice_enqueue_transaction() -> bool:
     return True
 
 
+def current_candidate_generation(task: dict) -> int:
+    control = load_slice_control()
+    active = control.get("active_slice")
+    if not isinstance(active, dict) or active.get("slice_id") != task.get("slice_id"):
+        return 0
+    candidate = active.get("candidate")
+    if not isinstance(candidate, dict):
+        return 0
+    generation = candidate.get("generation")
+    if isinstance(generation, bool) or not isinstance(generation, int) or generation < 1:
+        raise ValueError("当前候选代次无效")
+    return generation
+
+
+def state_action_signature(
+    action: str, actor: str, reason: str, target_state: str, candidate_generation: int,
+) -> dict:
+    return {
+        "action": action,
+        "actor": actor,
+        "reason": reason,
+        "target_state": target_state,
+        "candidate_generation": candidate_generation,
+    }
+
+
+def record_state_action(
+    task: dict, action: str, actor: str, reason: str, target_state: str, candidate_generation: int,
+) -> None:
+    task["state_action_receipt"] = state_action_signature(
+        action, actor, reason, target_state, candidate_generation,
+    )
+
+
+def require_identical_state_retry(
+    task: dict, action: str, actor: str, reason: str, target_state: str, candidate_generation: int,
+) -> None:
+    expected = state_action_signature(action, actor, reason, target_state, candidate_generation)
+    if task.get("state_action_receipt") != expected:
+        raise ValueError(f"{action} 重试与已记录动作签名冲突")
+
+
 def cmd_claim(args) -> int:
     _, current_path, current = locate(args.task_id)
     require_current_slice_task(current, "claim")
@@ -3517,6 +4011,8 @@ def cmd_claim(args) -> int:
     if actor != expected_actor:
         raise ValueError(f"claimed-by 必须匹配当前已登记部门会话: {expected_actor}")
 
+    generation = current_candidate_generation(current)
+
     def mutate(item: dict) -> None:
         item["claimed_by"] = actor
         history = list(item.get("ownership_history", []))
@@ -3525,6 +4021,7 @@ def cmd_claim(args) -> int:
             "previous_actor": "", "evidence": "registered-session-claim",
         })
         item["ownership_history"] = history
+        record_state_action(item, "claim", actor, "", "claimed", generation)
 
     task, path = transition(args.task_id, "claim", mutate)
     refresh_inboxes()
@@ -3533,36 +4030,97 @@ def cmd_claim(args) -> int:
 
 
 def cmd_block(args) -> int:
-    _, _, current = locate(args.task_id)
+    state, path, current = locate(args.task_id)
     require_current_slice_task(current, "block")
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
-    require_task_actor(current, args.actor)
-    task, path = transition(args.task_id, "block", lambda item: item.update(block_reason=clean("reason", args.reason)))
+    actor = require_task_actor(current, args.actor)
+    reason = clean("reason", args.reason)
+    generation = current_candidate_generation(current)
+    if state == "blocked":
+        require_identical_state_retry(current, "block", actor, reason, "blocked", generation)
+        print(f"TASK_STATE_NOOP | blocked | {current['task_id']} | {path.relative_to(PROJECT)}")
+        return 0
+
+    def mutate(item: dict) -> None:
+        item["block_reason"] = reason
+        record_state_action(item, "block", actor, reason, "blocked", generation)
+
+    task, path = transition(args.task_id, "block", mutate)
     refresh_inboxes()
     print(f"TASK_BLOCKED | {task['task_id']} | {path.relative_to(PROJECT)}")
     return 0
 
 
 def cmd_wait(args) -> int:
-    _, _, current = locate(args.task_id)
+    state, path, current = locate(args.task_id)
     require_current_slice_task(current, "wait")
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
-    require_task_actor(current, args.actor)
-    task, path = transition(args.task_id, "wait", lambda item: item.update(block_reason=clean("reason", args.reason)))
+    actor = require_task_actor(current, args.actor)
+    reason = clean("reason", args.reason)
+    generation = current_candidate_generation(current)
+    if state == "waiting_input":
+        require_identical_state_retry(current, "wait", actor, reason, "waiting_input", generation)
+        print(f"TASK_STATE_NOOP | waiting_input | {current['task_id']} | {path.relative_to(PROJECT)}")
+        return 0
+
+    def mutate(item: dict) -> None:
+        item["block_reason"] = reason
+        record_state_action(item, "wait", actor, reason, "waiting_input", generation)
+
+    task, path = transition(args.task_id, "wait", mutate)
     refresh_inboxes()
     print(f"TASK_WAITING_INPUT | {task['task_id']} | {path.relative_to(PROJECT)}")
     return 0
 
 
 def cmd_resume(args) -> int:
-    _, current_path, current = locate(args.task_id)
+    state, current_path, current = locate(args.task_id)
     require_current_slice_task(current, "resume")
-    require_new_work_open("resume")
     if current.get("temporary_executor"):
         raise ValueError("临时外包生命周期只能通过 agent_team_temporary.py 修改")
-    require_task_actor(current, args.actor)
+    actor = require_task_actor(current, args.actor)
+    generation = current_candidate_generation(current)
+    if state == "claimed":
+        require_identical_state_retry(current, "resume", actor, "", "claimed", generation)
+        print(f"TASK_STATE_NOOP | claimed | {current['task_id']} | {current_path.relative_to(PROJECT)}")
+        return 0
+    control = load_slice_control()
+    active = control.get("active_slice")
+    terminal_reopen = state in {"completed", "acknowledged"}
+    if terminal_reopen:
+        candidate = require_candidate_integrity(active or {})
+        if current["task_kind"] == "owner":
+            user_exit = active["user_exit"] if active else {}
+            if (
+                user_exit.get("status") != "needs_revision"
+                or user_exit.get("candidate_id") != candidate["candidate_id"]
+                or user_exit.get("generation") != candidate["generation"]
+            ):
+                raise ValueError("completed owner 仅可因当前候选的用户修订重新打开")
+            reopen_reason = user_exit["evidence"]
+            completed_candidate = candidate
+        else:
+            gate_states = current_generation_gate_states(active)
+            attempts = current.get("gate_attempts", [])
+            previous_attempt = attempts[-1] if attempts else None
+            if (
+                gate_states.get(current["gate_type"]) != "pending"
+                or previous_attempt is None
+                or previous_attempt.get("generation", 0) >= candidate["generation"]
+            ):
+                raise ValueError("terminal gate 仅可为更新一代候选重新打开")
+            reopen_reason = (
+                f"candidate generation {candidate['generation']} requires a fresh {current['gate_type']} verdict"
+            )
+            completed_candidate = {
+                "candidate_id": previous_attempt["candidate_id"],
+                "manifest": previous_attempt["candidate_manifest"],
+                "sha256": previous_attempt["candidate_sha256"],
+                "generation": previous_attempt["generation"],
+            }
+    require_new_work_open("resume")
     require_department(current["department"])
     authorization = current["authorization_state"]
     if authorization in {"user_required", "user_rejected"}:
@@ -3571,7 +4129,42 @@ def cmd_resume(args) -> int:
     if other:
         raise ValueError("本部门已有其他在办任务: " + ", ".join(other))
     require_formal_temporary_compatibility(current, current_path)
-    task, path = transition(args.task_id, "resume", lambda item: item.update(block_reason=""))
+    def mutate(item: dict) -> None:
+        if terminal_reopen:
+            history = list(item.get("completion_history", []))
+            history.append({
+                "from_state": state,
+                "completed_revision": item["revision"],
+                "completed_at": item["updated_at"],
+                "reopened_at": now_iso(),
+                "reopened_by": actor,
+                "reason": reopen_reason,
+                "candidate_id": completed_candidate["candidate_id"],
+                "candidate_manifest": completed_candidate["manifest"],
+                "candidate_sha256": completed_candidate["sha256"],
+                "generation": completed_candidate["generation"],
+                "artifacts": list(item["artifacts"]),
+                "external_artifacts": list(item["external_artifacts"]),
+                "verified": list(item["verified"]),
+                "unverified": list(item["unverified"]),
+                "mistake_check": item["mistake_check"],
+                "report": item["report"],
+                "event_receipts": list(item["event_receipts"]),
+                "acknowledged_by": item.get("acknowledged_by", ""),
+            })
+            item["completion_history"] = history[-100:]
+            item["artifacts"] = []
+            item["external_artifacts"] = []
+            item["verified"] = []
+            item["unverified"] = []
+            item["mistake_check"] = ""
+            item["report"] = ""
+            item["event_receipts"] = []
+            item.pop("acknowledged_by", None)
+        item["block_reason"] = ""
+        record_state_action(item, "resume", actor, "", "claimed", generation)
+
+    task, path = transition(args.task_id, "resume", mutate)
     refresh_inboxes()
     print(f"TASK_RESUMED | {task['task_id']} | {path.relative_to(PROJECT)}")
     return 0
@@ -3582,8 +4175,14 @@ def cmd_rebind_owner(args) -> int:
     require_current_slice_task(current, "rebind-owner")
     if current.get("temporary_executor"):
         raise ValueError("临时外包身份只能通过 agent_team_temporary.py 修改")
-    if state not in {"claimed", "blocked", "waiting_input"}:
+    allowed_states = {"claimed", "blocked", "waiting_input", "completed", "acknowledged"}
+    if state not in allowed_states:
         raise ValueError("只允许对活动中的普通 TASK 换班绑定")
+    if state in {"completed", "acknowledged"}:
+        control = load_slice_control()
+        active = control.get("active_slice")
+        if active is None or terminal_reopen_priority(state, current, active, frozen=False) is None:
+            raise ValueError("终态 TASK 仅可在当前切片明确要求 reopen 时换班绑定")
     if current["revision"] != args.expected_revision:
         raise ValueError("expected-revision 与 TASK 当前 revision 不一致")
     actor = clean("actor", args.actor, max_chars=ACTOR_MAX_CHARS)
@@ -3609,7 +4208,7 @@ def cmd_rebind_owner(args) -> int:
         item["claimed_by"] = actor
         item["ownership_history"] = history
 
-    task, path = update_task(args.task_id, mutate, allowed_states={"claimed", "blocked", "waiting_input"})
+    task, path = update_task(args.task_id, mutate, allowed_states=allowed_states)
     refresh_inboxes()
     print(f"TASK_OWNER_REBOUND | {task['task_id']} | {previous} -> {actor} | {path.relative_to(PROJECT)}")
     return 0
@@ -3672,10 +4271,12 @@ def require_candidate_integrity(active: dict, candidate_id: str = "") -> dict:
 
 
 def cmd_bind_candidate(args) -> int:
-    _, _, owner = locate(args.task_id)
+    owner_state, _, owner = locate(args.task_id)
     require_task_actor(owner, args.actor)
     control, active = require_active_slice_task(owner, "owner")
     require_new_work_open("bind-candidate")
+    if owner_state != "claimed":
+        raise ValueError(f"bind-candidate 只允许 claimed owner；当前状态: {owner_state}")
     candidate_id = clean("candidate-id", args.candidate_id, max_chars=32)
     if not CANDIDATE_ID_RE.fullmatch(candidate_id):
         raise ValueError("candidate-id 格式应为 CAND-YYYYMMDD-XXXXXX")
@@ -3693,8 +4294,16 @@ def cmd_bind_candidate(args) -> int:
                 attempt.get("generation") == previous["generation"] and attempt.get("decision") == "fail"
                 for attempt in gate_task.get("gate_attempts", [])
             )
-        if not failed_current_generation:
-            raise ValueError("只有当前候选已有 gate FAIL 时才能绑定下一代候选")
+        revision_request = next((
+            request for request in active["revision_requests"]
+            if request["status"] == "pending"
+            and request["source_candidate_id"] == previous["candidate_id"]
+            and request["source_generation"] == previous["generation"]
+        ), None)
+        if not failed_current_generation and revision_request is None:
+            raise ValueError("只有当前候选已有 gate FAIL 或有效 needs_revision 时才能绑定下一代候选")
+    else:
+        revision_request = None
     manifest, _ = candidate_manifest(args.manifest, candidate_id, args.sha256)
     if previous and manifest == previous["manifest"]:
         raise ValueError("返工候选必须使用新的 manifest 路径，不得覆盖上一代证据")
@@ -3721,7 +4330,15 @@ def cmd_bind_candidate(args) -> int:
         "bound_by": args.actor,
         "bound_at": now_iso(),
     }
-    active["user_exit"] = {"status": "pending", "evidence": "", "actor": "", "at": ""}
+    if revision_request is not None:
+        revision_request["status"] = "consumed"
+        revision_request["consumed_by_candidate_id"] = candidate_id
+        revision_request["consumed_generation"] = active["candidate"]["generation"]
+        revision_request["consumed_at"] = active["candidate"]["bound_at"]
+    active["user_exit"] = {
+        "status": "pending", "evidence": "", "actor": "", "at": "",
+        "candidate_id": candidate_id, "generation": active["candidate"]["generation"],
+    }
     store_slice_control(control)
     refresh_inboxes()
     print(
@@ -3732,7 +4349,9 @@ def cmd_bind_candidate(args) -> int:
 
 
 def cmd_gate_verdict(args) -> int:
-    _, _, gate = locate(args.task_id)
+    gate_state, _, gate = locate(args.task_id)
+    if gate_state != "claimed" or gate.get("task_kind") != "gate":
+        raise ValueError(f"gate-verdict 只允许 claimed gate；当前状态: {gate_state}")
     actor = require_task_actor(gate, args.actor)
     control, active = require_active_slice_task(gate, "gate")
     candidate = require_candidate_integrity(active, args.candidate_id)
@@ -3861,6 +4480,395 @@ def latest_gate_passes(active: dict) -> bool:
     return True
 
 
+def current_generation_gate_states(active: dict) -> dict[str, str]:
+    candidate = active.get("candidate")
+    generation = candidate.get("generation") if isinstance(candidate, dict) else None
+    states: dict[str, str] = {}
+    for gate in active["required_gates"]:
+        task_id = active["gate_tasks"].get(gate)
+        if not task_id or generation is None:
+            states[gate] = "pending"
+            continue
+        _, _, task = locate(task_id)
+        current = next((
+            attempt for attempt in reversed(task.get("gate_attempts", []))
+            if attempt.get("generation") == generation
+        ), None)
+        states[gate] = current.get("decision", "pending") if current else "pending"
+    return states
+
+
+def authorization_priority(state: str, task: dict, *, frozen: bool) -> dict[str, object] | None:
+    if state not in {"queued", "blocked", "waiting_input"}:
+        return None
+    authorization = task["authorization_state"]
+    if authorization == "user_required":
+        return {
+            "first_blocker": "USER_AUTHORIZATION_REQUIRED",
+            "allowed": ["authorize", "unfreeze-new-work", "next-action"] if frozen else [
+                "authorize", "next-action",
+            ],
+            "forbidden": ["claim", "resume"],
+            "user_decision": True,
+        }
+    if authorization == "user_rejected":
+        return {
+            "first_blocker": "USER_REJECTED", "allowed": ["resolve", "next-action"],
+            "forbidden": ["claim", "resume", "unfreeze-new-work"] if frozen else ["claim", "resume"],
+            "user_decision": False,
+        }
+    return None
+
+
+def owner_rebind_priority() -> dict[str, object]:
+    return {
+        "first_blocker": "OWNER_REBIND_REQUIRED",
+        "allowed": ["rebind-owner", "next-action"],
+        "forbidden": ["claim", "resume", "bind-candidate", "gate-verdict", "complete"],
+        "user_decision": False,
+    }
+
+
+def terminal_reopen_priority(
+    state: str, task: dict, active: dict, *, frozen: bool,
+) -> dict[str, object] | None:
+    if state not in {"completed", "acknowledged"}:
+        return None
+    reopen_required = False
+    blocker = ""
+    if task["task_kind"] == "owner":
+        candidate = active.get("candidate")
+        user_exit = active["user_exit"]
+        reopen_required = (
+            state in {"completed", "acknowledged"}
+            and isinstance(candidate, dict)
+            and user_exit["status"] == "needs_revision"
+            and user_exit["candidate_id"] == candidate["candidate_id"]
+            and user_exit["generation"] == candidate["generation"]
+        )
+        blocker = "OWNER_REOPEN_REQUIRED"
+    else:
+        candidate = active.get("candidate")
+        attempts = task.get("gate_attempts", [])
+        reopen_required = (
+            isinstance(candidate, dict)
+            and bool(attempts)
+            and attempts[-1].get("generation", 0) < candidate["generation"]
+            and current_generation_gate_states(active).get(task["gate_type"]) == "pending"
+        )
+        blocker = "GATE_TASK_REOPEN_REQUIRED"
+    if not reopen_required:
+        return None
+    if not task_owner_is_current(task):
+        decision = owner_rebind_priority()
+        decision["target_task_id"] = task["task_id"]
+        return decision
+    return {
+        "first_blocker": "P0_FREEZE_ACTIVE" if frozen else blocker,
+        "target_task_id": task["task_id"],
+        "allowed": ["unfreeze-new-work", "next-action"] if frozen else ["resume", "next-action"],
+        "forbidden": ["resume", "bind-candidate", "claim", "enqueue"] if frozen else [
+            "complete", "ack", "bind-candidate",
+        ],
+        "user_decision": frozen,
+    }
+
+
+def task_owner_is_current(task: dict) -> bool:
+    return task.get("claimed_by") == registered_department_actor(task["department"])
+
+
+def gate_task_completion_priority(active: dict, *, frozen: bool) -> dict[str, object] | None:
+    for gate in active["required_gates"]:
+        gate_task_id = active["gate_tasks"].get(gate)
+        if not gate_task_id:
+            continue
+        gate_state, _, gate_task = locate(gate_task_id)
+        if gate_state == "acknowledged":
+            continue
+        if gate_state == "completed":
+            return {
+                "first_blocker": "GATE_TASK_ACK_REQUIRED",
+                "target_task_id": gate_task_id,
+                "allowed": ["ack", "next-action"],
+                "forbidden": ["owner-complete", "owner-ack", "bind-candidate"],
+                "user_decision": False,
+            }
+        if not task_owner_is_current(gate_task):
+            decision = owner_rebind_priority()
+            decision["target_task_id"] = gate_task_id
+            return decision
+        if gate_state == "claimed":
+            return {
+                "first_blocker": "GATE_TASK_COMPLETION_REQUIRED",
+                "target_task_id": gate_task_id,
+                "allowed": ["complete", "next-action"],
+                "forbidden": ["owner-complete", "bind-candidate"],
+                "user_decision": False,
+            }
+        if gate_state in {"blocked", "waiting_input"}:
+            return {
+                "first_blocker": "P0_FREEZE_ACTIVE" if frozen else "GATE_TASK_RESUME_REQUIRED",
+                "target_task_id": gate_task_id,
+                "allowed": ["unfreeze-new-work", "next-action"] if frozen else ["resume", "next-action"],
+                "forbidden": ["resume", "owner-complete", "bind-candidate"] if frozen else [
+                    "owner-complete", "bind-candidate",
+                ],
+                "user_decision": frozen,
+            }
+        return {
+            "first_blocker": "GATE_TASK_STATE_INVALID",
+            "target_task_id": gate_task_id,
+            "allowed": ["next-action"],
+            "forbidden": ["owner-complete", "bind-candidate"],
+            "user_decision": False,
+        }
+    return None
+
+
+def slice_progress_priority(
+    state: str, task: dict, active: dict, *, frozen: bool,
+) -> dict[str, object] | None:
+    """Return slice facts that must be handled before an owner state action."""
+    if state not in {"claimed", "blocked", "waiting_input"}:
+        return None
+    candidate = active.get("candidate")
+    gate_states: dict[str, str] = {}
+    if candidate:
+        require_candidate_integrity(active)
+        gate_states = current_generation_gate_states(active)
+    all_gates_pass = bool(candidate) and all(value == "pass" for value in gate_states.values())
+    if all_gates_pass and active["user_exit"]["status"] == "pending":
+        allowed = ["record-user-exit", "next-action"] if frozen or state == "blocked" else [
+            "record-user-exit", "wait", "block", "next-action",
+        ]
+        if state == "waiting_input":
+            allowed = ["record-user-exit", "next-action"]
+        forbidden = ["resume", "bind-candidate", "claim", "enqueue"] if frozen else [
+            "resume", "complete", "bind-candidate",
+        ] if state in {"blocked", "waiting_input"} else ["complete", "bind-candidate"]
+        return {
+            "first_blocker": "P0_FREEZE_ACTIVE" if frozen else "USER_EXIT_PENDING",
+            "allowed": allowed, "forbidden": forbidden, "user_decision": True,
+        }
+    if not task_owner_is_current(task):
+        return owner_rebind_priority()
+    if not candidate or any(value == "fail" for value in gate_states.values()):
+        return None
+    if (
+        task["task_kind"] == "owner"
+        and all(value == "pass" for value in gate_states.values())
+        and active["user_exit"]["status"] in {"verified", "not_applicable"}
+    ):
+        completion = gate_task_completion_priority(active, frozen=frozen)
+        if completion is not None:
+            return completion
+
+    pending_gates: list[tuple[str, str, dict]] = []
+    for gate, gate_status in gate_states.items():
+        gate_task_id = active["gate_tasks"].get(gate)
+        if gate_status == "pending" and gate_task_id:
+            gate_state, _, gate_task = locate(gate_task_id)
+            pending_gates.append((gate_task_id, gate_state, gate_task))
+
+    for gate_task_id, gate_state, gate_task in pending_gates:
+        if gate_state in {"completed", "acknowledged"}:
+            decision = terminal_reopen_priority(gate_state, gate_task, active, frozen=frozen)
+            if decision is not None:
+                return decision
+
+    claimed_pending = [item for item in pending_gates if item[1] == "claimed"]
+    for gate_task_id, _, gate_task in claimed_pending:
+        if not task_owner_is_current(gate_task):
+            decision = owner_rebind_priority()
+            decision["target_task_id"] = gate_task_id
+            return decision
+    if task["task_kind"] == "gate" and any(task["task_id"] == item[0] for item in claimed_pending):
+        allowed = ["gate-verdict", "wait", "block", "next-action"]
+        target_task_id = task["task_id"]
+    elif task["task_kind"] == "owner" and claimed_pending:
+        allowed = ["gate-verdict", "next-action"] if frozen or state in {"blocked", "waiting_input"} else [
+            "gate-verdict", "wait", "block", "next-action",
+        ]
+        target_task_id = claimed_pending[0][0]
+    else:
+        allowed = []
+        target_task_id = ""
+    if target_task_id:
+        return {
+            "first_blocker": "P0_FREEZE_ACTIVE" if frozen else "GATES_PENDING",
+            "target_task_id": target_task_id,
+            "allowed": allowed,
+            "forbidden": ["resume", "bind-candidate", "claim", "enqueue"] if frozen else [
+                "complete", "bind-candidate",
+            ],
+            "user_decision": False,
+        }
+
+    blocked_pending = [item for item in pending_gates if item[1] in {"blocked", "waiting_input"}]
+    if blocked_pending:
+        gate_task_id, _, gate_task = blocked_pending[0]
+        if not task_owner_is_current(gate_task):
+            decision = owner_rebind_priority()
+            decision["target_task_id"] = gate_task_id
+            return decision
+        return {
+            "first_blocker": "P0_FREEZE_ACTIVE" if frozen else "GATE_TASK_RESUME_REQUIRED",
+            "target_task_id": gate_task_id,
+            "allowed": ["unfreeze-new-work", "next-action"] if frozen else ["resume", "next-action"],
+            "forbidden": ["resume", "bind-candidate", "claim", "enqueue"] if frozen else [
+                "complete", "bind-candidate", "gate-verdict",
+            ],
+            "user_decision": frozen,
+        }
+    return None
+
+
+def next_action_decision(task_id: str) -> dict[str, object]:
+    state, _, task = locate(task_id)
+    mode = load_dispatch_control()["mode"]
+    if task.get("schema_version") != SCHEMA_VERSION:
+        return {
+            "first_blocker": "LEGACY_TASK_COLD_ONLY", "allowed": ["next-action"],
+            "forbidden": ["slice-state-action"], "user_decision": False,
+        }
+    _, active = require_active_slice_task(task, task["task_kind"])
+    terminal_reopen = terminal_reopen_priority(state, task, active, frozen=mode == "frozen")
+    if terminal_reopen is not None:
+        return terminal_reopen
+    if task["task_kind"] == "owner" and state in {"completed", "acknowledged"}:
+        gate_close = gate_task_completion_priority(active, frozen=mode == "frozen")
+        if gate_close is not None:
+            return gate_close
+    authorization = authorization_priority(state, task, frozen=mode == "frozen")
+    if authorization is not None:
+        return authorization
+    priority = slice_progress_priority(state, task, active, frozen=mode == "frozen")
+    if priority is not None:
+        return priority
+    if mode == "frozen":
+        allowed = ["unfreeze-new-work", "next-action"]
+        user_decision = True
+        candidate = active.get("candidate")
+        gate_states: dict[str, str] = {}
+        if candidate:
+            require_candidate_integrity(active)
+            gate_states = current_generation_gate_states(active)
+        all_gates_pass = bool(candidate) and all(
+            value == "pass" for value in gate_states.values()
+        )
+        if active["user_exit"]["status"] == "needs_revision":
+            pass
+        elif state == "completed":
+            allowed, user_decision = ["ack", "next-action"], False
+        elif state == "claimed" and all_gates_pass and active["user_exit"]["status"] in {"verified", "not_applicable"}:
+            allowed, user_decision = ["complete", "wait", "block", "next-action"], False
+        return {
+            "first_blocker": "P0_FREEZE_ACTIVE", "allowed": allowed,
+            "forbidden": ["resume", "bind-candidate", "claim", "enqueue"],
+            "user_decision": user_decision,
+        }
+    if state == "completed":
+        return {
+            "first_blocker": "ACK_REQUIRED", "allowed": ["ack", "next-action"],
+            "forbidden": ["state-mutation"], "user_decision": False,
+        }
+    if state == "blocked":
+        return {
+            "first_blocker": "TASK_BLOCKED", "allowed": ["resume", "next-action"],
+            "forbidden": ["bind-candidate"], "user_decision": False,
+        }
+    if state == "waiting_input":
+        return {
+            "first_blocker": "TASK_WAITING_INPUT", "allowed": ["resume", "next-action"],
+            "forbidden": ["bind-candidate"], "user_decision": True,
+        }
+    if state == "queued":
+        return {
+            "first_blocker": "TASK_UNCLAIMED", "allowed": ["claim", "next-action"],
+            "forbidden": ["bind-candidate"], "user_decision": False,
+        }
+    if state != "claimed":
+        return {
+            "first_blocker": "TASK_TERMINAL", "allowed": ["next-action"],
+            "forbidden": ["state-mutation"], "user_decision": False,
+        }
+    candidate = active.get("candidate")
+    if not candidate:
+        return {
+            "first_blocker": "CANDIDATE_REQUIRED", "allowed": ["bind-candidate", "wait", "block", "next-action"],
+            "forbidden": ["complete"], "user_decision": False,
+        }
+    require_candidate_integrity(active)
+    gate_states = current_generation_gate_states(active)
+    if any(value == "fail" for value in gate_states.values()):
+        return {
+            "first_blocker": "CURRENT_GATE_FAIL", "allowed": ["bind-candidate", "wait", "block", "next-action"],
+            "forbidden": ["complete"], "user_decision": False,
+        }
+    if any(value != "pass" for value in gate_states.values()):
+        return {
+            "first_blocker": "GATES_PENDING", "allowed": ["gate-verdict", "wait", "block", "next-action"],
+            "forbidden": ["complete", "bind-candidate"], "user_decision": False,
+        }
+    user_exit = active["user_exit"]["status"]
+    if user_exit == "pending":
+        return {
+            "first_blocker": "USER_EXIT_PENDING", "allowed": ["record-user-exit", "wait", "block", "next-action"],
+            "forbidden": ["complete", "bind-candidate"], "user_decision": True,
+        }
+    if user_exit == "needs_revision":
+        return {
+            "first_blocker": "USER_REVISION_READY", "allowed": ["bind-candidate", "wait", "block", "next-action"],
+            "forbidden": ["complete"], "user_decision": False,
+        }
+    return {
+        "first_blocker": "NONE", "allowed": ["complete", "next-action"],
+        "forbidden": [], "user_decision": False,
+    }
+
+
+def cmd_next_action(args) -> int:
+    transactions = (
+        INDEX_TRANSACTION, GATE_TRANSACTION, SLICE_ENQUEUE_TRANSACTION, SLICE_CLOSE_TRANSACTION,
+    )
+    if any(path.exists() for path in transactions):
+        print(
+            f"NEXT_ACTION | task={args.task_id} | state=unknown | first_blocker=HOT_STATE_BUSY | "
+            "allowed=next-action | forbidden=state-mutation | user_decision=no"
+        )
+        return 0
+    state, task_path, task = locate(args.task_id)
+    control = load_slice_control()
+    watched = [DISPATCH_CONTROL, SLICE_CONTROL, SESSION_STATE, task_path]
+    active = control.get("active_slice")
+    if active:
+        watched.extend(task_path_for_id for task_path_for_id in (
+            locate(task_id)[1] for task_id in active_slice_task_ids(control)
+        ))
+    before = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dict.fromkeys(watched)
+    }
+    decision = next_action_decision(task["task_id"])
+    after = {
+        str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dict.fromkeys(watched)
+    }
+    if after != before:
+        raise ValueError("HOT_STATE_BUSY | next-action 查询期间机械真值发生变化")
+    allowed = ",".join(decision["allowed"]) or "none"
+    forbidden = ",".join(decision["forbidden"]) or "none"
+    user_decision = "yes" if decision["user_decision"] else "no"
+    target_task = decision.get("target_task_id", task["task_id"])
+    print(
+        f"NEXT_ACTION | task={task['task_id']} | state={state} | "
+        f"first_blocker={decision['first_blocker']} | target_task={target_task} | allowed={allowed} | "
+        f"forbidden={forbidden} | user_decision={user_decision}"
+    )
+    return 0
+
+
 def cmd_record_user_exit(args) -> int:
     actor = clean("actor", args.actor, max_chars=ACTOR_MAX_CHARS)
     expected = registered_lead_actor()
@@ -3871,7 +4879,31 @@ def cmd_record_user_exit(args) -> int:
     candidate = require_candidate_integrity(active, args.candidate_id)
     status = args.status
     evidence = clean("evidence", args.evidence, max_chars=1000)
-    active["user_exit"] = {"status": status, "evidence": evidence, "actor": actor, "at": now_iso()}
+    requested = {
+        "status": status, "evidence": evidence, "actor": actor,
+        "candidate_id": candidate["candidate_id"], "generation": candidate["generation"],
+    }
+    current = active["user_exit"]
+    if all(current.get(field) == value for field, value in requested.items()):
+        print(f"USER_EXIT_NOOP | {active['slice_id']} | {candidate['candidate_id']} | {status}")
+        return 0
+    superseding_revision = (
+        status == "needs_revision" and current["status"] in {"verified", "not_applicable"}
+    )
+    if current["status"] != "pending" and not superseding_revision:
+        raise ValueError("用户出口已记录；不同状态、证据、actor 或候选代次构成冲突")
+    timestamp = now_iso()
+    if status == "needs_revision":
+        if not latest_gate_passes(active):
+            raise ValueError("needs_revision 只用于当前候选全部 gate PASS 后的用户修订")
+        active["revision_requests"].append({
+            "source_candidate_id": candidate["candidate_id"],
+            "source_generation": candidate["generation"],
+            "evidence": evidence, "actor": actor, "at": timestamp, "status": "pending",
+            "consumed_by_candidate_id": "", "consumed_generation": 0, "consumed_at": "",
+            "superseded_user_exit": dict(current),
+        })
+    active["user_exit"] = {**requested, "at": timestamp}
     store_slice_control(control)
     refresh_inboxes()
     print(f"USER_EXIT_RECORDED | {active['slice_id']} | {candidate['candidate_id']} | {status}")
@@ -4040,6 +5072,9 @@ def slice_close_entry(active: dict, timestamp: str, resolution_state: str | None
         "candidate_manifest": candidate.get("manifest", ""),
         "candidate_sha256": candidate.get("sha256", ""),
         "closed_at": timestamp, "metrics": active["metrics"],
+        "user_exit": active["user_exit"],
+        "revision_requests": active["revision_requests"],
+        "candidate_lineage": slice_candidate_lineage(active),
     }
     if resolution_state is not None:
         entry["resolution"] = resolution_state
@@ -4132,7 +5167,8 @@ def validate_slice_close_transaction(payload: object) -> dict:
     entry = payload["close_entry"]
     base_fields = {
         "slice_id", "owner_task_id", "candidate_id", "candidate_manifest",
-        "candidate_sha256", "closed_at", "metrics",
+        "candidate_sha256", "closed_at", "metrics", "user_exit", "revision_requests",
+        "candidate_lineage",
     }
     expected_entry_fields = base_fields if payload["action"] == "ack" else base_fields | {"resolution"}
     if not isinstance(entry, dict) or set(entry) != expected_entry_fields:
@@ -4320,10 +5356,10 @@ def cmd_complete(args) -> int:
                 raise ValueError("owner 完成必须提交当前候选 manifest 作为本地产物")
             incomplete_gates = [
                 task_id for task_id in active["gate_tasks"].values()
-                if locate(task_id)[0] not in {"completed", "acknowledged"}
+                if locate(task_id)[0] != "acknowledged"
             ]
             if incomplete_gates:
-                raise ValueError("gate TASK 尚未完成: " + ", ".join(incomplete_gates))
+                raise ValueError("gate TASK 尚未核收: " + ", ".join(incomplete_gates))
     if current.get("completion_class") == "audit" or audit_department(current["department"]):
         report_path = audit_report(
             args.report, current["department"], current["task_id"],
@@ -4365,6 +5401,17 @@ def cmd_ack(args) -> int:
         raise ValueError(f"acknowledged-by 必须匹配当前已登记统筹会话: {expected};该字段仍只作审计声明")
     if state != "completed" or current.get("resolution") is not None:
         raise ValueError(f"非法状态转换: {state} --ack--> ?")
+    if current.get("schema_version") == SCHEMA_VERSION:
+        _, active = require_active_slice_task(current, current["task_kind"])
+        if active["user_exit"]["status"] == "needs_revision":
+            raise ValueError("用户修订尚未完成，不能核收或关闭当前切片")
+        if current["task_kind"] == "owner":
+            unacknowledged_gates = [
+                task_id for task_id in active["gate_tasks"].values()
+                if locate(task_id)[0] != "acknowledged"
+            ]
+            if unacknowledged_gates:
+                raise ValueError("gate TASK 尚未核收，不能先核收 owner: " + ", ".join(unacknowledged_gates))
     timestamp = now_iso()
     close_transaction = prepare_slice_close_transaction(
         action="ack", task=current, actor=actor, timestamp=timestamp,
@@ -4462,9 +5509,16 @@ def cmd_onboard_bundle(args) -> int:
         ("收件箱.md", department_root / "收件箱.md"),
     ]
     snapshots: list[tuple[str, Path, bytes]] = []
+    source_snapshots: list[tuple[str, Path, bytes]] = []
     for label, path in documents:
         ensure_plain_file(path, COLLAB, label=f"{department} {label}")
-        snapshots.append((label, path, path.read_bytes()))
+        source_data = path.read_bytes()
+        source_snapshots.append((label, path, source_data))
+        data = (
+            (extract_handoff_hot_block(source_data.decode("utf-8-sig")) + "\n").encode("utf-8")
+            if label == "交接班文档.md" else source_data
+        )
+        snapshots.append((label, path, data))
     current, recovery = department_onboard_tasks(department)
 
     def identity_rows(
@@ -4488,8 +5542,11 @@ def cmd_onboard_bundle(args) -> int:
         raise ValueError("HOT_STATE_BUSY | 接班快照读取期间 TASK 身份集合发生变化")
     if any(path.exists() for path in transactions):
         raise ValueError("HOT_STATE_BUSY | 接班快照读取期间出现未恢复事务")
-    for label, path, data in snapshots:
+    for label, path, data in source_snapshots:
         if path.read_bytes() != data:
+            raise ValueError(f"HOT_STATE_BUSY | 接班快照读取期间发生变化: {label}")
+    for label, path, data in snapshots:
+        if label.startswith("tasks/") and path.read_bytes() != data:
             raise ValueError(f"HOT_STATE_BUSY | 接班快照读取期间发生变化: {label}")
     hot_context_bytes = sum(len(data) for _, _, data in snapshots)
     warning = "review_required" if hot_context_bytes > HOT_CONTEXT_WARNING_BYTES else "none"
@@ -4673,7 +5730,7 @@ def parser() -> argparse.ArgumentParser:
     user_exit = sub.add_parser("record-user-exit")
     user_exit.add_argument("--task-id", required=True)
     user_exit.add_argument("--candidate-id", required=True)
-    user_exit.add_argument("--status", choices=("verified", "not_applicable"), required=True)
+    user_exit.add_argument("--status", choices=("needs_revision", "verified", "not_applicable"), required=True)
     user_exit.add_argument("--evidence", required=True)
     user_exit.add_argument("--actor", required=True, help="当前已登记统筹会话，格式：统筹部/会话ID")
     user_exit.set_defaults(func=cmd_record_user_exit)
@@ -4743,6 +5800,9 @@ def parser() -> argparse.ArgumentParser:
     onboard_bundle = sub.add_parser("onboard-bundle")
     onboard_bundle.add_argument("--department", required=True)
     onboard_bundle.set_defaults(func=cmd_onboard_bundle)
+    next_action = sub.add_parser("next-action")
+    next_action.add_argument("--task-id", required=True)
+    next_action.set_defaults(func=cmd_next_action)
     doctor = sub.add_parser("doctor")
     doctor.set_defaults(func=cmd_doctor)
     return root
@@ -4751,6 +5811,8 @@ def parser() -> argparse.ArgumentParser:
 def main() -> int:
     args = parser().parse_args()
     try:
+        if args.cmd == "next-action":
+            return args.func(args)
         init_layout()
         if args.cmd == "onboard-bundle":
             return args.func(args)
@@ -4796,7 +5858,7 @@ else:
 
 
 UTF8_BOOTSTRAP_MARKER = "AGENT_TEAM_SESSION_UTF8_BOOTSTRAPPED"
-PROTOCOL_VERSION = "1.5.0"
+PROTOCOL_VERSION = "1.5.1"
 THREAD_ID_MAX_CHARS = 300
 ACTOR_MAX_CHARS = 400
 ROOT_FIELDS = {
@@ -6693,7 +7755,8 @@ UPGRADE_TASK_REQUIRED_FIELDS = {
 }
 UPGRADE_TASK_OPTIONAL_FIELDS = {
     "acknowledged_by", "impact_declaration", "temporary_executor", "temporary_operation_history", "resolution",
-    "ownership_history", "slice_id", "task_kind", "gate_type", "gate_attempts",
+    "ownership_history", "state_action_receipt", "completion_history",
+    "slice_id", "task_kind", "gate_type", "gate_attempts",
 }
 UPGRADE_TASK_ID_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
 
@@ -7036,6 +8099,80 @@ def validate_upgrade_task_payload(payload: object, source: Path, departments: se
             for item in ownership
         ):
             raise ValueError(f"TASK ownership_history 无效: {source}")
+        state_action_receipt = payload.get("state_action_receipt")
+        if state_action_receipt is not None:
+            expected_states = {
+                "claim": "claimed", "block": "blocked", "wait": "waiting_input", "resume": "claimed",
+            }
+            action = state_action_receipt.get("action") if isinstance(state_action_receipt, dict) else None
+            reason = state_action_receipt.get("reason") if isinstance(state_action_receipt, dict) else None
+            generation = (
+                state_action_receipt.get("candidate_generation")
+                if isinstance(state_action_receipt, dict) else None
+            )
+            if (
+                not isinstance(state_action_receipt, dict)
+                or set(state_action_receipt) != {
+                    "action", "actor", "reason", "target_state", "candidate_generation",
+                }
+                or action not in expected_states
+                or state_action_receipt.get("target_state") != expected_states[action]
+                or not isinstance(state_action_receipt.get("actor"), str)
+                or not state_action_receipt["actor"]
+                or len(state_action_receipt["actor"]) > ACTOR_MAX_CHARS
+                or not isinstance(reason, str)
+                or len(reason) > 2000
+                or ((action in {"block", "wait"}) != bool(reason))
+                or isinstance(generation, bool)
+                or not isinstance(generation, int)
+                or generation < 0
+            ):
+                raise ValueError(f"TASK state_action_receipt 无效: {source}")
+        completion_history = payload.get("completion_history", [])
+        completion_fields = {
+            "from_state", "completed_revision", "completed_at", "reopened_at", "reopened_by", "reason",
+            "candidate_id", "candidate_manifest", "candidate_sha256", "generation", "artifacts",
+            "external_artifacts", "verified", "unverified", "mistake_check", "report", "event_receipts",
+            "acknowledged_by",
+        }
+        if not isinstance(completion_history, list) or len(completion_history) > 100:
+            raise ValueError(f"TASK completion_history 无效: {source}")
+        for entry in completion_history:
+            if (
+                not isinstance(entry, dict)
+                or set(entry) != completion_fields
+                or entry.get("from_state") not in {"completed", "acknowledged"}
+                or isinstance(entry.get("completed_revision"), bool)
+                or not isinstance(entry.get("completed_revision"), int)
+                or entry["completed_revision"] < 1
+                or isinstance(entry.get("generation"), bool)
+                or not isinstance(entry.get("generation"), int)
+                or entry["generation"] < 1
+                or not isinstance(entry.get("candidate_id"), str)
+                or not re.fullmatch(r"CAND-[0-9]{8}-[A-Z0-9]{6}", entry["candidate_id"])
+                or not isinstance(entry.get("candidate_sha256"), str)
+                or not re.fullmatch(r"[0-9a-f]{64}", entry["candidate_sha256"])
+            ):
+                raise ValueError(f"TASK completion_history 条目无效: {source}")
+            for field, max_chars, allow_empty in (
+                ("candidate_manifest", 500, False), ("reopened_by", ACTOR_MAX_CHARS, False),
+                ("reason", 1000, False), ("mistake_check", 2000, False),
+                ("report", 500, False), ("acknowledged_by", ACTOR_MAX_CHARS, True),
+            ):
+                validate_upgrade_task_text(entry[field], field, allow_empty=allow_empty, max_chars=max_chars)
+            validate_upgrade_task_timestamp(entry["completed_at"], "completion_history.completed_at")
+            validate_upgrade_task_timestamp(entry["reopened_at"], "completion_history.reopened_at")
+            for field, max_chars in (
+                ("artifacts", 500), ("external_artifacts", 1000), ("verified", 2000),
+                ("unverified", 2000), ("event_receipts", 1000),
+            ):
+                validate_upgrade_task_list(entry[field], field, max_chars=max_chars)
+            if (
+                (not entry["artifacts"] and not entry["external_artifacts"])
+                or not entry["verified"] or not entry["unverified"]
+                or (entry["from_state"] == "acknowledged") != bool(entry["acknowledged_by"])
+            ):
+                raise ValueError(f"TASK completion_history 证据无效: {source}")
         attempts = payload.get("gate_attempts", [])
         if payload["task_kind"] == "owner" and attempts:
             raise ValueError(f"owner TASK 不得含 gate_attempts: {source}")
@@ -7399,7 +8536,7 @@ def registry_data_from_session_state(payload: dict) -> dict[str, dict[str, str]]
 
 
 def load_legacy_archive_recovery(
-    collab: Path, task_payloads: list[tuple[Path, dict]],
+    collab: Path, task_payloads: list[tuple[Path, dict]], previous_protocol_version: str | None,
 ) -> tuple[Path, dict]:
     path = collab / ".locks" / LEGACY_ARCHIVE_RECOVERY_FILE
     empty = {"schema_version": 1, "protocol_version": PROTOCOL_VERSION, "entries": {}}
@@ -7411,7 +8548,11 @@ def load_legacy_archive_recovery(
     if not isinstance(payload, dict) or set(payload) != {"schema_version", "protocol_version", "entries"}:
         raise ValueError("legacy archive recovery 结构无效")
     entries = payload.get("entries")
-    if payload.get("schema_version") != 1 or payload.get("protocol_version") != PROTOCOL_VERSION or not isinstance(entries, dict):
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("protocol_version") not in {PROTOCOL_VERSION, previous_protocol_version}
+        or not isinstance(entries, dict)
+    ):
         raise ValueError("legacy archive recovery 版本无效")
     sources = {task.get("task_id"): source for source, task in task_payloads}
     for task_id, entry in entries.items():
@@ -7433,6 +8574,8 @@ def load_legacy_archive_recovery(
             )
         ):
             raise ValueError(f"legacy archive recovery 条目无效或与原 TASK 不一致: {task_id}")
+    payload = json.loads(json.dumps(payload, ensure_ascii=False))
+    payload["protocol_version"] = PROTOCOL_VERSION
     return path, payload
 
 
@@ -7500,6 +8643,7 @@ def merge_legacy_archive_recovery(
 
 def load_legacy_closeout_index(
     collab: Path, task_payloads: list[tuple[Path, dict]], recovery_entries: dict[str, dict],
+    previous_protocol_version: str | None,
 ) -> tuple[Path, list[str], list[str]]:
     path = collab / ".locks" / LEGACY_CLOSEOUT_INDEX_FILE
     existing: list[str] = []
@@ -7516,7 +8660,7 @@ def load_legacy_closeout_index(
         raw_recovery_ids = payload.get("archive_recovery_task_ids")
         if (
             payload.get("schema_version") != 1
-            or payload.get("protocol_version") != PROTOCOL_VERSION
+            or payload.get("protocol_version") not in {PROTOCOL_VERSION, previous_protocol_version}
             or not isinstance(raw_ids, list)
             or not isinstance(raw_recovery_ids, list)
             or len(raw_ids) > 10000
@@ -7564,6 +8708,132 @@ def load_legacy_closeout_index(
     if not recovery_required <= indexed:
         raise ValueError("legacy closeout index 缺少 archive recovery TASK 身份")
     return path, sorted(indexed), sorted(recovery_required)
+
+
+def migrated_slice_control(
+    collab: Path, previous_protocol_version: str | None, task_payloads: list[tuple[Path, dict]],
+) -> str:
+    path = collab / ".locks" / "slice-control.json"
+    if previous_protocol_version != "1.5.0":
+        if previous_protocol_version == PROTOCOL_VERSION:
+            if path.is_symlink() or not plain_path_within(path, collab, kind="file"):
+                raise ValueError("当前切片控制缺失或不安全")
+            return read_utf8(path)
+        return slice_control_payload()
+    if path.is_symlink() or not plain_path_within(path, collab, kind="file"):
+        raise ValueError("1.5.0 切片控制缺失或不安全")
+    payload = strict_json_loads(read_utf8(path), source=str(path))
+    top_fields = {
+        "schema_version", "protocol_version", "active_slice", "history", "candidate_ids", "host_runtime",
+    }
+    if (
+        not isinstance(payload, dict) or set(payload) != top_fields
+        or payload.get("schema_version") != 1
+        or payload.get("protocol_version") != "1.5.0"
+        or payload.get("host_runtime") != {"mode": "manual-degraded", "capabilities": []}
+        or not isinstance(payload.get("history"), list) or len(payload["history"]) > 100
+        or not isinstance(payload.get("candidate_ids"), list)
+        or len(payload["candidate_ids"]) > 100000
+        or len(payload["candidate_ids"]) != len(set(payload["candidate_ids"]))
+        or any(not isinstance(item, str) or not re.fullmatch(r"CAND-[0-9]{8}-[A-Z0-9]{6}", item)
+               for item in payload["candidate_ids"])
+    ):
+        raise ValueError("1.5.0 切片控制顶层结构无效")
+    active = payload.get("active_slice")
+    if active is not None:
+        old_fields = {
+            "slice_id", "owner_task_id", "required_gates", "gate_tasks", "candidate",
+            "user_exit", "created_at", "metrics",
+        }
+        if not isinstance(active, dict) or set(active) != old_fields:
+            raise ValueError("1.5.0 活动切片结构无效")
+        if (
+            not re.fullmatch(r"SLICE-[0-9]{8}-[A-Z0-9]{6}", active.get("slice_id", ""))
+            or not UPGRADE_TASK_ID_RE.fullmatch(active.get("owner_task_id", ""))
+            or not isinstance(active.get("required_gates"), list)
+            or len(active["required_gates"]) > 2
+            or len(active["required_gates"]) != len(set(active["required_gates"]))
+            or not isinstance(active.get("gate_tasks"), dict)
+            or any(gate not in active["required_gates"] for gate in active["gate_tasks"])
+            or any(not UPGRADE_TASK_ID_RE.fullmatch(task_id) for task_id in active["gate_tasks"].values())
+            or not isinstance(active.get("metrics"), list)
+        ):
+            raise ValueError("1.5.0 活动切片身份或 gate 结构无效")
+        by_id = {task.get("task_id"): task for _, task in task_payloads}
+        expected_ids = {active["owner_task_id"], *active["gate_tasks"].values()}
+        if not expected_ids <= set(by_id) or any(
+            by_id[task_id].get("slice_id") != active["slice_id"] for task_id in expected_ids
+        ):
+            raise ValueError("1.5.0 活动切片引用的 TASK 缺失或身份不一致")
+        candidate = active.get("candidate")
+        if candidate is not None and (
+            not isinstance(candidate, dict)
+            or set(candidate) != {"candidate_id", "manifest", "sha256", "generation", "bound_by", "bound_at"}
+            or not re.fullmatch(r"CAND-[0-9]{8}-[A-Z0-9]{6}", candidate.get("candidate_id", ""))
+            or candidate["candidate_id"] not in payload["candidate_ids"]
+            or not re.fullmatch(r"[0-9a-f]{64}", candidate.get("sha256", ""))
+            or isinstance(candidate.get("generation"), bool)
+            or not isinstance(candidate.get("generation"), int)
+            or candidate["generation"] < 1
+        ):
+            raise ValueError("1.5.0 活动候选身份无效")
+        if candidate is not None:
+            bound_by = candidate.get("bound_by")
+            if (
+                not isinstance(bound_by, str)
+                or not bound_by
+                or bound_by != bound_by.strip()
+                or len(bound_by) > ACTOR_MAX_CHARS
+                or any(char.isspace() for char in bound_by)
+            ):
+                raise ValueError("1.5.0 活动候选绑定 actor 无效")
+            try:
+                bound_at = validate_upgrade_task_timestamp(candidate.get("bound_at"), "candidate.bound_at")
+            except ValueError as exc:
+                raise ValueError("1.5.0 活动候选绑定时间无效") from exc
+            owner_task = by_id[active["owner_task_id"]]
+            ownership_history = owner_task.get("ownership_history", [])
+            ownership_times = [
+                validate_upgrade_task_timestamp(entry.get("at"), "ownership_history.at")
+                for entry in ownership_history
+            ]
+            if ownership_times != sorted(ownership_times):
+                raise ValueError("1.5.0 活动候选 owner 身份历史时间顺序无效")
+            binding_actor_indexes = [
+                index for index, entry in enumerate(ownership_history)
+                if isinstance(entry, dict) and entry.get("actor") == bound_by
+            ]
+            if not binding_actor_indexes:
+                raise ValueError("1.5.0 活动候选绑定 actor 不在 owner 身份历史中")
+            if bound_at < min(ownership_times[index] for index in binding_actor_indexes):
+                raise ValueError("1.5.0 活动候选绑定时间早于 actor 身份生效")
+            if not any(
+                ownership_times[index] <= bound_at
+                and (
+                    index + 1 == len(ownership_times)
+                    or bound_at <= ownership_times[index + 1]
+                )
+                for index in binding_actor_indexes
+            ):
+                raise ValueError("1.5.0 活动候选绑定时间不在 actor 负责区间")
+        user_exit = active.get("user_exit")
+        if (
+            not isinstance(user_exit, dict)
+            or set(user_exit) != {"status", "evidence", "actor", "at"}
+            or user_exit.get("status") not in {"pending", "verified", "not_applicable"}
+            or not all(isinstance(user_exit.get(field), str) for field in ("evidence", "actor", "at"))
+            or (user_exit["status"] == "pending" and any(user_exit[field] for field in ("evidence", "actor", "at")))
+            or (user_exit["status"] != "pending" and not all(user_exit[field] for field in ("evidence", "actor", "at")))
+        ):
+            raise ValueError("1.5.0 用户出口结构无效")
+        active["revision_requests"] = []
+        active["user_exit"] = {
+            **user_exit,
+            "candidate_id": candidate["candidate_id"] if candidate else "",
+            "generation": candidate["generation"] if candidate else 0,
+        }
+    payload["protocol_version"] = PROTOCOL_VERSION
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
 
 
 def emit_pending_archive_actions(actions: list[tuple[str, str]]) -> None:
@@ -7858,6 +9128,7 @@ def run_explicit_rollback(collab: Path, manifest_argument: str) -> int:
         upgrade_identity = protocol.get("upgrade_identity") if isinstance(protocol, dict) else None
         if not isinstance(upgrade_identity, dict):
             raise ValueError("当前现场没有可回滚的升级代次身份")
+        active_150_rollback = upgrade_identity.get("source_protocol") == "1.5.0"
         if collaboration_work_mode(collab) != "frozen":
             raise ValueError("先由已登记统筹会话冻结新工作，再执行协议回滚")
         manifest = Path(manifest_argument).expanduser()
@@ -7872,14 +9143,15 @@ def run_explicit_rollback(collab: Path, manifest_argument: str) -> int:
         operation_id = backup_root.name
         if not re.fullmatch(r"UPGRADE-[0-9]{8}T[0-9]{6}-[A-F0-9]{8}", operation_id):
             raise ValueError("升级备份 operation_id 无效")
-        slice_control = collab / ".locks" / "slice-control.json"
-        slice_payload = strict_json_loads(read_utf8(slice_control), source=str(slice_control))
-        if not isinstance(slice_payload, dict) or slice_payload.get("active_slice") is not None:
-            raise ValueError("仍有活动切片，拒绝回滚")
-        for task_path in sorted((collab / "tasks").glob("TASK-*.json")):
-            payload = strict_json_loads(read_utf8(task_path), source=str(task_path))
-            if isinstance(payload, dict) and payload.get("schema_version") == 2:
-                raise ValueError(f"已创建 1.5 TASK，拒绝回滚: {task_path.name}")
+        if not active_150_rollback:
+            slice_control = collab / ".locks" / "slice-control.json"
+            slice_payload = strict_json_loads(read_utf8(slice_control), source=str(slice_control))
+            if not isinstance(slice_payload, dict) or slice_payload.get("active_slice") is not None:
+                raise ValueError("仍有活动切片，拒绝回滚")
+            for task_path in sorted((collab / "tasks").glob("TASK-*.json")):
+                payload = strict_json_loads(read_utf8(task_path), source=str(task_path))
+                if isinstance(payload, dict) and payload.get("schema_version") == 2:
+                    raise ValueError(f"已创建 1.5 TASK，拒绝回滚: {task_path.name}")
         if (collab / UPGRADE_TRANSACTION_FILE).exists():
             raise ValueError("已有升级事务标记，拒绝叠加显式回滚")
         manifest_bytes = manifest.read_bytes()
@@ -7988,7 +9260,7 @@ def run_upgrade(collab: Path, *, role_policy_overlay_file: str = "") -> int:
             collab, roles, registry_text, date, session_mode, task_payloads,
         )
         legacy_archive_recovery_path, legacy_archive_recovery = load_legacy_archive_recovery(
-            collab, task_payloads,
+            collab, task_payloads, previous_protocol_version,
         )
         legacy_archive_repairs, pending_archive_actions = scan_archive_recovery_actions(
             task_payloads, previous_protocol_version, legacy_archive_recovery["entries"],
@@ -8002,6 +9274,10 @@ def run_upgrade(collab: Path, *, role_policy_overlay_file: str = "") -> int:
             legacy_archive_recovery_task_ids,
         ) = load_legacy_closeout_index(
             collab, task_payloads, target_legacy_archive_recovery["entries"],
+            previous_protocol_version,
+        )
+        target_slice_control = migrated_slice_control(
+            collab, previous_protocol_version, task_payloads,
         )
     except (OSError, UnicodeError, ValueError) as exc:
         print(f"升级已停止:会话或归档真值未通过预检: {exc}", file=sys.stderr)
@@ -8105,13 +9381,7 @@ def run_upgrade(collab: Path, *, role_policy_overlay_file: str = "") -> int:
     if slice_control_path.is_symlink():
         print("切片控制不能是符号链接，已拒绝升级。", file=sys.stderr)
         return 3
-    if slice_control_path.exists() and previous_protocol_version == PROTOCOL_VERSION:
-        if not plain_path_within(slice_control_path, collab, kind="file"):
-            print("切片控制路径不安全，已拒绝升级。", file=sys.stderr)
-            return 3
-        managed[slice_control_path] = (read_utf8(slice_control_path), 0o600)
-    else:
-        managed[slice_control_path] = (slice_control_payload(), 0o600)
+    managed[slice_control_path] = (target_slice_control, 0o600)
     if target_legacy_archive_recovery["entries"] or legacy_archive_recovery_path.exists():
         managed[legacy_archive_recovery_path] = (
             json.dumps(target_legacy_archive_recovery, ensure_ascii=False, indent=2, sort_keys=True) + "\n",

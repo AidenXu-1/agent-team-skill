@@ -26,10 +26,13 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCAFFOLD = Path(os.environ.get("AGENT_TEAM_SCAFFOLD", ROOT / "scripts" / "scaffold_team.py")).expanduser().resolve()
-PUBLIC_VERSION = "2.0.6"
-SOURCE_VERSION = "2.1.0"
-PROTOCOL_VERSION = "1.5.0"
+PUBLIC_VERSION = "2.1.0"
+SOURCE_VERSION = "2.1.1"
+PROTOCOL_VERSION = "1.5.1"
 PREVIOUS_PROTOCOL_VERSION = "1.4.15"
+IMMEDIATE_PREVIOUS_PROTOCOL_VERSION = "1.5.0"
+TOKEN_AB_CANDIDATE_VERSION = "2.1.0"
+TOKEN_AB_CANDIDATE_RUNTIME = "ea02df33bf675562ba89b6cc8d34d1a5da32f3754ad48153427bbf5aafd66e98"
 LEGACY_2011_FIXTURE = ROOT / "tests" / "fixtures" / "agent-team-2.0.11-runtime"
 RUNTIME_FILES = (
     "SKILL.md",
@@ -374,7 +377,7 @@ def verify_repository_contract() -> None:
     check(isinstance(metadata, dict) and metadata.get("version") == SOURCE_VERSION,
           "SKILL metadata did not identify the current source build")
     check(
-        f"当前正式版：{SOURCE_VERSION} · 适用于 Codex" in readme
+        f"当前正式版：{PUBLIC_VERSION} · 适用于 Codex" in readme
         and "https://github.com/AidenXu-1/agent-team-skill/releases/latest" in readme
         and "只下载安装标记为 Latest 的正式版本" in readme
         and "安装到我的 Codex 全局 Skill 目录" in readme
@@ -408,11 +411,7 @@ def verify_repository_contract() -> None:
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         ).returncode == 0
     )
-    status_binding_valid = (
-        candidate_status == "uncommitted-review-candidate" and base_commit == current_head
-    ) or (
-        candidate_status == "reviewed-release-candidate" and base_is_ancestor and base_commit != current_head
-    )
+    status_binding_valid = candidate_status == "source-candidate" and base_is_ancestor
     check(
         isinstance(candidate_manifest, dict)
         and set(candidate_manifest) == {
@@ -422,7 +421,7 @@ def verify_repository_contract() -> None:
         }
         and candidate_manifest.get("schema_version") == 1
         and candidate_manifest.get("candidate_id") == expected_candidate_id
-        and candidate_status in {"uncommitted-review-candidate", "reviewed-release-candidate"}
+        and candidate_status == "source-candidate"
         and status_binding_valid
         and candidate_manifest.get("source_version") == SOURCE_VERSION
         and candidate_manifest.get("protocol_version") == PROTOCOL_VERSION
@@ -528,8 +527,8 @@ def verify_repository_contract() -> None:
         and legacy_tokens.get("sample_count") == 2
         and legacy_tokens.get("input_tokens_mean") == 101929.0
         and legacy_tokens.get("tool_calls_mean") == 5.0
-        and candidate_tokens.get("source_version") == SOURCE_VERSION
-        and candidate_tokens.get("runtime_set_sha256") == runtime_set_sha256
+        and candidate_tokens.get("source_version") == TOKEN_AB_CANDIDATE_VERSION
+        and candidate_tokens.get("runtime_set_sha256") == TOKEN_AB_CANDIDATE_RUNTIME
         and candidate_tokens.get("sample_count") == 2
         and candidate_tokens.get("input_tokens_mean") == 75915.0
         and candidate_tokens.get("tool_calls_mean") == 2.0
@@ -552,7 +551,7 @@ def verify_repository_contract() -> None:
             for probe in token_ab.get("rejected_probes", [])
         )
         and isinstance(token_ab.get("limitations"), list) and len(token_ab["limitations"]) >= 5,
-        "real Token A/B evidence is stale, selective, or no longer bound to the candidate runtime",
+        "historical Token A/B evidence is stale, selective, or no longer bound to its tested runtime",
     )
     check(
         all(term not in readme_lower for term in (
@@ -4674,8 +4673,12 @@ summary: 已对指定候选执行独立反向探针并记录结论
     ])
     check(manual_note.stdout.startswith("ONBOARD_FRESH_OK"),
           "manual cold notes outside the machine block incorrectly invalidated freshness")
-    check("stale manual claim" in manual_bundle.stdout,
-          "onboarding bundle summarized or dropped the untrusted manual handoff text")
+    check(
+        "stale manual claim" not in manual_bundle.stdout
+        and "===== BEGIN 交接班文档.md =====" in manual_bundle.stdout
+        and "机器生成的当前切片" in manual_bundle.stdout,
+        "onboarding bundle leaked stale manual handoff prose or omitted the machine block",
+    )
     check(
         "current_tasks=1 | recovery_tasks=0" in manual_bundle.stdout
         and "===== BEGIN tasks/TASK-19990101-FAKE00.json =====" not in manual_bundle.stdout
@@ -5727,6 +5730,2258 @@ def verify_long_thread_actor_identity(root: Path) -> None:
     )
 
 
+def verify_protocol_151_zero_gate_next_action(root: Path) -> None:
+    project = make_project(root, "protocol-151-zero-gate-next-action")
+    scaffold(project, "lead,dev,test")
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    ensure_department_registered(task_tool, "统筹部", "lead-thread")
+    ensure_department_registered(task_tool, "开发部", "dev-thread")
+    ensure_department_registered(task_tool, "测试部", "test-thread")
+    run([sys.executable, str(task_tool), "rebuild-index"])
+    owner = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+        "--department", "开发部", "--from-department", "统筹部",
+        "--title", "零 gate 用户出口优先级", "--node", "2.1.1 next-action",
+        "--details", "验证空审核集合在候选绑定后视为全部通过",
+        "--acceptance-exit", "正常与冻结模式均先记录用户出口",
+        "--failure-path", "错误建议解冻、恢复或继续审核时拒绝",
+        "--authorization-state", "none", "--task-kind", "owner",
+    ]))
+    run([
+        sys.executable, str(task_tool), "claim", "--task-id", owner,
+        "--claimed-by", "开发部/dev-thread",
+    ])
+    candidate_id = "CAND-20260828-ZG0001"
+    artifact = project / "docs" / "zero-gate-next-action.txt"
+    artifact.write_text("zero gate candidate\n", encoding="utf-8")
+    manifest = project / "docs" / "zero-gate-next-action-manifest.json"
+    manifest.write_text(json.dumps({
+        "schema_version": 1,
+        "candidate_id": candidate_id,
+        "artifact": {
+            "path": artifact.relative_to(project).as_posix(),
+            "sha256": file_sha256(artifact),
+            "kind": "file",
+        },
+        "source_revision": "verify-zero-gate-next-action",
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_id,
+        "--manifest", str(manifest.relative_to(project)),
+        "--sha256", file_sha256(manifest), "--actor", "开发部/dev-thread",
+    ])
+
+    normal_action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    normal_bundle = run([
+        sys.executable, str(task_tool), "onboard-bundle", "--department", "开发部",
+    ])
+    check(
+        "first_blocker=USER_EXIT_PENDING" in normal_action.stdout
+        and "allowed=record-user-exit" in normal_action.stdout
+        and "user_decision=yes" in normal_action.stdout
+        and "下一合法动作：`record-user-exit`" in normal_bundle.stdout,
+        "normal zero-gate candidate did not prioritize record-user-exit in next-action/onboard",
+    )
+
+    run([
+        sys.executable, str(task_tool), "wait", "--task-id", owner,
+        "--reason", "等待用户给出零 gate 候选意见", "--actor", "开发部/dev-thread",
+    ])
+    normal_waiting_action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    normal_waiting_bundle = run([
+        sys.executable, str(task_tool), "onboard-bundle", "--department", "开发部",
+    ])
+    check(
+        "state=waiting_input" in normal_waiting_action.stdout
+        and "first_blocker=USER_EXIT_PENDING" in normal_waiting_action.stdout
+        and "allowed=record-user-exit" in normal_waiting_action.stdout
+        and "下一合法动作：`record-user-exit`" in normal_waiting_bundle.stdout,
+        "normal waiting_input zero-gate owner suggested resume before record-user-exit",
+    )
+
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "零 gate 冻结优先级探针",
+    ])
+    frozen_action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    frozen_bundle = run([
+        sys.executable, str(task_tool), "onboard-bundle", "--department", "开发部",
+    ])
+    check(
+        "first_blocker=P0_FREEZE_ACTIVE" in frozen_action.stdout
+        and "allowed=record-user-exit" in frozen_action.stdout
+        and "user_decision=yes" in frozen_action.stdout
+        and "下一合法动作：`record-user-exit`" in frozen_bundle.stdout,
+        "frozen zero-gate candidate suggested unfreeze before record-user-exit",
+    )
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_id, "--status", "needs_revision",
+        "--evidence", "用户要求修订零 gate 候选", "--actor", "统筹部/lead-thread",
+    ])
+    frozen_revision = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "allowed=unfreeze-new-work,next-action" in frozen_revision.stdout,
+        "frozen waiting_input needs_revision did not return to the unfreeze boundary",
+    )
+    run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "测试夹具恢复零 gate 用户修订",
+    ])
+    normal_revision = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "state=waiting_input" in normal_revision.stdout
+        and "first_blocker=TASK_WAITING_INPUT" in normal_revision.stdout
+        and "allowed=resume,next-action" in normal_revision.stdout,
+        "normal waiting_input needs_revision did not return to resume before candidate binding",
+    )
+
+
+def protocol_151_edge_slice(
+    root: Path, label: str, required_gates: tuple[str, ...],
+) -> tuple[Path, Path, Path, str, str, dict[str, str], Path]:
+    project = make_project(root, label)
+    scaffold(project, "lead,dev,test,security")
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    for department, thread_id in (
+        ("统筹部", "lead-thread"), ("开发部", "dev-thread"),
+        ("测试部", "test-thread"), ("安全部", "security-thread"),
+    ):
+        ensure_department_registered(task_tool, department, thread_id)
+    run([sys.executable, str(task_tool), "rebuild-index"])
+    enqueue_args = [
+        sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+        "--department", "开发部", "--from-department", "统筹部",
+        "--title", label, "--node", "2.1.1 next-action priority",
+        "--details", "验证 next-action 的机械优先级",
+        "--acceptance-exit", "只报告当前真实可执行动作",
+        "--failure-path", "错误优先级被反向测试拒绝",
+        "--authorization-state", "none", "--task-kind", "owner",
+    ]
+    for gate_type in required_gates:
+        enqueue_args += ["--required-gate", gate_type]
+    owner = task_id_from(run(enqueue_args))
+    run([
+        sys.executable, str(task_tool), "claim", "--task-id", owner,
+        "--claimed-by", "开发部/dev-thread",
+    ])
+    slice_id = json.loads(
+        (collab / ".locks" / "slice-control.json").read_text(encoding="utf-8")
+    )["active_slice"]["slice_id"]
+    candidate_id = "CAND-20260828-EDG001"
+    artifact = project / "docs" / f"{label}-candidate.txt"
+    artifact.write_text(f"{label} candidate\n", encoding="utf-8")
+    manifest = project / "docs" / f"{label}-manifest.json"
+    manifest.write_text(json.dumps({
+        "schema_version": 1,
+        "candidate_id": candidate_id,
+        "artifact": {
+            "path": artifact.relative_to(project).as_posix(),
+            "sha256": file_sha256(artifact), "kind": "file",
+        },
+        "source_revision": f"verify-{label}",
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_id,
+        "--manifest", str(manifest.relative_to(project)),
+        "--sha256", file_sha256(manifest), "--actor", "开发部/dev-thread",
+    ])
+    departments = {"test": ("测试部", "test-thread"), "security": ("安全部", "security-thread")}
+    gates: dict[str, str] = {}
+    for gate_type in required_gates:
+        department, thread_id = departments[gate_type]
+        gate = task_id_from(run([
+            sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+            "--department", department, "--from-department", "统筹部",
+            "--title", f"{label} {gate_type} gate", "--node", "2.1.1 next-action priority",
+            "--details", "给当前候选独立结论", "--acceptance-exit", "报告固定",
+            "--failure-path", "错误候选拒绝", "--authorization-state", "none",
+            "--task-kind", "gate", "--slice-id", slice_id, "--gate-type", gate_type,
+        ]))
+        run([
+            sys.executable, str(task_tool), "claim", "--task-id", gate,
+            "--claimed-by", f"{department}/{thread_id}",
+        ])
+        gates[gate_type] = gate
+    return project, collab, task_tool, owner, candidate_id, gates, manifest
+
+
+def protocol_151_edge_report(
+    collab: Path, task_id: str, candidate_id: str,
+    department: str, decision: str, label: str,
+) -> Path:
+    report = collab / "部门" / department / "报告" / f"{label}.md"
+    report.write_text(f"""---
+type: audit_report
+department: {department}
+target: Agent Team 2.1.1 next-action priority
+status: final
+date: {dt.date.today().isoformat()}
+related_task: {task_id}
+decision: {decision}
+candidate_id: {candidate_id}
+tags: [protocol-1.5.1]
+summary: 当前代候选独立审核结论
+---
+
+# 独立审核
+
+当前代结论为 {decision}。
+""", encoding="utf-8")
+    return report
+
+
+def verify_protocol_151_fail_and_ack_priorities(root: Path) -> None:
+    fail_project, fail_collab, fail_tool, fail_owner, fail_candidate, fail_gates, _ = (
+        protocol_151_edge_slice(root, "protocol-151-fail-priority", ("test", "security"))
+    )
+    fail_report = protocol_151_edge_report(
+        fail_collab, fail_gates["test"], fail_candidate,
+        "测试部", "fail", "fail-priority-test",
+    )
+    run([
+        sys.executable, str(fail_tool), "gate-verdict", "--task-id", fail_gates["test"],
+        "--candidate-id", fail_candidate, "--decision", "fail",
+        "--report", str(fail_report.relative_to(fail_project)),
+        "--evidence", "当前候选测试失败", "--actor", "测试部/test-thread",
+    ])
+    fail_claimed = run([
+        sys.executable, str(fail_tool), "next-action", "--task-id", fail_owner,
+    ])
+    fail_claimed_allowed = re.search(r"allowed=([^|\n]+)", fail_claimed.stdout)
+    check(
+        "first_blocker=CURRENT_GATE_FAIL" in fail_claimed.stdout
+        and fail_claimed_allowed is not None
+        and "bind-candidate" in fail_claimed_allowed.group(1).split(",")
+        and "gate-verdict" not in fail_claimed_allowed.group(1).split(","),
+        "a current gate FAIL was hidden behind another claimed pending gate",
+    )
+    run([
+        sys.executable, str(fail_tool), "block", "--task-id", fail_owner,
+        "--reason", "失败候选等待恢复后返工", "--actor", "开发部/dev-thread",
+    ])
+    fail_blocked = run([
+        sys.executable, str(fail_tool), "next-action", "--task-id", fail_owner,
+    ])
+    check(
+        "first_blocker=TASK_BLOCKED" in fail_blocked.stdout
+        and "allowed=resume,next-action" in fail_blocked.stdout,
+        "a blocked owner with current gate FAIL skipped resume before candidate rebinding",
+    )
+    run([
+        sys.executable, str(fail_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "失败候选冻结边界探针",
+    ])
+    fail_frozen = run([
+        sys.executable, str(fail_tool), "next-action", "--task-id", fail_owner,
+    ])
+    check(
+        "first_blocker=P0_FREEZE_ACTIVE" in fail_frozen.stdout
+        and "allowed=unfreeze-new-work,next-action" in fail_frozen.stdout
+        and "forbidden=resume,bind-candidate,claim,enqueue" in fail_frozen.stdout,
+        "a frozen failed candidate continued gate work or exposed candidate binding",
+    )
+
+    ack_project, ack_collab, ack_tool, ack_owner, ack_candidate, ack_gates, ack_manifest = (
+        protocol_151_edge_slice(root, "protocol-151-completed-ack", ("test",))
+    )
+    pass_report = protocol_151_edge_report(
+        ack_collab, ack_gates["test"], ack_candidate,
+        "测试部", "pass", "completed-ack-test",
+    )
+    run([
+        sys.executable, str(ack_tool), "gate-verdict", "--task-id", ack_gates["test"],
+        "--candidate-id", ack_candidate, "--decision", "pass",
+        "--report", str(pass_report.relative_to(ack_project)),
+        "--evidence", "当前候选测试通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(ack_tool), "record-user-exit", "--task-id", ack_owner,
+        "--candidate-id", ack_candidate, "--status", "not_applicable",
+        "--evidence", "纯代码候选无需人工体验", "--actor", "统筹部/lead-thread",
+    ])
+    incomplete_gate_action = run([
+        sys.executable, str(ack_tool), "next-action", "--task-id", ack_owner,
+    ])
+    check(
+        "first_blocker=GATE_TASK_COMPLETION_REQUIRED" in incomplete_gate_action.stdout
+        and f"target_task={ack_gates['test']}" in incomplete_gate_action.stdout
+        and "allowed=complete,next-action" in incomplete_gate_action.stdout,
+        "owner next-action suggested owner completion before the PASS gate TASK was completed",
+    )
+    run([
+        sys.executable, str(ack_tool), "complete", "--task-id", ack_gates["test"],
+        "--actor", "测试部/test-thread",
+        "--artifact", str(pass_report.relative_to(ack_project)),
+        "--report", str(pass_report.relative_to(ack_project)),
+        "--verified", "当前代报告固定", "--unverified", "无",
+        "--mistake-check", "未把 gate PASS 冒充发布",
+    ])
+    completed_gate = run([
+        sys.executable, str(ack_tool), "next-action", "--task-id", ack_gates["test"],
+    ])
+    check(
+        "state=completed" in completed_gate.stdout
+        and "allowed=ack,next-action" in completed_gate.stdout,
+        "normal completed gate did not expose ack as its next legal action",
+    )
+    bad_gate_ack = run([
+        sys.executable, str(ack_tool), "ack", "--task-id", ack_gates["test"],
+        "--acknowledged-by", "开发部/dev-thread",
+    ], ok=False)
+    check("必须匹配当前已登记统筹会话" in bad_gate_ack.stderr,
+          "next-action ack reporting bypassed the actual ack actor constraint")
+    run([
+        sys.executable, str(ack_tool), "ack", "--task-id", ack_gates["test"],
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    acknowledged_gate = run([
+        sys.executable, str(ack_tool), "next-action", "--task-id", ack_gates["test"],
+    ])
+    check(
+        "state=acknowledged" in acknowledged_gate.stdout
+        and "first_blocker=TASK_TERMINAL" in acknowledged_gate.stdout
+        and "allowed=next-action" in acknowledged_gate.stdout,
+        "acknowledged gate was not treated as terminal",
+    )
+    run([
+        sys.executable, str(ack_tool), "complete", "--task-id", ack_owner,
+        "--actor", "开发部/dev-thread",
+        "--artifact", str(ack_manifest.relative_to(ack_project)),
+        "--verified", "当前候选及 gate 已固定", "--unverified", "无",
+        "--mistake-check", "未把代码完成冒充用户体验",
+    ])
+    completed_owner = run([
+        sys.executable, str(ack_tool), "next-action", "--task-id", ack_owner,
+    ])
+    check(
+        "state=completed" in completed_owner.stdout
+        and "allowed=ack,next-action" in completed_owner.stdout,
+        "normal completed owner did not expose ack as its next legal action",
+    )
+    bad_owner_ack = run([
+        sys.executable, str(ack_tool), "ack", "--task-id", ack_owner,
+        "--acknowledged-by", "开发部/dev-thread",
+    ], ok=False)
+    check("必须匹配当前已登记统筹会话" in bad_owner_ack.stderr,
+          "completed owner ack actor constraint was not enforced by the actual command")
+
+
+def verify_protocol_151_authorization_priority(root: Path) -> None:
+    for task_state in ("queued", "blocked", "waiting_input"):
+        for authorization in ("user_required", "user_rejected"):
+            label = f"protocol-151-auth-{task_state}-{authorization}"
+            project = make_project(root, label)
+            scaffold(project, "lead,dev,test")
+            collab = project / "docs" / "collaboration"
+            task_tool = collab / "scripts" / "agent_team_task.py"
+            for department, thread_id in (
+                ("统筹部", "lead-thread"), ("开发部", "dev-thread"), ("测试部", "test-thread"),
+            ):
+                ensure_department_registered(task_tool, department, thread_id)
+            run([sys.executable, str(task_tool), "rebuild-index"])
+            initial_authorization = authorization if task_state == "queued" else "none"
+            enqueue_args = [
+                sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+                "--department", "开发部", "--from-department", "统筹部",
+                "--title", label, "--node", "2.1.1 authorization priority",
+                "--details", "验证授权闸先于领取或恢复",
+                "--acceptance-exit", "只报告真实授权动作",
+                "--failure-path", "错误建议 claim 或 resume 时拒绝",
+                "--authorization-state", initial_authorization, "--task-kind", "owner",
+            ]
+            if initial_authorization == "user_rejected":
+                enqueue_args += ["--authorization-evidence", "用户已拒绝当前工作"]
+            owner = task_id_from(run(enqueue_args))
+            if task_state != "queued":
+                run([
+                    sys.executable, str(task_tool), "claim", "--task-id", owner,
+                    "--claimed-by", "开发部/dev-thread",
+                ])
+                transition = "block" if task_state == "blocked" else "wait"
+                run([
+                    sys.executable, str(task_tool), transition, "--task-id", owner,
+                    "--reason", f"进入 {task_state} 授权探针", "--actor", "开发部/dev-thread",
+                ])
+                run([
+                    sys.executable, str(task_tool), "authorize", "--task-id", owner,
+                    "--state", authorization, "--evidence", f"设置 {authorization} 授权闸",
+                    "--actor", "统筹部/lead-thread",
+                ])
+
+            normal = run([
+                sys.executable, str(task_tool), "next-action", "--task-id", owner,
+            ])
+            normal_allowed = re.search(r"allowed=([^|\n]+)", normal.stdout)
+            expected_blocker = (
+                "USER_AUTHORIZATION_REQUIRED" if authorization == "user_required" else "USER_REJECTED"
+            )
+            expected_action = "authorize" if authorization == "user_required" else "resolve"
+            check(
+                f"state={task_state}" in normal.stdout
+                and f"first_blocker={expected_blocker}" in normal.stdout
+                and normal_allowed is not None
+                and normal_allowed.group(1).strip() == f"{expected_action},next-action"
+                and "claim" not in normal_allowed.group(1).split(",")
+                and "resume" not in normal_allowed.group(1).split(",")
+                and ("user_decision=yes" in normal.stdout) == (authorization == "user_required"),
+                f"normal {task_state} {authorization} authorization gate suggested an impossible state action",
+            )
+
+            run([
+                sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+                "--evidence", f"冻结 {task_state} {authorization} 授权探针",
+            ])
+            frozen = run([
+                sys.executable, str(task_tool), "next-action", "--task-id", owner,
+            ])
+            frozen_allowed = re.search(r"allowed=([^|\n]+)", frozen.stdout)
+            expected_frozen_actions = (
+                "authorize,unfreeze-new-work,next-action"
+                if authorization == "user_required" else "resolve,next-action"
+            )
+            check(
+                f"first_blocker={expected_blocker}" in frozen.stdout
+                and frozen_allowed is not None
+                and frozen_allowed.group(1).strip() == expected_frozen_actions
+                and "claim" not in frozen_allowed.group(1).split(",")
+                and "resume" not in frozen_allowed.group(1).split(",")
+                and (
+                    ("unfreeze-new-work" in frozen_allowed.group(1).split(","))
+                    == (authorization == "user_required")
+                )
+                and ("user_decision=yes" in frozen.stdout) == (authorization == "user_required"),
+                f"frozen {task_state} {authorization} authorization gate escaped its cleanup whitelist",
+            )
+            if authorization == "user_rejected" or task_state == "blocked":
+                if authorization == "user_required":
+                    run([
+                        sys.executable, str(task_tool), "authorize", "--task-id", owner,
+                        "--state", "user_rejected", "--evidence", "用户在冻结中明确拒绝",
+                        "--actor", "统筹部/lead-thread",
+                    ])
+                    rejected = run([
+                        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+                    ])
+                    check(
+                        "first_blocker=USER_REJECTED" in rejected.stdout
+                        and "allowed=resolve,next-action" in rejected.stdout,
+                        "frozen user_required could not close through user_rejected and resolve",
+                    )
+                task_payload = json.loads(
+                    (collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8")
+                )
+                resolved = run([
+                    sys.executable, str(task_tool), "resolve", "--task-id", owner,
+                    "--state", "rejected_by_user", "--expected-revision", str(task_payload["revision"]),
+                    "--actor", "统筹部/lead-thread", "--reason", "用户拒绝当前工作",
+                    "--evidence", "冻结授权拒绝分支已确认",
+                ])
+                check(resolved.stdout.startswith("TASK_RESOLUTION_OK | state=rejected_by_user"),
+                      "frozen user_rejected could not resolve without unfreezing")
+            else:
+                state_action = "claim" if task_state == "queued" else "resume"
+                denied_args = [sys.executable, str(task_tool), state_action, "--task-id", owner]
+                if state_action == "claim":
+                    denied_args += ["--claimed-by", "开发部/dev-thread"]
+                else:
+                    denied_args += ["--actor", "开发部/dev-thread"]
+                denied = run(denied_args, ok=False)
+                check("P0_FREEZE_ACTIVE" in denied.stderr,
+                      "frozen user_required allowed claim/resume before explicit unfreeze")
+                run([
+                    sys.executable, str(task_tool), "unfreeze-new-work",
+                    "--actor", "统筹部/lead-thread",
+                    "--user-confirmation", "用户确认继续，先显式解冻",
+                ])
+                after_unfreeze = run([
+                    sys.executable, str(task_tool), "next-action", "--task-id", owner,
+                ])
+                check(
+                    "first_blocker=USER_AUTHORIZATION_REQUIRED" in after_unfreeze.stdout
+                    and "allowed=authorize,next-action" in after_unfreeze.stdout,
+                    "confirmed path skipped the user_confirmed record after unfreezing",
+                )
+                run([
+                    sys.executable, str(task_tool), "authorize", "--task-id", owner,
+                    "--state", "user_confirmed", "--evidence", "用户明确确认继续",
+                    "--actor", "统筹部/lead-thread",
+                ])
+                confirmed = run([
+                    sys.executable, str(task_tool), "next-action", "--task-id", owner,
+                ])
+                check(
+                    f"allowed={state_action}" in confirmed.stdout,
+                    f"user_confirmed {task_state} did not expose {state_action}",
+                )
+                completed_action = run(denied_args)
+                expected_receipt = "TASK_CLAIMED" if state_action == "claim" else "TASK_RESUMED"
+                check(completed_action.stdout.startswith(expected_receipt),
+                      f"confirmed path could not execute {state_action} after unfreeze and authorize")
+
+
+def protocol_151_switch_session(
+    collab: Path, department: str, old_thread: str, new_thread: str,
+) -> None:
+    session_tool = collab / "scripts" / "agent_team_session.py"
+    run([
+        sys.executable, str(session_tool), "begin-switch", "--department", department,
+        "--old-thread-id", old_thread, "--reason", "next-action identity drift probe",
+    ])
+    for step in ("created", "onboarded", "registered"):
+        run([
+            sys.executable, str(session_tool), "mark", "--department", department,
+            "--step", step, "--thread-id", new_thread, "--evidence", f"identity-{step}",
+        ])
+
+
+def verify_protocol_151_identity_priority(root: Path) -> None:
+    for task_state in ("claimed", "blocked", "waiting_input"):
+        project, collab, task_tool, owner, candidate, _, _ = protocol_151_edge_slice(
+            root, f"protocol-151-owner-drift-{task_state}", (),
+        )
+        run([
+            sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+            "--candidate-id", candidate, "--status", "not_applicable",
+            "--evidence", "身份探针无需用户体验", "--actor", "统筹部/lead-thread",
+        ])
+        if task_state != "claimed":
+            transition = "block" if task_state == "blocked" else "wait"
+            run([
+                sys.executable, str(task_tool), transition, "--task-id", owner,
+                "--reason", f"进入 {task_state} 身份漂移探针", "--actor", "开发部/dev-thread",
+            ])
+        protocol_151_switch_session(collab, "开发部", "dev-thread", "dev-thread-v2")
+        normal = run([
+            sys.executable, str(task_tool), "next-action", "--task-id", owner,
+        ])
+        normal_allowed = re.search(r"allowed=([^|\n]+)", normal.stdout)
+        check(
+            "first_blocker=OWNER_REBIND_REQUIRED" in normal.stdout
+            and normal_allowed is not None
+            and normal_allowed.group(1).strip() == "rebind-owner,next-action",
+            f"normal {task_state} owner identity drift exposed an action that its registered actor cannot run",
+        )
+        run([
+            sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+            "--evidence", f"冻结 {task_state} 身份漂移探针",
+        ])
+        frozen = run([
+            sys.executable, str(task_tool), "next-action", "--task-id", owner,
+        ])
+        check(
+            "first_blocker=OWNER_REBIND_REQUIRED" in frozen.stdout
+            and "allowed=rebind-owner,next-action" in frozen.stdout,
+            f"frozen {task_state} owner identity drift was hidden behind unfreeze",
+        )
+
+    pending_project, pending_collab, pending_tool, pending_owner, pending_candidate, _, _ = (
+        protocol_151_edge_slice(root, "protocol-151-user-exit-before-rebind", ())
+    )
+    run([
+        sys.executable, str(pending_tool), "block", "--task-id", pending_owner,
+        "--reason", "等待用户纠偏", "--actor", "开发部/dev-thread",
+    ])
+    protocol_151_switch_session(pending_collab, "开发部", "dev-thread", "dev-thread-v2")
+    pending = run([
+        sys.executable, str(pending_tool), "next-action", "--task-id", pending_owner,
+    ])
+    check(
+        "first_blocker=USER_EXIT_PENDING" in pending.stdout
+        and "allowed=record-user-exit" in pending.stdout,
+        "owner drift incorrectly hid a user-exit fact that the lead can still record",
+    )
+    run([
+        sys.executable, str(pending_tool), "record-user-exit", "--task-id", pending_owner,
+        "--candidate-id", pending_candidate, "--status", "needs_revision",
+        "--evidence", "用户要求换班后修订", "--actor", "统筹部/lead-thread",
+    ])
+    revision = run([
+        sys.executable, str(pending_tool), "next-action", "--task-id", pending_owner,
+    ])
+    check(
+        "first_blocker=OWNER_REBIND_REQUIRED" in revision.stdout
+        and "allowed=rebind-owner,next-action" in revision.stdout
+        and "resume" not in re.search(r"allowed=([^|\n]+)", revision.stdout).group(1).split(","),
+        "needs_revision skipped owner rebind and suggested resume to a drifted actor",
+    )
+
+    gate_project, gate_collab, gate_tool, gate_owner, _, gate_tasks, _ = protocol_151_edge_slice(
+        root, "protocol-151-gate-drift", ("test", "security"),
+    )
+    protocol_151_switch_session(gate_collab, "测试部", "test-thread", "test-thread-v2")
+    owner_view = run([
+        sys.executable, str(gate_tool), "next-action", "--task-id", gate_owner,
+    ])
+    gate_view = run([
+        sys.executable, str(gate_tool), "next-action", "--task-id", gate_tasks["test"],
+    ])
+    for output, label in ((owner_view.stdout, "owner"), (gate_view.stdout, "drifted gate")):
+        allowed = re.search(r"allowed=([^|\n]+)", output)
+        check(
+            "first_blocker=OWNER_REBIND_REQUIRED" in output
+            and allowed is not None
+            and allowed.group(1).strip() == "rebind-owner,next-action"
+            and "gate-verdict" not in allowed.group(1).split(","),
+            f"{label} next-action recommended verdict with a drifted claimed gate actor",
+        )
+    run([
+        sys.executable, str(gate_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "冻结 gate 身份漂移探针",
+    ])
+    frozen_owner_view = run([
+        sys.executable, str(gate_tool), "next-action", "--task-id", gate_owner,
+    ])
+    check(
+        "first_blocker=OWNER_REBIND_REQUIRED" in frozen_owner_view.stdout
+        and "allowed=rebind-owner,next-action" in frozen_owner_view.stdout,
+        "frozen owner query recommended a verdict for a drifted gate actor",
+    )
+
+
+def verify_protocol_151_state_retry_actor_identity(root: Path) -> None:
+    project, collab, task_tool, owner, _, _, _ = protocol_151_edge_slice(
+        root, "protocol-151-state-retry-actor", (),
+    )
+    session_tool = collab / "scripts" / "agent_team_session.py"
+    run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "同一阻断原因", "--actor", "开发部/dev-thread",
+    ])
+
+    def switch_and_rebind(old_thread: str, new_thread: str) -> None:
+        run([
+            sys.executable, str(session_tool), "begin-switch", "--department", "开发部",
+            "--old-thread-id", old_thread, "--reason", "verify state retry actor binding",
+        ])
+        for step in ("created", "onboarded", "registered"):
+            run([
+                sys.executable, str(session_tool), "mark", "--department", "开发部",
+                "--step", step, "--thread-id", new_thread,
+                "--evidence", f"verify-{new_thread}-{step}",
+            ])
+        payload = json.loads((collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8"))
+        run([
+            sys.executable, str(task_tool), "rebind-owner", "--task-id", owner,
+            "--expected-revision", str(payload["revision"]),
+            "--actor", f"开发部/{new_thread}", "--previous-actor", f"开发部/{old_thread}",
+            "--evidence", "authorized switch and four-document onboarding",
+        ])
+        run([
+            sys.executable, str(session_tool), "finish-switch", "--department", "开发部",
+            "--new-thread-id", new_thread,
+            "--evidence", f"host=verify thread_id={old_thread} archived=true",
+        ])
+
+    switch_and_rebind("dev-thread", "dev-thread-v2")
+    repeated_block = run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "同一阻断原因", "--actor", "开发部/dev-thread-v2",
+    ], ok=False)
+    check("动作签名冲突" in repeated_block.stderr,
+          "a new owner session inherited the previous actor's block NOOP")
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread-v2",
+    ])
+    repeated_resume = run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread-v2",
+    ])
+    check(repeated_resume.stdout.startswith("TASK_STATE_NOOP"),
+          "the same actor's identical resume retry did not remain a NOOP")
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "verify frozen identical resume retry",
+    ])
+    frozen_resume = run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread-v2",
+    ])
+    check(frozen_resume.stdout.startswith("TASK_STATE_NOOP"),
+          "an identical resume retry was rejected only because work became frozen")
+    run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "verify resume retry fixture continues",
+    ])
+
+    switch_and_rebind("dev-thread-v2", "dev-thread-v3")
+    inherited_resume = run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread-v3",
+    ], ok=False)
+    check("动作签名冲突" in inherited_resume.stderr,
+          "a new owner session inherited the previous actor's resume NOOP")
+    run([
+        sys.executable, str(task_tool), "wait", "--task-id", owner,
+        "--reason", "同一等待原因", "--actor", "开发部/dev-thread-v3",
+    ])
+
+    switch_and_rebind("dev-thread-v3", "dev-thread-v4")
+    repeated_wait = run([
+        sys.executable, str(task_tool), "wait", "--task-id", owner,
+        "--reason", "同一等待原因", "--actor", "开发部/dev-thread-v4",
+    ], ok=False)
+    check("动作签名冲突" in repeated_wait.stderr,
+          "a new owner session inherited the previous actor's wait NOOP")
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread-v4",
+    ])
+    final_resume = run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread-v4",
+    ])
+    check(final_resume.stdout.startswith("TASK_STATE_NOOP"),
+          "the rebound actor's own resume retry did not remain a NOOP")
+
+
+def verify_protocol_151_user_exit_supersession(root: Path) -> None:
+    for prior_status in ("verified", "not_applicable"):
+        project, collab, task_tool, owner, candidate, gates, _ = protocol_151_edge_slice(
+            root, f"protocol-151-user-exit-supersede-{prior_status}", ("test",),
+        )
+        report = protocol_151_edge_report(
+            collab, gates["test"], candidate, "测试部", "pass",
+            f"user-exit-supersede-{prior_status}",
+        )
+        run([
+            sys.executable, str(task_tool), "gate-verdict", "--task-id", gates["test"],
+            "--candidate-id", candidate, "--decision", "pass",
+            "--report", str(report.relative_to(project)),
+            "--evidence", "当前候选测试通过", "--actor", "测试部/test-thread",
+        ])
+        prior_evidence = f"用户原先记录 {prior_status}"
+        run([
+            sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+            "--candidate-id", candidate, "--status", prior_status,
+            "--evidence", prior_evidence, "--actor", "统筹部/lead-thread",
+        ])
+        revised = run([
+            sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+            "--candidate-id", candidate, "--status", "needs_revision",
+            "--evidence", "用户随后要求同一候选继续修订", "--actor", "统筹部/lead-thread",
+        ])
+        control = json.loads(
+            (collab / ".locks" / "slice-control.json").read_text(encoding="utf-8")
+        )
+        active = control["active_slice"]
+        request = active["revision_requests"][-1]
+        superseded = request["superseded_user_exit"]
+        action = run([
+            sys.executable, str(task_tool), "next-action", "--task-id", owner,
+        ])
+        check(
+            revised.stdout.startswith("USER_EXIT_RECORDED")
+            and active["user_exit"]["status"] == "needs_revision"
+            and request["status"] == "pending"
+            and superseded["status"] == prior_status
+            and superseded["evidence"] == prior_evidence
+            and superseded["candidate_id"] == candidate
+            and superseded["generation"] == 1
+            and "first_blocker=USER_REVISION_READY" in action.stdout,
+            f"{prior_status} user exit could not be superseded by a preserved user revision",
+        )
+
+
+def verify_protocol_151_completed_revision_reopen(root: Path) -> None:
+    project, collab, task_tool, owner, candidate_1, gates, manifest_1 = protocol_151_edge_slice(
+        root, "protocol-151-completed-revision-reopen", ("test",),
+    )
+    gate = gates["test"]
+    report = protocol_151_edge_report(
+        collab, gate, candidate_1, "测试部", "pass", "completed-revision-reopen-pass",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate_1, "--decision", "pass",
+        "--report", str(report.relative_to(project)),
+        "--evidence", "第一代当前候选测试通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_1, "--status", "verified",
+        "--evidence", "用户先确认第一代", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", gate,
+        "--actor", "测试部/test-thread", "--artifact", str(report.relative_to(project)),
+        "--report", str(report.relative_to(project)), "--verified", "第一代 gate 已固定",
+        "--unverified", "无", "--mistake-check", "未把 PASS 冒充发布",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest_1.relative_to(project)),
+        "--verified", "第一代候选已固定", "--unverified", "无",
+        "--mistake-check", "等待统筹最终核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_1, "--status", "needs_revision",
+        "--evidence", "用户在切片关闭前撤回验收并要求修订", "--actor", "统筹部/lead-thread",
+    ])
+    action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=OWNER_REOPEN_REQUIRED" in action.stdout
+        and f"target_task={owner}" in action.stdout
+        and "allowed=resume,next-action" in action.stdout,
+        "a completed owner with a user revision was not routed to reopen",
+    )
+    denied_ack = run([
+        sys.executable, str(task_tool), "ack", "--task-id", owner,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ], ok=False)
+    check("用户修订" in denied_ack.stderr,
+          "owner acknowledgement closed a slice after the user requested revision")
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ])
+
+    candidate_2 = "CAND-20260829-RPN002"
+    artifact_2 = project / "docs" / "completed-revision-candidate-2.txt"
+    artifact_2.write_text("completed revision generation 2\n", encoding="utf-8")
+    manifest_2 = project / "docs" / "completed-revision-manifest-2.json"
+    manifest_2.write_text(json.dumps({
+        "schema_version": 1,
+        "candidate_id": candidate_2,
+        "artifact": {
+            "path": artifact_2.relative_to(project).as_posix(),
+            "sha256": file_sha256(artifact_2), "kind": "file",
+        },
+        "source_revision": "verify-completed-revision-generation-2",
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_2, "--manifest", str(manifest_2.relative_to(project)),
+        "--sha256", file_sha256(manifest_2), "--actor", "开发部/dev-thread",
+    ])
+    gate_action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=GATE_TASK_REOPEN_REQUIRED" in gate_action.stdout
+        and f"target_task={gate}" in gate_action.stdout
+        and "allowed=resume,next-action" in gate_action.stdout,
+        "a next-generation owner did not route an acknowledged gate back to its original TASK",
+    )
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", gate,
+        "--actor", "测试部/test-thread",
+    ])
+    owner_payload = json.loads((collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8"))
+    gate_payload = json.loads((collab / "tasks" / f"{gate}.json").read_text(encoding="utf-8"))
+    check(
+        owner_payload["execution_state"] == "claimed"
+        and gate_payload["execution_state"] == "claimed"
+        and owner_payload["completion_history"][-1]["candidate_id"] == candidate_1
+        and gate_payload["completion_history"][-1]["report"] == str(report.relative_to(project))
+        and gate_payload["completion_history"][-1]["acknowledged_by"] == "统筹部/lead-thread"
+        and not owner_payload["artifacts"]
+        and not gate_payload["artifacts"],
+        "reopen did not preserve prior completion evidence before clearing the live delivery fields",
+    )
+    manifest_1_bytes = manifest_1.read_bytes()
+    manifest_1.write_bytes(manifest_1_bytes + b" ")
+    drifted_history = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "候选 manifest SHA-256 不匹配" in drifted_history.stderr
+        and "full_history_validated=true" not in drifted_history.stdout,
+        "doctor accepted a completion_history candidate manifest that drifted after reopen",
+    )
+    manifest_1.write_bytes(manifest_1_bytes)
+    run([sys.executable, str(task_tool), "doctor"])
+
+    report_2 = protocol_151_edge_report(
+        collab, gate, candidate_2, "测试部", "pass", "completed-revision-reopen-pass-2",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate_2, "--decision", "pass",
+        "--report", str(report_2.relative_to(project)),
+        "--evidence", "第二代当前候选测试通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_2, "--status", "verified",
+        "--evidence", "用户确认第二代", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", gate,
+        "--actor", "测试部/test-thread", "--artifact", str(report_2.relative_to(project)),
+        "--report", str(report_2.relative_to(project)), "--verified", "第二代 gate 已固定",
+        "--unverified", "无", "--mistake-check", "未把第二代 PASS 冒充发布",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest_2.relative_to(project)),
+        "--verified", "第二代候选已固定", "--unverified", "无",
+        "--mistake-check", "等待统筹最终核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", owner,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    closed = json.loads(
+        (collab / ".locks" / "slice-control.json").read_text(encoding="utf-8")
+    )
+    close_entry = closed["history"][-1]
+    check(
+        closed["active_slice"] is None
+        and close_entry["user_exit"]["candidate_id"] == candidate_2
+        and close_entry["revision_requests"][-1]["source_candidate_id"] == candidate_1
+        and close_entry["revision_requests"][-1]["status"] == "consumed"
+        and close_entry["revision_requests"][-1]["evidence"] == "用户在切片关闭前撤回验收并要求修订",
+        "slice close discarded the consumed user revision evidence from cold history",
+    )
+    forged = json.loads(
+        (collab / ".locks" / "slice-control.json").read_text(encoding="utf-8")
+    )
+    forged["history"][-1]["revision_requests"][-1]["consumed_by_candidate_id"] = (
+        "CAND-20260829-FORGED"
+    )
+    (collab / ".locks" / "slice-control.json").write_text(
+        json.dumps(forged, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    forged_doctor = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check("冷历史已消费用户修订记录无效" in forged_doctor.stderr,
+          "doctor accepted a forged consumed candidate identity in cold revision history")
+
+
+def verify_protocol_151_gate_error_recovery_and_blocked_routing(root: Path) -> None:
+    project, collab, task_tool, owner, candidate, gates, _ = protocol_151_edge_slice(
+        root, "protocol-151-gate-error-recovery", ("test",),
+    )
+    gate = gates["test"]
+    run([
+        sys.executable, str(task_tool), "block", "--task-id", gate,
+        "--reason", "gate 等待独立证据", "--actor", "测试部/test-thread",
+    ])
+    owner_action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=GATE_TASK_RESUME_REQUIRED" in owner_action.stdout
+        and f"target_task={gate}" in owner_action.stdout
+        and "allowed=resume,next-action" in owner_action.stdout,
+        "owner next-action targeted itself or verdict while its only pending gate was blocked",
+    )
+    report = protocol_151_edge_report(
+        collab, gate, candidate, "测试部", "pass", "blocked-gate-invalid-verdict",
+    )
+    denied = run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate, "--decision", "pass",
+        "--report", str(report.relative_to(project)),
+        "--evidence", "blocked gate 不得 verdict", "--actor", "测试部/test-thread",
+    ], ok=False)
+    marker = collab / ".locks" / "gate-verdict-transaction.json"
+    after = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "claimed gate" in denied.stderr
+        and not marker.exists()
+        and "HOT_STATE_BUSY" not in after.stdout,
+        "an invalid gate verdict left a persistent transaction marker or blocked next-action",
+    )
+
+
+def verify_protocol_151_cross_slice_candidate_lineage(root: Path) -> None:
+    project, collab, task_tool, owner_a, candidate_a1, gates, _ = protocol_151_edge_slice(
+        root, "protocol-151-cross-slice-lineage", ("test",),
+    )
+    gate = gates["test"]
+    report_a1 = protocol_151_edge_report(
+        collab, gate, candidate_a1, "测试部", "pass", "lineage-a1-pass",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate_a1, "--decision", "pass",
+        "--report", str(report_a1.relative_to(project)),
+        "--evidence", "切片 A 第一代通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner_a,
+        "--candidate-id", candidate_a1, "--status", "needs_revision",
+        "--evidence", "切片 A 要求第二代", "--actor", "统筹部/lead-thread",
+    ])
+    candidate_a2 = "CAND-20260829-XLN002"
+    artifact_a2 = project / "docs" / "lineage-a2.txt"
+    artifact_a2.write_text("lineage A generation 2\n", encoding="utf-8")
+    manifest_a2 = project / "docs" / "lineage-a2-manifest.json"
+    manifest_a2.write_text(json.dumps({
+        "schema_version": 1, "candidate_id": candidate_a2,
+        "artifact": {
+            "path": artifact_a2.relative_to(project).as_posix(),
+            "sha256": file_sha256(artifact_a2), "kind": "file",
+        },
+        "source_revision": "verify-lineage-a2",
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner_a,
+        "--candidate-id", candidate_a2, "--manifest", str(manifest_a2.relative_to(project)),
+        "--sha256", file_sha256(manifest_a2), "--actor", "开发部/dev-thread",
+    ])
+    report_a2 = protocol_151_edge_report(
+        collab, gate, candidate_a2, "测试部", "pass", "lineage-a2-pass",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate_a2, "--decision", "pass",
+        "--report", str(report_a2.relative_to(project)),
+        "--evidence", "切片 A 第二代通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner_a,
+        "--candidate-id", candidate_a2, "--status", "verified",
+        "--evidence", "切片 A 第二代确认", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", gate,
+        "--actor", "测试部/test-thread", "--artifact", str(report_a2.relative_to(project)),
+        "--report", str(report_a2.relative_to(project)), "--verified", "A2 gate 已固定",
+        "--unverified", "无", "--mistake-check", "等待核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner_a,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest_a2.relative_to(project)),
+        "--verified", "A2 owner 已固定", "--unverified", "无", "--mistake-check", "等待核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", owner_a,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+
+    owner_b = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+        "--department", "开发部", "--from-department", "统筹部",
+        "--title", "cross-slice lineage B", "--node", "2.1.1 cold lineage",
+        "--details", "创建第二切片合法候选，验证不得串入第一切片",
+        "--acceptance-exit", "跨切片候选替换被 doctor 拒绝",
+        "--failure-path", "候选谱系可跨切片替换", "--authorization-state", "none",
+        "--task-kind", "owner",
+    ]))
+    run([
+        sys.executable, str(task_tool), "claim", "--task-id", owner_b,
+        "--claimed-by", "开发部/dev-thread",
+    ])
+    candidate_b = "CAND-20260829-XLN003"
+    artifact_b = project / "docs" / "lineage-b.txt"
+    artifact_b.write_text("lineage B\n", encoding="utf-8")
+    manifest_b = project / "docs" / "lineage-b-manifest.json"
+    manifest_b.write_text(json.dumps({
+        "schema_version": 1, "candidate_id": candidate_b,
+        "artifact": {
+            "path": artifact_b.relative_to(project).as_posix(),
+            "sha256": file_sha256(artifact_b), "kind": "file",
+        },
+        "source_revision": "verify-lineage-b",
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner_b,
+        "--candidate-id", candidate_b, "--manifest", str(manifest_b.relative_to(project)),
+        "--sha256", file_sha256(manifest_b), "--actor", "开发部/dev-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner_b,
+        "--candidate-id", candidate_b, "--status", "not_applicable",
+        "--evidence", "第二切片为纯协议验证", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner_b,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest_b.relative_to(project)),
+        "--verified", "B owner 已固定", "--unverified", "无", "--mistake-check", "等待核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", owner_b,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    control_path = collab / ".locks" / "slice-control.json"
+    clean_control = json.loads(control_path.read_text(encoding="utf-8"))
+    check(
+        clean_control["history"][-2]["candidate_lineage"] == [
+            {"candidate_id": candidate_a1, "generation": 1},
+            {"candidate_id": candidate_a2, "generation": 2},
+        ]
+        and clean_control["history"][-1]["candidate_lineage"] == [
+            {"candidate_id": candidate_b, "generation": 1},
+        ],
+        "slice close did not persist its own ordered candidate lineage",
+    )
+    for field in ("source", "consumed"):
+        forged = json.loads(json.dumps(clean_control, ensure_ascii=False))
+        request = forged["history"][-2]["revision_requests"][0]
+        if field == "source":
+            request["source_candidate_id"] = candidate_b
+            request["superseded_user_exit"]["candidate_id"] = candidate_b
+        else:
+            request["consumed_by_candidate_id"] = candidate_b
+        control_path.write_text(
+            json.dumps(forged, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        denied = run([sys.executable, str(task_tool), "doctor"], ok=False)
+        check(
+            denied.stderr.startswith("TASK_ERROR") and "full_history_validated=true" not in denied.stdout,
+            f"doctor accepted a {field} candidate borrowed from another closed slice",
+        )
+    control_path.write_text(
+        json.dumps(clean_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    run([sys.executable, str(task_tool), "doctor"])
+
+
+def verify_protocol_151_candidate_binding_provenance(root: Path) -> None:
+    project, collab, task_tool, owner, _, _, _ = protocol_151_edge_slice(
+        root, "protocol-151-candidate-binding-provenance", (),
+    )
+    control_path = collab / ".locks" / "slice-control.json"
+    clean_control = json.loads(control_path.read_text(encoding="utf-8"))
+    missing_actor_control = json.loads(json.dumps(clean_control, ensure_ascii=False))
+    missing_actor_control["active_slice"]["candidate"]["bound_by"] = ""
+    control_path.write_text(
+        json.dumps(missing_actor_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    missing_actor = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "活动候选绑定 actor 无效" in missing_actor.stderr,
+        "doctor accepted an active candidate without a binding actor",
+    )
+    invalid_time_control = json.loads(json.dumps(clean_control, ensure_ascii=False))
+    invalid_time_control["active_slice"]["candidate"]["bound_at"] = "not-a-time"
+    control_path.write_text(
+        json.dumps(invalid_time_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    invalid_time = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "活动候选绑定时间无效" in invalid_time.stderr,
+        "doctor accepted an active candidate with an invalid binding timestamp",
+    )
+    forged_actor_control = json.loads(json.dumps(clean_control, ensure_ascii=False))
+    forged_actor_control["active_slice"]["candidate"]["bound_by"] = "开发部/forged-thread"
+    control_path.write_text(
+        json.dumps(forged_actor_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    forged_actor = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "活动候选绑定 actor 不在 owner 身份历史中" in forged_actor.stderr,
+        "doctor accepted a binding actor absent from the owner identity history",
+    )
+    predated_binding_control = json.loads(json.dumps(clean_control, ensure_ascii=False))
+    predated_binding_control["active_slice"]["candidate"]["bound_at"] = "2000-01-01T00:00:00+00:00"
+    control_path.write_text(
+        json.dumps(predated_binding_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    predated_binding = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "活动候选绑定时间早于 actor 身份生效" in predated_binding.stderr,
+        "doctor accepted a candidate binding that predates its owner identity",
+    )
+    control_path.write_text(
+        json.dumps(clean_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    protocol_151_switch_session(collab, "开发部", "dev-thread", "dev-thread-v2")
+    owner_payload = json.loads(
+        (collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8")
+    )
+    run([
+        sys.executable, str(task_tool), "rebind-owner", "--task-id", owner,
+        "--expected-revision", str(owner_payload["revision"]),
+        "--actor", "开发部/dev-thread-v2", "--previous-actor", "开发部/dev-thread",
+        "--evidence", "candidate provenance shift regression",
+    ])
+    shifted = run([sys.executable, str(task_tool), "doctor"])
+    check(
+        shifted.stdout.startswith("TASK_DOCTOR_OK"),
+        "doctor rejected a valid candidate because the owner later changed shifts",
+    )
+    shifted_control = json.loads(control_path.read_text(encoding="utf-8"))
+    shifted_owner = json.loads(
+        (collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8")
+    )
+    rebound_at = dt.datetime.fromisoformat(shifted_owner["ownership_history"][-1]["at"])
+    shifted_control["active_slice"]["candidate"]["bound_at"] = (
+        rebound_at + dt.timedelta(minutes=1)
+    ).isoformat(timespec="minutes")
+    control_path.write_text(
+        json.dumps(shifted_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    stale_actor_binding = run([
+        sys.executable, str(task_tool), "doctor",
+    ], ok=False)
+    check(
+        "活动候选绑定时间不在 actor 负责区间" in stale_actor_binding.stderr,
+        "doctor accepted an old owner as the binding actor after a later rebind",
+    )
+
+
+def verify_protocol_151_acknowledged_owner_revision_reopen(root: Path) -> None:
+    project, collab, task_tool, owner, candidate, gates, manifest = protocol_151_edge_slice(
+        root, "protocol-151-acknowledged-owner-revision", ("test",),
+    )
+    gate = gates["test"]
+    report = protocol_151_edge_report(
+        collab, gate, candidate, "测试部", "pass", "acknowledged-owner-revision-pass",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate, "--decision", "pass",
+        "--report", str(report.relative_to(project)),
+        "--evidence", "当前候选测试通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate, "--status", "verified",
+        "--evidence", "用户先确认当前代", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", gate,
+        "--actor", "测试部/test-thread", "--artifact", str(report.relative_to(project)),
+        "--report", str(report.relative_to(project)), "--verified", "gate 已固定",
+        "--unverified", "无", "--mistake-check", "等待统筹核收",
+    ])
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest.relative_to(project)),
+        "--verified", "owner 已固定", "--unverified", "无",
+        "--mistake-check", "等待统筹核收",
+    ])
+    gate_path = collab / "tasks" / f"{gate}.json"
+    legacy_gate = json.loads(gate_path.read_text(encoding="utf-8"))
+    legacy_gate["execution_state"] = "completed"
+    legacy_gate.pop("acknowledged_by", None)
+    legacy_gate["revision"] += 1
+    gate_path.write_text(
+        json.dumps(legacy_gate, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    owner_path = collab / "tasks" / f"{owner}.json"
+    acknowledged_owner = json.loads(owner_path.read_text(encoding="utf-8"))
+    acknowledged_owner["execution_state"] = "acknowledged"
+    acknowledged_owner["acknowledged_by"] = "统筹部/lead-thread"
+    acknowledged_owner["revision"] += 1
+    owner_path.write_text(
+        json.dumps(acknowledged_owner, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    run([
+        sys.executable, str(task_tool), "rebuild-index", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate, "--status", "needs_revision",
+        "--evidence", "owner 已核收但 gate 未核收时用户要求返工",
+        "--actor", "统筹部/lead-thread",
+    ])
+    action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "state=acknowledged" in action.stdout
+        and "first_blocker=OWNER_REOPEN_REQUIRED" in action.stdout
+        and f"target_task={owner}" in action.stdout
+        and "allowed=resume,next-action" in action.stdout,
+        "an acknowledged owner with an active user revision was hidden behind TASK_TERMINAL",
+    )
+    denied_gate_ack = run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ], ok=False)
+    check("用户修订" in denied_gate_ack.stderr,
+          "gate acknowledgement closed a slice after an acknowledged owner received a revision")
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ])
+    reopened = json.loads((collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8"))
+    check(
+        reopened["execution_state"] == "claimed"
+        and reopened["completion_history"][-1]["from_state"] == "acknowledged"
+        and reopened["completion_history"][-1]["acknowledged_by"] == "统筹部/lead-thread"
+        and reopened["completion_history"][-1]["candidate_id"] == candidate,
+        "acknowledged owner reopen did not preserve the prior acceptance evidence",
+    )
+
+
+def verify_protocol_151_gate_ack_order(root: Path) -> None:
+    project, collab, task_tool, owner, candidate, gates, manifest = protocol_151_edge_slice(
+        root, "protocol-151-gate-ack-order", ("test",),
+    )
+    gate = gates["test"]
+    report = protocol_151_edge_report(
+        collab, gate, candidate, "测试部", "pass", "gate-ack-order-pass",
+    )
+    run([
+        sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+        "--candidate-id", candidate, "--decision", "pass",
+        "--report", str(report.relative_to(project)),
+        "--evidence", "当前候选测试通过", "--actor", "测试部/test-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate, "--status", "not_applicable",
+        "--evidence", "纯协议探针无需真实用户出口", "--actor", "统筹部/lead-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", gate,
+        "--actor", "测试部/test-thread", "--artifact", str(report.relative_to(project)),
+        "--report", str(report.relative_to(project)), "--verified", "gate 已固定",
+        "--unverified", "无", "--mistake-check", "等待统筹核收",
+    ])
+    action = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=GATE_TASK_ACK_REQUIRED" in action.stdout
+        and f"target_task={gate}" in action.stdout
+        and "allowed=ack,next-action" in action.stdout,
+        "owner next-action did not route a completed gate to acknowledgement",
+    )
+    premature_complete = run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest.relative_to(project)),
+        "--verified", "owner 已固定", "--unverified", "无",
+        "--mistake-check", "不得跳过 gate 核收",
+    ], ok=False)
+    check("尚未核收" in premature_complete.stderr,
+          "owner completed before all required gate tasks were acknowledged")
+    run([
+        sys.executable, str(task_tool), "ack", "--task-id", gate,
+        "--acknowledged-by", "统筹部/lead-thread",
+    ])
+    ready = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check("first_blocker=NONE" in ready.stdout and "allowed=complete,next-action" in ready.stdout,
+          "owner was not released after every required gate was acknowledged")
+    run([
+        sys.executable, str(task_tool), "complete", "--task-id", owner,
+        "--actor", "开发部/dev-thread", "--artifact", str(manifest.relative_to(project)),
+        "--verified", "owner 已固定", "--unverified", "无",
+        "--mistake-check", "gate 已先核收",
+    ])
+
+
+def verify_protocol_151_user_revision(root: Path) -> None:
+    def tree_snapshot(path: Path) -> dict[str, str]:
+        return {
+            item.relative_to(path).as_posix(): file_sha256(item)
+            for item in sorted(path.rglob("*"))
+            if item.is_file() and not item.is_symlink()
+        }
+
+    def task_args(
+        task_tool: Path, department: str, title: str, *, kind: str = "owner",
+        slice_id: str = "", gate_type: str = "", required_gates: tuple[str, ...] = (),
+    ) -> list[str]:
+        args = [
+            sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+            "--department", department, "--from-department", "统筹部",
+            "--title", title, "--node", "2.1.1 用户修订",
+            "--details", "验证 PASS 后用户要求同切片修订的机械入口",
+            "--acceptance-exit", "用户修订和新一代审核可复验",
+            "--failure-path", "修订证据或候选身份错误时拒绝",
+            "--authorization-state", "none", "--task-kind", kind,
+        ]
+        if slice_id:
+            args += ["--slice-id", slice_id]
+        if gate_type:
+            args += ["--gate-type", gate_type]
+        for gate in required_gates:
+            args += ["--required-gate", gate]
+        return args
+
+    def write_candidate(project: Path, candidate_id: str, label: str) -> tuple[Path, str]:
+        artifact = project / "docs" / f"{label}.txt"
+        artifact.write_text(f"candidate {candidate_id}\n", encoding="utf-8")
+        manifest = project / "docs" / f"{label}-manifest.json"
+        manifest.write_text(json.dumps({
+            "schema_version": 1,
+            "candidate_id": candidate_id,
+            "artifact": {
+                "path": artifact.relative_to(project).as_posix(),
+                "sha256": file_sha256(artifact),
+                "kind": "file",
+            },
+            "source_revision": f"verify-{label}",
+        }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        return manifest, file_sha256(manifest)
+
+    def write_gate_report(
+        collab: Path, department: str, task_id: str, candidate_id: str, label: str,
+    ) -> Path:
+        report = collab / "部门" / department / "报告" / f"{label}.md"
+        report.write_text(f"""---
+type: audit_report
+department: {department}
+target: Agent Team 2.1.1 candidate
+status: final
+date: {dt.date.today().isoformat()}
+related_task: {task_id}
+decision: pass
+candidate_id: {candidate_id}
+tags: [protocol-1.5.1]
+summary: 当前代候选已完成独立审核
+---
+
+# 独立审核
+
+当前代候选身份和验收出口通过。
+""", encoding="utf-8")
+        return report
+
+    project = make_project(root, "protocol-151-user-revision")
+    scaffold(project, "lead,dev,test,security")
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    for department, thread_id in (
+        ("统筹部", "lead-thread"), ("开发部", "dev-thread"),
+        ("测试部", "test-thread"), ("安全部", "security-thread"),
+    ):
+        ensure_department_registered(task_tool, department, thread_id)
+    run([sys.executable, str(task_tool), "rebuild-index"])
+
+    owner = task_id_from(run(task_args(
+        task_tool, "开发部", "PASS 后用户修订 owner", required_gates=("test", "security"),
+    )))
+    run([
+        sys.executable, str(task_tool), "claim", "--task-id", owner,
+        "--claimed-by", "开发部/dev-thread",
+    ])
+    slice_control_path = collab / ".locks" / "slice-control.json"
+    slice_id = json.loads(slice_control_path.read_text(encoding="utf-8"))["active_slice"]["slice_id"]
+    candidate_1 = "CAND-20260828-R10001"
+    manifest_1, manifest_sha_1 = write_candidate(project, candidate_1, "revision-candidate-1")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_1, "--manifest", str(manifest_1.relative_to(project)),
+        "--sha256", manifest_sha_1, "--actor", "开发部/dev-thread",
+    ])
+    gates = {}
+    for department, thread_id, gate_type in (
+        ("测试部", "test-thread", "test"), ("安全部", "security-thread", "security"),
+    ):
+        gate = task_id_from(run(task_args(
+            task_tool, department, f"{gate_type} gate", kind="gate",
+            slice_id=slice_id, gate_type=gate_type,
+        )))
+        gates[gate_type] = gate
+        run([
+            sys.executable, str(task_tool), "claim", "--task-id", gate,
+            "--claimed-by", f"{department}/{thread_id}",
+        ])
+        report = write_gate_report(collab, department, gate, candidate_1, f"{gate_type}-pass-1")
+        run([
+            sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+            "--candidate-id", candidate_1, "--decision", "pass",
+            "--report", str(report.relative_to(project)), "--evidence", f"{gate_type} pass generation 1",
+            "--actor", f"{department}/{thread_id}",
+        ])
+
+    candidate_2 = "CAND-20260828-R10002"
+    manifest_2, manifest_sha_2 = write_candidate(project, candidate_2, "revision-candidate-2")
+    denied_without_revision = run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_2, "--manifest", str(manifest_2.relative_to(project)),
+        "--sha256", manifest_sha_2, "--actor", "开发部/dev-thread",
+    ], ok=False)
+    check("gate FAIL" in denied_without_revision.stderr,
+          "PASS+PASS bound a second generation without a user revision record")
+
+    run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "等待用户决定是否修订", "--actor", "开发部/dev-thread",
+    ])
+    normal_pending_snapshot = tree_snapshot(collab)
+    normal_pending_1 = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    normal_pending_2 = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    normal_pending_allowed = re.search(r"allowed=([^|\n]+)", normal_pending_1.stdout)
+    check(
+        normal_pending_1.stdout == normal_pending_2.stdout
+        and tree_snapshot(collab) == normal_pending_snapshot
+        and "first_blocker=USER_EXIT_PENDING" in normal_pending_1.stdout
+        and normal_pending_allowed is not None
+        and normal_pending_allowed.group(1).strip() == "record-user-exit,next-action"
+        and "user_decision=yes" in normal_pending_1.stdout,
+        "normal blocked owner with PASS+PASS did not prioritize the user-exit fact without writes",
+    )
+    normal_pending_bundle = run([
+        sys.executable, str(task_tool), "onboard-bundle", "--department", "开发部",
+    ])
+    check(
+        "下一合法动作：`record-user-exit`" in normal_pending_bundle.stdout,
+        "normal blocked PASS+PASS onboarding suggested resume before record-user-exit",
+    )
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "冻结期间只保全用户修订事实",
+    ])
+    frozen_pending_snapshot = tree_snapshot(collab)
+    frozen_pending_1 = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    frozen_pending_2 = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        frozen_pending_1.stdout == frozen_pending_2.stdout
+        and tree_snapshot(collab) == frozen_pending_snapshot
+        and "first_blocker=P0_FREEZE_ACTIVE" in frozen_pending_1.stdout
+        and "allowed=record-user-exit" in frozen_pending_1.stdout
+        and "forbidden=resume,bind-candidate,claim,enqueue" in frozen_pending_1.stdout
+        and "user_decision=yes" in frozen_pending_1.stdout,
+        "frozen blocked owner with PASS+PASS did not prioritize the user-exit fact without writes",
+    )
+    frozen_pending_bundle = run([
+        sys.executable, str(task_tool), "onboard-bundle", "--department", "开发部",
+    ])
+    check(
+        "下一合法动作：`record-user-exit`" in frozen_pending_bundle.stdout,
+        "frozen blocked PASS+PASS onboarding suggested an action before record-user-exit",
+    )
+    revision = run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_1, "--status", "needs_revision",
+        "--evidence", "用户要求补齐三个同范围缺口", "--actor", "统筹部/lead-thread",
+    ])
+    check(revision.stdout.startswith("USER_EXIT_RECORDED"),
+          "a registered lead could not record a candidate-bound user revision")
+    frozen_revision_snapshot = tree_snapshot(collab)
+    frozen_revision_noop = run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_1, "--status", "needs_revision",
+        "--evidence", "用户要求补齐三个同范围缺口", "--actor", "统筹部/lead-thread",
+    ])
+    check(
+        frozen_revision_noop.stdout.startswith("USER_EXIT_NOOP")
+        and tree_snapshot(collab) == frozen_revision_snapshot,
+        "frozen evidence recording was not idempotent",
+    )
+    revision_control = json.loads(slice_control_path.read_text(encoding="utf-8"))
+    dispatch_after_revision = json.loads(
+        (collab / ".locks" / "dispatch-control.json").read_text(encoding="utf-8")
+    )
+    check(
+        all(
+            attempt["decision"] == "pass"
+            for gate_task_id in revision_control["active_slice"]["gate_tasks"].values()
+            for attempt in json.loads(
+                (collab / "tasks" / f"{gate_task_id}.json").read_text(encoding="utf-8")
+            )["gate_attempts"]
+        )
+        and all("AUTO_GATE_FAIL_X2" not in event["evidence"] for event in dispatch_after_revision["history"]),
+        "needs_revision was misclassified as a gate FAIL or continuous-failure freeze",
+    )
+    after_revision = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "allowed=unfreeze-new-work,next-action" in after_revision.stdout
+        and "forbidden=resume,bind-candidate,claim,enqueue" in after_revision.stdout
+        and "user_decision=yes" in after_revision.stdout,
+        "frozen needs_revision did not require unfreeze before candidate binding",
+    )
+    frozen_bind = run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_2, "--manifest", str(manifest_2.relative_to(project)),
+        "--sha256", manifest_sha_2, "--actor", "开发部/dev-thread",
+    ], ok=False)
+    frozen_resume = run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ], ok=False)
+    check(
+        "P0_FREEZE_ACTIVE" in frozen_bind.stderr and "P0_FREEZE_ACTIVE" in frozen_resume.stderr,
+        "frozen mode allowed candidate binding or resume after a valid user revision",
+    )
+    run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "测试夹具允许消费用户修订",
+    ])
+    normal_revision_blocked = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=TASK_BLOCKED" in normal_revision_blocked.stdout
+        and "allowed=resume,next-action" in normal_revision_blocked.stdout
+        and "bind-candidate" not in re.search(
+            r"allowed=([^|\n]+)", normal_revision_blocked.stdout,
+        ).group(1).split(","),
+        "normal blocked needs_revision skipped resume or allowed candidate binding too early",
+    )
+    blocked_revision_bind = run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_2, "--manifest", str(manifest_2.relative_to(project)),
+        "--sha256", manifest_sha_2, "--actor", "开发部/dev-thread",
+    ], ok=False)
+    check("只允许 claimed owner" in blocked_revision_bind.stderr,
+          "an unfreezed but blocked owner bound the user-revision candidate")
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ])
+    normal_revision_claimed = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=USER_REVISION_READY" in normal_revision_claimed.stdout
+        and "allowed=bind-candidate" in normal_revision_claimed.stdout,
+        "normal claimed needs_revision did not allow the next candidate after resume",
+    )
+    reused_id = run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_1, "--manifest", str(manifest_2.relative_to(project)),
+        "--sha256", manifest_sha_2, "--actor", "开发部/dev-thread",
+    ], ok=False)
+    reused_manifest = run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_2, "--manifest", str(manifest_1.relative_to(project)),
+        "--sha256", manifest_sha_1, "--actor", "开发部/dev-thread",
+    ], ok=False)
+    old_artifact_bytes = (project / "docs" / "revision-candidate-1.txt").read_bytes()
+    (project / "docs" / "revision-candidate-1.txt").write_bytes(old_artifact_bytes + b"tampered\n")
+    tampered_old = run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_2, "--manifest", str(manifest_2.relative_to(project)),
+        "--sha256", manifest_sha_2, "--actor", "开发部/dev-thread",
+    ], ok=False)
+    (project / "docs" / "revision-candidate-1.txt").write_bytes(old_artifact_bytes)
+    check(
+        "新的 candidate-id" in reused_id.stderr
+        and "candidate_id" in reused_manifest.stderr
+        and "artifact SHA-256" in tampered_old.stderr,
+        "old candidate identity, manifest path, or modified artifact was accepted for a new generation",
+    )
+    bound = run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_2, "--manifest", str(manifest_2.relative_to(project)),
+        "--sha256", manifest_sha_2, "--actor", "开发部/dev-thread",
+    ])
+    control = json.loads(slice_control_path.read_text(encoding="utf-8"))
+    active = control["active_slice"]
+    check(
+        bound.stdout.startswith("CANDIDATE_BOUND")
+        and active["candidate"]["candidate_id"] == candidate_2
+        and active["candidate"]["generation"] == 2
+        and active["user_exit"]["status"] == "pending",
+        "a valid PASS+PASS user revision did not bind generation 2 and reset its user exit",
+    )
+
+    before_next_action = tree_snapshot(collab)
+    next_action_1 = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    next_action_2 = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        next_action_1.stdout == next_action_2.stdout
+        and tree_snapshot(collab) == before_next_action,
+        "next-action was not a deterministic zero-write query",
+    )
+    check(
+        "first_blocker=GATES_PENDING" in next_action_1.stdout
+        and "allowed=gate-verdict,wait,block,next-action" in next_action_1.stdout,
+        "next-action did not expose the first generation-2 gate blocker",
+    )
+
+    run([
+        sys.executable, str(task_tool), "wait", "--task-id", owner,
+        "--reason", "等待第二代 gate 收尾", "--actor", "开发部/dev-thread",
+    ])
+    normal_waiting_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "state=waiting_input" in normal_waiting_gate.stdout
+        and "first_blocker=GATES_PENDING" in normal_waiting_gate.stdout
+        and "allowed=gate-verdict" in normal_waiting_gate.stdout
+        and "resume" not in re.search(r"allowed=([^|\n]+)", normal_waiting_gate.stdout).group(1).split(","),
+        "normal waiting_input owner hid a claimed pending gate behind resume",
+    )
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "验证冻结 waiting_input 仍能收尾已领取 gate",
+    ])
+    frozen_waiting_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "state=waiting_input" in frozen_waiting_gate.stdout
+        and "first_blocker=P0_FREEZE_ACTIVE" in frozen_waiting_gate.stdout
+        and "allowed=gate-verdict" in frozen_waiting_gate.stdout
+        and "resume" not in re.search(r"allowed=([^|\n]+)", frozen_waiting_gate.stdout).group(1).split(","),
+        "frozen waiting_input owner hid a claimed pending gate behind resume or unfreeze",
+    )
+    run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "测试夹具恢复 waiting_input gate",
+    ])
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ])
+
+    run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "冻结时等待第二代 gate", "--actor", "开发部/dev-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "block", "--task-id", gates["test"],
+        "--reason", "测试 gate 自身阻断", "--actor", "测试部/test-thread",
+    ])
+    normal_gate_snapshot = tree_snapshot(collab)
+    normal_owner_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    normal_blocked_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", gates["test"],
+    ])
+    normal_claimed_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", gates["security"],
+    ])
+    normal_blocked_gate_allowed = re.search(r"allowed=([^|\n]+)", normal_blocked_gate.stdout)
+    check(
+        "allowed=gate-verdict" in normal_owner_gate.stdout
+        and "allowed=gate-verdict" in normal_claimed_gate.stdout
+        and normal_blocked_gate_allowed is not None
+        and "gate-verdict" not in normal_blocked_gate_allowed.group(1).split(",")
+        and "allowed=resume,next-action" in normal_blocked_gate.stdout
+        and tree_snapshot(collab) == normal_gate_snapshot,
+        "normal gate routing hid a claimed gate or allowed a blocked gate to verdict",
+    )
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "验证冻结时仍能收尾已领取 gate",
+    ])
+    frozen_gate_snapshot = tree_snapshot(collab)
+    frozen_owner_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    frozen_blocked_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", gates["test"],
+    ])
+    frozen_claimed_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", gates["security"],
+    ])
+    blocked_gate_allowed = re.search(r"allowed=([^|\n]+)", frozen_blocked_gate.stdout)
+    check(
+        "allowed=gate-verdict" in frozen_owner_gate.stdout
+        and "allowed=gate-verdict" in frozen_claimed_gate.stdout
+        and blocked_gate_allowed is not None
+        and "gate-verdict" not in blocked_gate_allowed.group(1).split(",")
+        and "forbidden=resume,bind-candidate,claim,enqueue" in frozen_blocked_gate.stdout
+        and tree_snapshot(collab) == frozen_gate_snapshot,
+        "frozen gate routing hid a claimed gate or allowed a blocked gate to verdict",
+    )
+    run([
+        sys.executable, str(task_tool), "unfreeze-new-work", "--actor", "统筹部/lead-thread",
+        "--user-confirmation", "测试夹具恢复第二代 gate",
+    ])
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ])
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", gates["test"],
+        "--actor", "测试部/test-thread",
+    ])
+
+    handoff = collab / "部门" / "开发部" / "交接班文档.md"
+    handoff.write_text(
+        handoff.read_text(encoding="utf-8") + "\n旧的人工当前任务：继续 generation 1。\n",
+        encoding="utf-8",
+    )
+    bundle = run([
+        sys.executable, str(task_tool), "onboard-bundle", "--department", "开发部",
+    ])
+    check(
+        "旧的人工当前任务" not in bundle.stdout
+        and "候选：`CAND-20260828-R10002` · generation `2`" in bundle.stdout
+        and "下一合法动作：`gate-verdict`" in bundle.stdout,
+        "onboard-bundle leaked stale manual current-task prose or omitted current machine truth",
+    )
+
+    first_block = run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "等待用户补图", "--actor", "开发部/dev-thread",
+    ])
+    blocked_snapshot = tree_snapshot(collab)
+    repeated_block = run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "等待用户补图", "--actor", "开发部/dev-thread",
+    ])
+    check(
+        first_block.stdout.startswith("TASK_BLOCKED")
+        and repeated_block.stdout.startswith("TASK_STATE_NOOP")
+        and tree_snapshot(collab) == blocked_snapshot,
+        "an identical block retry mutated state instead of returning a safe NOOP",
+    )
+    conflicting_block = run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "另一条原因", "--actor", "开发部/dev-thread",
+    ], ok=False)
+    check("冲突" in conflicting_block.stderr, "a conflicting block retry was not rejected")
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ])
+    resumed_snapshot = tree_snapshot(collab)
+    repeated_resume = run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ])
+    check(
+        repeated_resume.stdout.startswith("TASK_STATE_NOOP")
+        and tree_snapshot(collab) == resumed_snapshot,
+        "an identical resume retry mutated state instead of returning a safe NOOP",
+    )
+    run([
+        sys.executable, str(task_tool), "wait", "--task-id", owner,
+        "--reason", "等待用户选择", "--actor", "开发部/dev-thread",
+    ])
+    waiting_snapshot = tree_snapshot(collab)
+    repeated_wait = run([
+        sys.executable, str(task_tool), "wait", "--task-id", owner,
+        "--reason", "等待用户选择", "--actor", "开发部/dev-thread",
+    ])
+    check(
+        repeated_wait.stdout.startswith("TASK_STATE_NOOP")
+        and tree_snapshot(collab) == waiting_snapshot,
+        "an identical wait retry mutated state instead of returning a safe NOOP",
+    )
+    conflicting_wait = run([
+        sys.executable, str(task_tool), "wait", "--task-id", owner,
+        "--reason", "等待另一选择", "--actor", "开发部/dev-thread",
+    ], ok=False)
+    check("冲突" in conflicting_wait.stderr, "a conflicting wait retry was not rejected")
+    run([
+        sys.executable, str(task_tool), "resume", "--task-id", owner,
+        "--actor", "开发部/dev-thread",
+    ])
+
+    preserved_generation_1 = {
+        path: path.read_bytes() for path in (
+            project / "docs" / "revision-candidate-1.txt",
+            manifest_1,
+            collab / "部门" / "测试部" / "报告" / "test-pass-1.md",
+            collab / "部门" / "安全部" / "报告" / "security-pass-1.md",
+        )
+    }
+
+    def owner_complete(*, ok: bool) -> subprocess.CompletedProcess[str]:
+        return run([
+            sys.executable, str(task_tool), "complete", "--task-id", owner,
+            "--actor", "开发部/dev-thread",
+            "--artifact", str(manifest_2.relative_to(project)),
+            "--verified", "候选身份固定", "--unverified", "无",
+            "--mistake-check", "已检查", "--report", "不适用",
+        ], ok=ok)
+
+    pending_denied = owner_complete(ok=False)
+    check("全部 gate" in pending_denied.stderr,
+          "generation 2 completed while both current-generation gates were pending")
+    generation_2_reports: dict[str, Path] = {}
+    for index, (department, thread_id, gate_type) in enumerate((
+        ("测试部", "test-thread", "test"), ("安全部", "security-thread", "security"),
+    )):
+        gate = gates[gate_type]
+        report = write_gate_report(collab, department, gate, candidate_2, f"{gate_type}-pass-2")
+        generation_2_reports[gate_type] = report
+        run([
+            sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+            "--candidate-id", candidate_2, "--decision", "pass",
+            "--report", str(report.relative_to(project)),
+            "--evidence", f"{gate_type} pass generation 2",
+            "--actor", f"{department}/{thread_id}",
+        ])
+        if index == 0:
+            mixed_generation_denied = owner_complete(ok=False)
+            check("全部 gate" in mixed_generation_denied.stderr,
+                  "one generation-2 PASS combined with one generation-1 PASS completed the owner")
+
+    user_exit_pending_denied = owner_complete(ok=False)
+    check("用户最终出口" in user_exit_pending_denied.stderr,
+          "a user-experience slice completed while generation-2 user_exit was pending")
+    mismatch = run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_1, "--status", "verified",
+        "--evidence", "错误代次", "--actor", "统筹部/lead-thread",
+    ], ok=False)
+    check("候选身份不匹配" in mismatch.stderr,
+          "record-user-exit accepted evidence for an old candidate generation")
+    verified = run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_2, "--status", "verified",
+        "--evidence", "用户确认第二代体验通过", "--actor", "统筹部/lead-thread",
+    ])
+    verified_snapshot = tree_snapshot(collab)
+    verified_noop = run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_2, "--status", "verified",
+        "--evidence", "用户确认第二代体验通过", "--actor", "统筹部/lead-thread",
+    ])
+    check(
+        verified.stdout.startswith("USER_EXIT_RECORDED")
+        and verified_noop.stdout.startswith("USER_EXIT_NOOP")
+        and tree_snapshot(collab) == verified_snapshot,
+        "an identical user-exit retry mutated state instead of returning a safe NOOP",
+    )
+    conflicting_exit = run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_2, "--status", "verified",
+        "--evidence", "另一份体验证据", "--actor", "统筹部/lead-thread",
+    ], ok=False)
+    check("冲突" in conflicting_exit.stderr, "a conflicting user-exit retry was not rejected")
+    for department, thread_id, gate_type in (
+        ("测试部", "test-thread", "test"), ("安全部", "security-thread", "security"),
+    ):
+        gate = gates[gate_type]
+        report = generation_2_reports[gate_type]
+        run([
+            sys.executable, str(task_tool), "complete", "--task-id", gate,
+            "--actor", f"{department}/{thread_id}",
+            "--artifact", str(report.relative_to(project)),
+            "--verified", "第二代审核通过", "--unverified", "无",
+            "--mistake-check", "已检查", "--report", str(report.relative_to(project)),
+        ])
+        run([
+            sys.executable, str(task_tool), "ack", "--task-id", gate,
+            "--acknowledged-by", "统筹部/lead-thread",
+        ])
+    completed = owner_complete(ok=True)
+    check(completed.stdout.startswith("TASK_STATE_OK"),
+          "generation 2 did not complete after two fresh PASS verdicts and verified user exit")
+    check(
+        all(path.read_bytes() == data for path, data in preserved_generation_1.items()),
+        "binding or completing generation 2 rewrote generation-1 candidate or PASS evidence",
+    )
+
+
+def verify_protocol_151_active_migration(root: Path) -> None:
+    project = make_project(root, "protocol-151-active-migration")
+    scaffold(project, "lead,dev,test,security")
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    for department, thread_id in (
+        ("统筹部", "lead-thread"), ("开发部", "dev-thread"),
+        ("测试部", "test-thread"), ("安全部", "security-thread"),
+    ):
+        ensure_department_registered(task_tool, department, thread_id)
+    run([sys.executable, str(task_tool), "rebuild-index"])
+    owner = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+        "--department", "开发部", "--from-department", "统筹部",
+        "--title", "1.5.0 活动切片迁移", "--node", "协议升级",
+        "--details", "保全活动 owner、候选和 gate 报告",
+        "--acceptance-exit", "升级后活动切片可继续",
+        "--failure-path", "任何证据字节变化即失败", "--authorization-state", "none",
+        "--task-kind", "owner", "--required-gate", "test", "--required-gate", "security",
+    ]))
+    run([
+        sys.executable, str(task_tool), "claim", "--task-id", owner,
+        "--claimed-by", "开发部/dev-thread",
+    ])
+    slice_path = collab / ".locks" / "slice-control.json"
+    slice_id = json.loads(slice_path.read_text(encoding="utf-8"))["active_slice"]["slice_id"]
+    candidate_id = "CAND-20260828-M15100"
+    artifact = project / "docs" / "migration-candidate.txt"
+    artifact.write_text("migration candidate\n", encoding="utf-8")
+    manifest = project / "docs" / "migration-candidate-manifest.json"
+    manifest.write_text(json.dumps({
+        "schema_version": 1, "candidate_id": candidate_id,
+        "artifact": {"path": artifact.relative_to(project).as_posix(),
+                     "sha256": file_sha256(artifact), "kind": "file"},
+        "source_revision": "protocol-1.5.0-active-fixture",
+    }, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run([
+        sys.executable, str(task_tool), "bind-candidate", "--task-id", owner,
+        "--candidate-id", candidate_id, "--manifest", str(manifest.relative_to(project)),
+        "--sha256", file_sha256(manifest), "--actor", "开发部/dev-thread",
+    ])
+    gate_paths: list[Path] = []
+    task_paths = [collab / "tasks" / f"{owner}.json"]
+    for department, thread_id, gate_type in (
+        ("测试部", "test-thread", "test"), ("安全部", "security-thread", "security"),
+    ):
+        gate = task_id_from(run([
+            sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+            "--department", department, "--from-department", "统筹部",
+            "--title", f"migration {gate_type} gate", "--node", "协议升级",
+            "--details", "迁移前审核证据", "--acceptance-exit", "独立 PASS",
+            "--failure-path", "证据错误即拒绝", "--authorization-state", "none",
+            "--task-kind", "gate", "--slice-id", slice_id, "--gate-type", gate_type,
+        ]))
+        run([
+            sys.executable, str(task_tool), "claim", "--task-id", gate,
+            "--claimed-by", f"{department}/{thread_id}",
+        ])
+        report = collab / "部门" / department / "报告" / f"migration-{gate_type}-pass.md"
+        report.write_text(f"""---
+type: audit_report
+department: {department}
+target: protocol 1.5.0 active migration
+status: final
+date: {dt.date.today().isoformat()}
+related_task: {gate}
+decision: pass
+candidate_id: {candidate_id}
+tags: [migration]
+summary: 迁移前当前代独立审核通过
+---
+
+# 迁移前审核
+
+当前候选通过。
+""", encoding="utf-8")
+        run([
+            sys.executable, str(task_tool), "gate-verdict", "--task-id", gate,
+            "--candidate-id", candidate_id, "--decision", "pass",
+            "--report", str(report.relative_to(project)), "--evidence", f"{gate_type} pass",
+            "--actor", f"{department}/{thread_id}",
+        ])
+        task_paths.append(collab / "tasks" / f"{gate}.json")
+        gate_paths.append(report)
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "1.5.0 到 1.5.1 迁移冻结",
+    ])
+    for task_path in task_paths:
+        payload = json.loads(task_path.read_text(encoding="utf-8"))
+        payload.pop("state_action_receipt", None)
+        task_path.write_text(
+            json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+    preserved = {
+        path: path.read_bytes() for path in [artifact, manifest, *gate_paths, *task_paths]
+    }
+    protocol_path = collab / "协议版本.json"
+    session_path = collab / "会话启动状态.json"
+    for path in (protocol_path, session_path, collab / ".locks" / "legacy-closeout-index.json"):
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["protocol_version"] = IMMEDIATE_PREVIOUS_PROTOCOL_VERSION
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    slice_payload = json.loads(slice_path.read_text(encoding="utf-8"))
+    slice_payload["protocol_version"] = IMMEDIATE_PREVIOUS_PROTOCOL_VERSION
+    active = slice_payload["active_slice"]
+    active.pop("revision_requests")
+    active["user_exit"].pop("candidate_id")
+    active["user_exit"].pop("generation")
+    slice_path.write_text(json.dumps(slice_payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    guide = project / "docs" / "agent-guide.md"
+    guide.write_text(guide.read_text(encoding="utf-8").replace(
+        f"受管协议版本:{PROTOCOL_VERSION}", f"受管协议版本:{IMMEDIATE_PREVIOUS_PROTOCOL_VERSION}",
+    ), encoding="utf-8")
+
+    valid_150_slice = slice_path.read_bytes()
+    missing_bound_actor = json.loads(valid_150_slice.decode("utf-8"))
+    missing_bound_actor["active_slice"]["candidate"]["bound_by"] = ""
+    slice_path.write_text(
+        json.dumps(missing_bound_actor, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    invalid_binding_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.5.0 活动候选绑定 actor 无效" in invalid_binding_upgrade.stderr,
+        "1.5.0 migration accepted an active candidate without a binding actor",
+    )
+    slice_path.write_bytes(valid_150_slice)
+    invalid_bound_time = json.loads(valid_150_slice.decode("utf-8"))
+    invalid_bound_time["active_slice"]["candidate"]["bound_at"] = "not-a-time"
+    slice_path.write_text(
+        json.dumps(invalid_bound_time, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    invalid_time_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.5.0 活动候选绑定时间无效" in invalid_time_upgrade.stderr,
+        "1.5.0 migration accepted an invalid candidate binding timestamp",
+    )
+    slice_path.write_bytes(valid_150_slice)
+    forged_bound_actor = json.loads(valid_150_slice.decode("utf-8"))
+    forged_bound_actor["active_slice"]["candidate"]["bound_by"] = "开发部/forged-thread"
+    slice_path.write_text(
+        json.dumps(forged_bound_actor, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    forged_actor_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.5.0 活动候选绑定 actor 不在 owner 身份历史中" in forged_actor_upgrade.stderr,
+        "1.5.0 migration accepted a binding actor absent from owner history",
+    )
+    slice_path.write_bytes(valid_150_slice)
+    predated_bound_time = json.loads(valid_150_slice.decode("utf-8"))
+    predated_bound_time["active_slice"]["candidate"]["bound_at"] = "2000-01-01T00:00:00+00:00"
+    slice_path.write_text(
+        json.dumps(predated_bound_time, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    predated_time_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.5.0 活动候选绑定时间早于 actor 身份生效" in predated_time_upgrade.stderr,
+        "1.5.0 migration accepted a binding time before owner identity activation",
+    )
+    slice_path.write_bytes(valid_150_slice)
+    owner_path = collab / "tasks" / f"{owner}.json"
+    valid_150_owner = owner_path.read_bytes()
+    rebound_owner = json.loads(valid_150_owner.decode("utf-8"))
+    valid_150_control = json.loads(valid_150_slice.decode("utf-8"))
+    original_bound_at = dt.datetime.fromisoformat(
+        valid_150_control["active_slice"]["candidate"]["bound_at"]
+    )
+    rebound_at = original_bound_at + dt.timedelta(minutes=1)
+    rebound_owner["ownership_history"].append({
+        "at": rebound_at.isoformat(timespec="minutes"),
+        "action": "rebind",
+        "actor": "开发部/dev-thread-v2",
+        "previous_actor": "开发部/dev-thread",
+        "evidence": "migration candidate provenance interval probe",
+    })
+    rebound_owner["claimed_by"] = "开发部/dev-thread-v2"
+    rebound_owner["updated_at"] = rebound_at.isoformat(timespec="minutes")
+    rebound_owner["revision"] += 1
+    owner_path.write_text(
+        json.dumps(rebound_owner, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    valid_150_control["active_slice"]["candidate"]["bound_at"] = (
+        rebound_at + dt.timedelta(minutes=1)
+    ).isoformat(timespec="minutes")
+    slice_path.write_text(
+        json.dumps(valid_150_control, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    stale_actor_upgrade = run([
+        sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration",
+    ], ok=False)
+    check(
+        "1.5.0 活动候选绑定时间不在 actor 负责区间" in stale_actor_upgrade.stderr,
+        "1.5.0 migration accepted an old binding actor after a later rebind",
+    )
+    owner_path.write_bytes(valid_150_owner)
+    slice_path.write_bytes(valid_150_slice)
+
+    upgraded = run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    migrated = json.loads(slice_path.read_text(encoding="utf-8"))
+    check(
+        upgraded.stdout.startswith("UPGRADE_OK |")
+        and migrated["protocol_version"] == PROTOCOL_VERSION
+        and migrated["active_slice"]["slice_id"] == slice_id
+        and migrated["active_slice"]["candidate"]["candidate_id"] == candidate_id
+        and migrated["active_slice"]["revision_requests"] == []
+        and migrated["active_slice"]["user_exit"]["candidate_id"] == candidate_id
+        and all(path.read_bytes() == data for path, data in preserved.items()),
+        "1.5.0 active slice did not migrate in place without rewriting TASK/candidate/gate evidence",
+    )
+    first_manifest = sorted((collab / "升级备份").iterdir())[-1] / "rollback-manifest.json"
+    immediate = run([
+        sys.executable, str(SCAFFOLD), str(project), "--rollback-collaboration", str(first_manifest),
+    ])
+    check(
+        immediate.stdout.startswith("ROLLBACK_OK |")
+        and json.loads(protocol_path.read_text(encoding="utf-8"))["protocol_version"]
+        == IMMEDIATE_PREVIOUS_PROTOCOL_VERSION
+        and json.loads(slice_path.read_text(encoding="utf-8"))["active_slice"].get("revision_requests") is None,
+        "immediate 1.5.1 rollback did not restore the exact 1.5.0 active slice",
+    )
+    existing_backups = set((collab / "升级备份").iterdir())
+    run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    second_manifest = next(iter(set((collab / "升级备份").iterdir()) - existing_backups)) / "rollback-manifest.json"
+    run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "旧 1.5.0 TASK 首次新协议状态动作", "--actor", "开发部/dev-thread",
+    ])
+    migrated_owner = json.loads((collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8"))
+    repeated_block = run([
+        sys.executable, str(task_tool), "block", "--task-id", owner,
+        "--reason", "旧 1.5.0 TASK 首次新协议状态动作", "--actor", "开发部/dev-thread",
+    ])
+    check(
+        migrated_owner["state_action_receipt"]["action"] == "block"
+        and repeated_block.stdout.startswith("TASK_STATE_NOOP"),
+        "a migrated 1.5.0 TASK without a receipt did not safely acquire one on its first transition",
+    )
+    run([
+        sys.executable, str(task_tool), "record-user-exit", "--task-id", owner,
+        "--candidate-id", candidate_id, "--status", "needs_revision",
+        "--evidence", "用户要求迁移后修订", "--actor", "统筹部/lead-thread",
+    ])
+    denied = run([
+        sys.executable, str(SCAFFOLD), str(project), "--rollback-collaboration", str(second_manifest),
+    ], ok=False)
+    check(
+        "ROLLBACK_DENIED" in denied.stderr
+        and json.loads(protocol_path.read_text(encoding="utf-8"))["protocol_version"] == PROTOCOL_VERSION,
+        "rollback remained open after the first protocol-1.5.1 state mutation",
+    )
+
+
 def main() -> int:
     compile_script(SCAFFOLD)
     verify_repository_contract()
@@ -5740,6 +7995,20 @@ def main() -> int:
         verify_default_minimal_software_team(root)
         verify_foundation_contract(root)
         verify_protocol_150_core(root)
+        verify_protocol_151_zero_gate_next_action(root)
+        verify_protocol_151_fail_and_ack_priorities(root)
+        verify_protocol_151_authorization_priority(root)
+        verify_protocol_151_identity_priority(root)
+        verify_protocol_151_state_retry_actor_identity(root)
+        verify_protocol_151_user_exit_supersession(root)
+        verify_protocol_151_completed_revision_reopen(root)
+        verify_protocol_151_gate_error_recovery_and_blocked_routing(root)
+        verify_protocol_151_candidate_binding_provenance(root)
+        verify_protocol_151_cross_slice_candidate_lineage(root)
+        verify_protocol_151_acknowledged_owner_revision_reopen(root)
+        verify_protocol_151_gate_ack_order(root)
+        verify_protocol_151_user_revision(root)
+        verify_protocol_151_active_migration(root)
         verify_protocol_150_migration(root)
         verify_protocol_150_atomic_guards(root)
         verify_long_thread_actor_identity(root)

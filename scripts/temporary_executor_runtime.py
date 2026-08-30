@@ -24,7 +24,7 @@ else:
     import fcntl
 
 
-PROTOCOL_VERSION = "1.5.0"
+PROTOCOL_VERSION = "1.5.1"
 DISPATCH_CONTROL_NAME = "dispatch-control.json"
 TASK_RE = re.compile(r"^TASK-[0-9]{8}-[A-Z0-9]{6}$")
 SAFE_STATES = {"safe", "manual", "unsafe", "waiting_base"}
