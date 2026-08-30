@@ -123,6 +123,152 @@ def file_sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def verify_candidate_manifest(
+    repo: Path,
+    *,
+    require_reviewed: bool = False,
+    expected_commit: str | None = None,
+    expected_runtime_sha256: str | None = None,
+) -> dict:
+    manifest_path = repo / "candidate-manifest.json"
+    try:
+        candidate_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise VerifyError(f"candidate manifest cannot be read: {exc}") from exc
+    runtime_hashes = {
+        relative: hashlib.sha256((repo / relative).read_bytes()).hexdigest()
+        for relative in RUNTIME_FILES
+    }
+    runtime_set_sha256 = hashlib.sha256("".join(
+        f"{runtime_hashes[relative]}  {relative}\n" for relative in RUNTIME_FILES
+    ).encode("utf-8")).hexdigest()
+    expected_candidate_id = f"AT-{SOURCE_VERSION}-RC-{runtime_set_sha256[:12].upper()}"
+    current_head = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    candidate_status = candidate_manifest.get("status") if isinstance(candidate_manifest, dict) else None
+    base_commit = candidate_manifest.get("base_commit") if isinstance(candidate_manifest, dict) else None
+    base_is_commit = (
+        isinstance(base_commit, str)
+        and subprocess.run(
+            ["git", "cat-file", "-e", f"{base_commit}^{{commit}}"], cwd=repo,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    )
+    base_is_ancestor = (
+        base_is_commit
+        and subprocess.run(
+            ["git", "merge-base", "--is-ancestor", base_commit, current_head], cwd=repo,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        ).returncode == 0
+    )
+    reviewed_promotion_valid = False
+    if candidate_status == "reviewed-release-candidate" and base_is_ancestor and base_commit != current_head:
+        source_result = subprocess.run(
+            ["git", "show", f"{base_commit}:candidate-manifest.json"], cwd=repo,
+            text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        changed_result = subprocess.run(
+            ["git", "diff", "--name-only", base_commit, current_head], cwd=repo,
+            text=True, encoding="utf-8", stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+        )
+        try:
+            source_manifest = json.loads(source_result.stdout) if source_result.returncode == 0 else None
+        except json.JSONDecodeError:
+            source_manifest = None
+        source_base = source_manifest.get("base_commit") if isinstance(source_manifest, dict) else None
+        source_base_is_ancestor = (
+            isinstance(source_base, str)
+            and source_base != base_commit
+            and subprocess.run(
+                ["git", "merge-base", "--is-ancestor", source_base, base_commit], cwd=repo,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            ).returncode == 0
+        )
+        expected_promotion = dict(source_manifest) if isinstance(source_manifest, dict) else None
+        if expected_promotion is not None:
+            expected_promotion["status"] = "reviewed-release-candidate"
+            expected_promotion["base_commit"] = base_commit
+        reviewed_promotion_valid = (
+            source_base_is_ancestor
+            and source_manifest.get("status") == "source-candidate"
+            and changed_result.returncode == 0
+            and changed_result.stdout.splitlines() == ["candidate-manifest.json"]
+            and candidate_manifest == expected_promotion
+        )
+    status_binding_valid = (
+        candidate_status == "source-candidate" and base_is_ancestor
+    ) or (
+        candidate_status == "reviewed-release-candidate" and reviewed_promotion_valid
+    )
+    check(
+        isinstance(candidate_manifest, dict)
+        and set(candidate_manifest) == {
+            "schema_version", "candidate_id", "status", "generated_on", "base_commit",
+            "source_version", "protocol_version", "public_version_at_review", "runtime_files",
+            "runtime_set_sha256", "runtime_set_sha256_algorithm",
+        }
+        and candidate_manifest.get("schema_version") == 1
+        and candidate_manifest.get("candidate_id") == expected_candidate_id
+        and candidate_status in {"source-candidate", "reviewed-release-candidate"}
+        and status_binding_valid
+        and candidate_manifest.get("source_version") == SOURCE_VERSION
+        and candidate_manifest.get("protocol_version") == PROTOCOL_VERSION
+        and candidate_manifest.get("public_version_at_review") == PUBLIC_VERSION
+        and candidate_manifest.get("runtime_files") == runtime_hashes
+        and candidate_manifest.get("runtime_set_sha256") == runtime_set_sha256,
+        "candidate manifest is stale, ambiguous, or not bound to the five runtime files",
+    )
+    if require_reviewed:
+        check(
+            candidate_status == "reviewed-release-candidate",
+            "REVIEWED_RELEASE_CANDIDATE_REQUIRED | source candidate must be independently reviewed and promoted",
+        )
+    if expected_commit is not None:
+        check(expected_commit == current_head, "RELEASE_COMMIT_MISMATCH | reviewed commit is not checkout HEAD")
+    if expected_runtime_sha256 is not None:
+        check(
+            expected_runtime_sha256 == runtime_set_sha256,
+            "RELEASE_RUNTIME_MISMATCH | reviewed runtime digest does not match checkout",
+        )
+    return candidate_manifest
+
+
+def verify_independent_release_approval(
+    approvals_path: Path,
+    dispatcher: str,
+    environment: str,
+) -> str:
+    try:
+        approvals = json.loads(approvals_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise VerifyError(f"cannot read release approval history: {exc}") from exc
+    check(
+        isinstance(approvals, list)
+        and isinstance(dispatcher, str) and bool(dispatcher.strip()) and not any(char.isspace() for char in dispatcher)
+        and isinstance(environment, str) and bool(environment.strip()) and len(environment) <= 255,
+        "release approval history inputs are invalid",
+    )
+    reviewers = sorted({
+        approval["user"]["login"]
+        for approval in approvals
+        if isinstance(approval, dict)
+        and approval.get("state") == "approved"
+        and isinstance(approval.get("user"), dict)
+        and isinstance(approval["user"].get("login"), str)
+        and bool(approval["user"]["login"].strip())
+        and approval["user"]["login"].casefold() != dispatcher.casefold()
+        and isinstance(approval.get("environments"), list)
+        and any(
+            isinstance(item, dict) and item.get("name") == environment
+            for item in approval["environments"]
+        )
+    })
+    check(
+        bool(reviewers),
+        "INDEPENDENT_RELEASE_APPROVAL_REQUIRED | a different GitHub actor must approve the release environment",
+    )
+    return reviewers[0]
+
+
 def verify_latest_release_assets(
     latest_json_path: Path,
     zip_path: Path,
@@ -265,6 +411,152 @@ def verify_release_guard_branches(root: Path) -> None:
         raise VerifyError("Latest release guard accepted a self-consistent ZIP with wrong runtime content")
 
 
+def verify_release_candidate_promotion(root: Path) -> None:
+    repo = root / "release-candidate-promotion"
+    repo.mkdir()
+    run(["git", "init", "-q"], cwd=repo)
+    run(["git", "config", "user.name", "Agent Team CI"], cwd=repo)
+    run(["git", "config", "user.email", "ci@users.noreply.github.com"], cwd=repo)
+    for relative in RUNTIME_FILES:
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(f"fixture:{relative}\n", encoding="utf-8")
+    run(["git", "add", *RUNTIME_FILES], cwd=repo)
+    run(["git", "commit", "-q", "-m", "runtime candidate"], cwd=repo)
+    runtime_base = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+
+    runtime_hashes = {
+        relative: hashlib.sha256((repo / relative).read_bytes()).hexdigest()
+        for relative in RUNTIME_FILES
+    }
+    runtime_set_sha256 = hashlib.sha256("".join(
+        f"{runtime_hashes[relative]}  {relative}\n" for relative in RUNTIME_FILES
+    ).encode("utf-8")).hexdigest()
+    manifest_path = repo / "candidate-manifest.json"
+    manifest = {
+        "base_commit": runtime_base,
+        "candidate_id": f"AT-{SOURCE_VERSION}-RC-{runtime_set_sha256[:12].upper()}",
+        "generated_on": "2026-08-30",
+        "protocol_version": PROTOCOL_VERSION,
+        "public_version_at_review": PUBLIC_VERSION,
+        "runtime_files": runtime_hashes,
+        "runtime_set_sha256": runtime_set_sha256,
+        "runtime_set_sha256_algorithm": "sha256 of ordered `shasum -a 256` output for runtime_files",
+        "schema_version": 1,
+        "source_version": SOURCE_VERSION,
+        "status": "source-candidate",
+    }
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run(["git", "add", "candidate-manifest.json"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "bind source candidate"], cwd=repo)
+    source_commit = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    check(
+        verify_candidate_manifest(repo)["status"] == "source-candidate",
+        "normal verification rejected a valid source candidate",
+    )
+
+    verifier_copy = repo / "scripts" / "verify_agent_team.py"
+    shutil.copy2(Path(__file__).resolve(), verifier_copy)
+    source_release = run([
+        sys.executable, str(verifier_copy), "--check-release-candidate",
+        source_commit, runtime_set_sha256,
+    ], cwd=repo, ok=False)
+    check(
+        "REVIEWED_RELEASE_CANDIDATE_REQUIRED" in source_release.stderr,
+        "release checker accepted a source candidate before independent-review promotion",
+    )
+
+    manifest["status"] = "reviewed-release-candidate"
+    manifest["base_commit"] = source_commit
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run(["git", "add", "candidate-manifest.json"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "promote reviewed candidate"], cwd=repo)
+    promoted_commit = run(["git", "rev-parse", "HEAD"], cwd=repo).stdout.strip()
+    check(
+        verify_candidate_manifest(repo)["status"] == "reviewed-release-candidate",
+        "normal verification rejected a valid reviewed promotion commit",
+    )
+    promoted_release = run([
+        sys.executable, str(verifier_copy), "--check-release-candidate",
+        promoted_commit, runtime_set_sha256,
+    ], cwd=repo)
+    check(
+        promoted_release.stdout.startswith("RELEASE_CANDIDATE_OK |"),
+        "release checker rejected the exact reviewed promotion commit",
+    )
+
+    stale_commit = run([
+        sys.executable, str(verifier_copy), "--check-release-candidate",
+        source_commit, runtime_set_sha256,
+    ], cwd=repo, ok=False)
+    stale_runtime = run([
+        sys.executable, str(verifier_copy), "--check-release-candidate",
+        promoted_commit, "0" * 64,
+    ], cwd=repo, ok=False)
+    check(
+        "RELEASE_COMMIT_MISMATCH" in stale_commit.stderr
+        and "RELEASE_RUNTIME_MISMATCH" in stale_runtime.stderr,
+        "release checker accepted a stale reviewed commit or runtime digest",
+    )
+
+    run(["git", "switch", "-q", "-c", "forged-reviewed", runtime_base], cwd=repo)
+    manifest["status"] = "reviewed-release-candidate"
+    manifest["base_commit"] = runtime_base
+    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    run(["git", "add", "candidate-manifest.json"], cwd=repo)
+    run(["git", "commit", "-q", "-m", "forge reviewed status directly"], cwd=repo)
+    try:
+        verify_candidate_manifest(repo)
+    except VerifyError:
+        pass
+    else:
+        raise VerifyError("candidate verifier accepted a direct reviewed-status forgery without source promotion")
+
+
+def verify_independent_release_approval_guard(root: Path) -> None:
+    approvals_path = root / "release-approvals.json"
+    checker = Path(__file__).resolve()
+    environment = "agent-team-public-release"
+    dispatcher = "release-owner"
+
+    for payload in (
+        [],
+        [{
+            "state": "approved",
+            "environments": [{"name": environment}],
+            "user": {"login": dispatcher},
+        }],
+        [{
+            "state": "approved",
+            "environments": [{"name": "unrelated-environment"}],
+            "user": {"login": "independent-reviewer"},
+        }],
+    ):
+        approvals_path.write_text(json.dumps(payload), encoding="utf-8")
+        rejected = run([
+            sys.executable, str(checker), "--check-independent-release-approval",
+            str(approvals_path), dispatcher, environment,
+        ], ok=False)
+        check(
+            "INDEPENDENT_RELEASE_APPROVAL_REQUIRED" in rejected.stderr,
+            "release approval checker accepted a missing, self, or unrelated approval",
+        )
+
+    approvals_path.write_text(json.dumps([{
+        "state": "approved",
+        "environments": [{"name": environment}],
+        "user": {"login": "independent-reviewer"},
+    }]), encoding="utf-8")
+    accepted = run([
+        sys.executable, str(checker), "--check-independent-release-approval",
+        str(approvals_path), dispatcher, environment,
+    ])
+    check(
+        accepted.stdout.startswith("INDEPENDENT_RELEASE_APPROVAL_OK | reviewer:independent-reviewer"),
+        "release approval checker rejected an independent approval for the protected environment",
+    )
+
+
 class UniqueKeyLoader(yaml.SafeLoader):
     pass
 
@@ -351,7 +643,6 @@ def verify_repository_contract() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     readme_lower = readme.casefold()
     spec = (ROOT / "docs" / "spec.md").read_text(encoding="utf-8")
-    candidate_manifest = json.loads((ROOT / "candidate-manifest.json").read_text(encoding="utf-8"))
     token_ab = json.loads((ROOT / "tests" / "token-ab-20260826.json").read_text(encoding="utf-8"))
     temporary_reference = (ROOT / "references" / "temporary-executor.md").read_text(encoding="utf-8")
     semantic_review = (ROOT / "tests" / "semantic_review.md").read_text(encoding="utf-8")
@@ -385,51 +676,7 @@ def verify_repository_contract() -> None:
         and "等我确认后再创建团队" in readme,
         "README omitted the current product version or complete copyable installation prompts",
     )
-    runtime_hashes = {
-        relative: hashlib.sha256((ROOT / relative).read_bytes()).hexdigest()
-        for relative in RUNTIME_FILES
-    }
-    runtime_set_bytes = "".join(
-        f"{runtime_hashes[relative]}  {relative}\n" for relative in RUNTIME_FILES
-    ).encode("utf-8")
-    runtime_set_sha256 = hashlib.sha256(runtime_set_bytes).hexdigest()
-    expected_candidate_id = f"AT-{SOURCE_VERSION}-RC-{runtime_set_sha256[:12].upper()}"
-    candidate_status = candidate_manifest.get("status") if isinstance(candidate_manifest, dict) else None
-    base_commit = candidate_manifest.get("base_commit") if isinstance(candidate_manifest, dict) else None
-    current_head = run(["git", "rev-parse", "HEAD"], cwd=ROOT).stdout.strip()
-    base_is_commit = (
-        isinstance(base_commit, str)
-        and subprocess.run(
-            ["git", "cat-file", "-e", f"{base_commit}^{{commit}}"], cwd=ROOT,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ).returncode == 0
-    )
-    base_is_ancestor = (
-        base_is_commit
-        and subprocess.run(
-            ["git", "merge-base", "--is-ancestor", base_commit, current_head], cwd=ROOT,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-        ).returncode == 0
-    )
-    status_binding_valid = candidate_status == "source-candidate" and base_is_ancestor
-    check(
-        isinstance(candidate_manifest, dict)
-        and set(candidate_manifest) == {
-            "schema_version", "candidate_id", "status", "generated_on", "base_commit",
-            "source_version", "protocol_version", "public_version_at_review", "runtime_files",
-            "runtime_set_sha256", "runtime_set_sha256_algorithm",
-        }
-        and candidate_manifest.get("schema_version") == 1
-        and candidate_manifest.get("candidate_id") == expected_candidate_id
-        and candidate_status == "source-candidate"
-        and status_binding_valid
-        and candidate_manifest.get("source_version") == SOURCE_VERSION
-        and candidate_manifest.get("protocol_version") == PROTOCOL_VERSION
-        and candidate_manifest.get("public_version_at_review") == PUBLIC_VERSION
-        and candidate_manifest.get("runtime_files") == runtime_hashes
-        and candidate_manifest.get("runtime_set_sha256") == runtime_set_sha256,
-        "candidate manifest is stale, ambiguous, or not bound to the five runtime files",
-    )
+    verify_candidate_manifest(ROOT)
     legacy_tokens = token_ab.get("legacy", {}) if isinstance(token_ab, dict) else {}
     candidate_tokens = token_ab.get("candidate", {}) if isinstance(token_ab, dict) else {}
     token_fixture = token_ab.get("fixture", {}) if isinstance(token_ab, dict) else {}
@@ -735,15 +982,20 @@ def verify_repository_contract() -> None:
     check(
         "Publish explicitly authorized reviewed release" in workflow
         and "github.event_name == 'workflow_dispatch'" in workflow
-        and "github.ref == 'refs/heads/main'" not in workflow
+        and "github.ref == 'refs/heads/main'" in workflow
         and "needs: verify" in workflow
         and "environment: agent-team-public-release" in workflow
+        and "actions: read" in workflow
         and "contents: write" in workflow
         and "git archive --format=zip" in workflow
         and all(relative in workflow for relative in RUNTIME_FILES)
         and "reviewed-release-candidate" in workflow
         and "inputs.reviewed_commit" in workflow
         and "inputs.reviewed_runtime_sha256" in workflow
+        and "--check-release-candidate" in workflow
+        and "--check-independent-release-approval" in workflow
+        and "/actions/runs/${GITHUB_RUN_ID}/approvals" in workflow
+        and '"${GITHUB_ACTOR}"' in workflow
         and "inputs.confirm_publish" in workflow
         and "PUBLISH v${version}" in workflow
         and "agent-team-%s-pure.zip" in workflow
@@ -5850,7 +6102,8 @@ def verify_protocol_151_zero_gate_next_action(root: Path) -> None:
 
 
 def protocol_151_edge_slice(
-    root: Path, label: str, required_gates: tuple[str, ...],
+    root: Path, label: str, required_gates: tuple[str, ...], *,
+    provision_gates: bool = True, claim_gates: bool = True,
 ) -> tuple[Path, Path, Path, str, str, dict[str, str], Path]:
     project = make_project(root, label)
     scaffold(project, "lead,dev,test,security")
@@ -5902,7 +6155,7 @@ def protocol_151_edge_slice(
     ])
     departments = {"test": ("测试部", "test-thread"), "security": ("安全部", "security-thread")}
     gates: dict[str, str] = {}
-    for gate_type in required_gates:
+    for gate_type in required_gates if provision_gates else ():
         department, thread_id = departments[gate_type]
         gate = task_id_from(run([
             sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
@@ -5912,10 +6165,11 @@ def protocol_151_edge_slice(
             "--failure-path", "错误候选拒绝", "--authorization-state", "none",
             "--task-kind", "gate", "--slice-id", slice_id, "--gate-type", gate_type,
         ]))
-        run([
-            sys.executable, str(task_tool), "claim", "--task-id", gate,
-            "--claimed-by", f"{department}/{thread_id}",
-        ])
+        if claim_gates:
+            run([
+                sys.executable, str(task_tool), "claim", "--task-id", gate,
+                "--claimed-by", f"{department}/{thread_id}",
+            ])
         gates[gate_type] = gate
     return project, collab, task_tool, owner, candidate_id, gates, manifest
 
@@ -5943,6 +6197,56 @@ summary: 当前代候选独立审核结论
 当前代结论为 {decision}。
 """, encoding="utf-8")
     return report
+
+
+def verify_protocol_151_gate_admission_actions(root: Path) -> None:
+    project, collab, task_tool, owner, _, _, _ = protocol_151_edge_slice(
+        root, "protocol-151-gate-admission", ("test",), provision_gates=False,
+    )
+    missing_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=GATE_TASK_ENQUEUE_REQUIRED" in missing_gate.stdout
+        and f"target_task={owner}" in missing_gate.stdout
+        and "allowed=enqueue,next-action" in missing_gate.stdout
+        and "forbidden=gate-verdict" in missing_gate.stdout,
+        "next-action did not require gate enqueue before offering a verdict",
+    )
+    slice_id = json.loads(
+        (collab / ".locks" / "slice-control.json").read_text(encoding="utf-8")
+    )["active_slice"]["slice_id"]
+    gate = task_id_from(run([
+        sys.executable, str(task_tool), "enqueue", "--actor", "统筹部/lead-thread",
+        "--department", "测试部", "--from-department", "统筹部",
+        "--title", "gate admission test", "--node", "2.1.1 next-action priority",
+        "--details", "给当前候选独立结论", "--acceptance-exit", "报告固定",
+        "--failure-path", "错误候选拒绝", "--authorization-state", "none",
+        "--task-kind", "gate", "--slice-id", slice_id, "--gate-type", "test",
+    ]))
+    queued_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=GATE_TASK_CLAIM_REQUIRED" in queued_gate.stdout
+        and f"target_task={gate}" in queued_gate.stdout
+        and "allowed=claim,next-action" in queued_gate.stdout
+        and "forbidden=gate-verdict" in queued_gate.stdout,
+        "next-action did not require a queued gate to be claimed before verdict",
+    )
+    run([
+        sys.executable, str(task_tool), "claim", "--task-id", gate,
+        "--claimed-by", "测试部/test-thread",
+    ])
+    claimed_gate = run([
+        sys.executable, str(task_tool), "next-action", "--task-id", owner,
+    ])
+    check(
+        "first_blocker=GATES_PENDING" in claimed_gate.stdout
+        and f"target_task={gate}" in claimed_gate.stdout
+        and "allowed=gate-verdict" in claimed_gate.stdout,
+        "next-action did not expose verdict only after the gate was claimed",
+    )
 
 
 def verify_protocol_151_fail_and_ack_priorities(root: Path) -> None:
@@ -6182,6 +6486,15 @@ def verify_protocol_151_authorization_priority(root: Path) -> None:
                         and "allowed=resolve,next-action" in rejected.stdout,
                         "frozen user_required could not close through user_rejected and resolve",
                     )
+                rejected_unfreeze = run([
+                    sys.executable, str(task_tool), "unfreeze-new-work",
+                    "--actor", "统筹部/lead-thread",
+                    "--user-confirmation", "不得跳过用户拒绝清账",
+                ], ok=False)
+                check(
+                    "USER_REJECTED_UNRESOLVED" in rejected_unfreeze.stderr,
+                    "frozen user_rejected task allowed global unfreeze before resolve",
+                )
                 task_payload = json.loads(
                     (collab / "tasks" / f"{owner}.json").read_text(encoding="utf-8")
                 )
@@ -7715,6 +8028,60 @@ summary: 当前代候选已完成独立审核
     )
 
 
+def verify_protocol_151_real_150_rollback_handoff(root: Path) -> None:
+    legacy_scaffold = root / "agent-team-2.1.0-scaffold.py"
+    legacy_scaffold.write_text(
+        run(["git", "show", "v2.1.0:scripts/scaffold_team.py"], cwd=ROOT).stdout,
+        encoding="utf-8",
+    )
+    (root / "temporary_executor_runtime.py").write_text(
+        run(["git", "show", "v2.1.0:scripts/temporary_executor_runtime.py"], cwd=ROOT).stdout,
+        encoding="utf-8",
+    )
+    compile_script(legacy_scaffold)
+    project = make_project(root, "protocol-151-real-150-rollback")
+    run([
+        sys.executable, str(legacy_scaffold), str(project),
+        "--profile", "通用项目协作", "--roles", "lead,dev,test",
+        "--session-mode", "manual", "--foundation-file", "docs/spec.md",
+    ])
+    collab = project / "docs" / "collaboration"
+    task_tool = collab / "scripts" / "agent_team_task.py"
+    for department, thread_id in (
+        ("统筹部", "lead-thread"), ("开发部", "dev-thread"), ("测试部", "test-thread"),
+    ):
+        ensure_department_registered(task_tool, department, thread_id)
+    run([sys.executable, str(task_tool), "rebuild-index"])
+    run([
+        sys.executable, str(task_tool), "freeze-new-work", "--actor", "统筹部/lead-thread",
+        "--evidence", "1.5.0 到 1.5.1 精确回滚探针",
+    ])
+    hot_documents = {
+        path: path.read_bytes()
+        for pattern in ("*/交接班文档.md", "*/收件箱.md")
+        for path in sorted((collab / "部门").glob(pattern))
+    }
+    run([sys.executable, str(SCAFFOLD), str(project), "--upgrade-collaboration"])
+    backup_dirs = sorted((collab / "升级备份").iterdir())
+    check(len(backup_dirs) == 1, "real 1.5.0 upgrade did not produce one rollback generation")
+    rollback = run([
+        sys.executable, str(SCAFFOLD), str(project), "--rollback-collaboration",
+        str(backup_dirs[0] / "rollback-manifest.json"),
+    ])
+    restored_task_tool = collab / "scripts" / "agent_team_task.py"
+    bundle = run([
+        sys.executable, str(restored_task_tool), "onboard-bundle", "--department", "开发部",
+    ])
+    doctor = run([sys.executable, str(restored_task_tool), "doctor"])
+    check(
+        rollback.stdout.startswith("ROLLBACK_OK |")
+        and all(path.read_bytes() == original for path, original in hot_documents.items())
+        and bundle.stdout.startswith("ONBOARD_BUNDLE_OK | 开发部")
+        and doctor.stdout.startswith("TASK_DOCTOR_OK"),
+        "real 1.5.0 rollback reported success without restoring usable hot handoffs",
+    )
+
+
 def verify_protocol_151_active_migration(root: Path) -> None:
     project = make_project(root, "protocol-151-active-migration")
     scaffold(project, "lead,dev,test,security")
@@ -7988,6 +8355,8 @@ def main() -> int:
     with tempfile.TemporaryDirectory(prefix="agent-team-verify-") as temp:
         root = Path(temp)
         verify_release_guard_branches(root)
+        verify_release_candidate_promotion(root)
+        verify_independent_release_approval_guard(root)
         verify_install_bundle_contract(root)
         project = make_project(root, "main")
         scaffold(project)
@@ -7996,6 +8365,7 @@ def main() -> int:
         verify_foundation_contract(root)
         verify_protocol_150_core(root)
         verify_protocol_151_zero_gate_next_action(root)
+        verify_protocol_151_gate_admission_actions(root)
         verify_protocol_151_fail_and_ack_priorities(root)
         verify_protocol_151_authorization_priority(root)
         verify_protocol_151_identity_priority(root)
@@ -8008,6 +8378,7 @@ def main() -> int:
         verify_protocol_151_acknowledged_owner_revision_reopen(root)
         verify_protocol_151_gate_ack_order(root)
         verify_protocol_151_user_revision(root)
+        verify_protocol_151_real_150_rollback_handoff(root)
         verify_protocol_151_active_migration(root)
         verify_protocol_150_migration(root)
         verify_protocol_150_atomic_guards(root)
@@ -8040,9 +8411,30 @@ def entrypoint() -> int:
             f" | source:{SOURCE_VERSION} | public:{PUBLIC_VERSION}"
         )
         return 0
+    if len(sys.argv) == 4 and sys.argv[1] == "--check-release-candidate":
+        candidate = verify_candidate_manifest(
+            ROOT,
+            require_reviewed=True,
+            expected_commit=sys.argv[2],
+            expected_runtime_sha256=sys.argv[3],
+        )
+        print(
+            f"RELEASE_CANDIDATE_OK | commit:{sys.argv[2]}"
+            f" | runtime:{candidate['runtime_set_sha256']}"
+            f" | candidate:{candidate['candidate_id']}"
+        )
+        return 0
+    if len(sys.argv) == 5 and sys.argv[1] == "--check-independent-release-approval":
+        reviewer = verify_independent_release_approval(
+            Path(sys.argv[2]).expanduser().resolve(), sys.argv[3], sys.argv[4],
+        )
+        print(f"INDEPENDENT_RELEASE_APPROVAL_OK | reviewer:{reviewer} | environment:{sys.argv[4]}")
+        return 0
     if len(sys.argv) != 1:
         raise VerifyError(
             "usage: verify_agent_team.py [--check-installed-copy PATH] "
+            "[--check-release-candidate COMMIT RUNTIME_SHA256] "
+            "[--check-independent-release-approval JSON DISPATCHER ENVIRONMENT] "
             "[--check-release-assets LATEST_JSON ZIP CHECKSUM REPO]"
         )
     return main()

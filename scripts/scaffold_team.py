@@ -3194,6 +3194,16 @@ def cmd_unfreeze_new_work(args) -> int:
     if control["mode"] == "normal":
         print(f"WORK_UNFREEZE_OK | normal | idempotent | history:{len(control['history'])}")
         return 0
+    unresolved_rejections = []
+    for task_id in sorted(active_slice_task_ids(load_slice_control())):
+        _, _, task = locate(task_id)
+        if task["authorization_state"] == "user_rejected" and task.get("resolution") is None:
+            unresolved_rejections.append(task_id)
+    if unresolved_rejections:
+        raise ValueError(
+            "USER_REJECTED_UNRESOLVED | 先 resolve 用户拒绝任务再解冻: "
+            + ",".join(unresolved_rejections)
+        )
     timestamp = now_iso()
     control["mode"] = "normal"
     control["updated_at"] = timestamp
@@ -4664,12 +4674,40 @@ def slice_progress_priority(
         if completion is not None:
             return completion
 
+    missing_gates = [
+        gate for gate, gate_status in gate_states.items()
+        if gate_status == "pending" and not active["gate_tasks"].get(gate)
+    ]
+    if missing_gates:
+        return {
+            "first_blocker": "P0_FREEZE_ACTIVE" if frozen else "GATE_TASK_ENQUEUE_REQUIRED",
+            "target_task_id": task["task_id"],
+            "allowed": ["unfreeze-new-work", "next-action"] if frozen else ["enqueue", "next-action"],
+            "forbidden": ["enqueue", "claim", "gate-verdict", "bind-candidate"] if frozen else [
+                "gate-verdict", "complete", "bind-candidate",
+            ],
+            "user_decision": frozen,
+        }
+
     pending_gates: list[tuple[str, str, dict]] = []
     for gate, gate_status in gate_states.items():
         gate_task_id = active["gate_tasks"].get(gate)
         if gate_status == "pending" and gate_task_id:
             gate_state, _, gate_task = locate(gate_task_id)
             pending_gates.append((gate_task_id, gate_state, gate_task))
+
+    queued_pending = [item for item in pending_gates if item[1] == "queued"]
+    if queued_pending:
+        gate_task_id, _, _ = queued_pending[0]
+        return {
+            "first_blocker": "P0_FREEZE_ACTIVE" if frozen else "GATE_TASK_CLAIM_REQUIRED",
+            "target_task_id": gate_task_id,
+            "allowed": ["unfreeze-new-work", "next-action"] if frozen else ["claim", "next-action"],
+            "forbidden": ["claim", "gate-verdict", "bind-candidate", "enqueue"] if frozen else [
+                "gate-verdict", "complete", "bind-candidate",
+            ],
+            "user_decision": frozen,
+        }
 
     for gate_task_id, gate_state, gate_task in pending_gates:
         if gate_state in {"completed", "acknowledged"}:
@@ -9400,6 +9438,7 @@ def run_upgrade(collab: Path, *, role_policy_overlay_file: str = "") -> int:
     if not mistakes.exists():
         managed[mistakes] = (cuoti_markdown(date), None)
     obsolete = [collab / "读取路由规则.md", collab / "scripts" / "agent_team_read.py"]
+    rendered_hot_paths: list[Path] = []
     for key in roles:
         role = ROLE_DEFS[key]
         department = collab / "部门" / role["name"]
@@ -9416,9 +9455,13 @@ def run_upgrade(collab: Path, *, role_policy_overlay_file: str = "") -> int:
             return 3
         if not handoff.exists():
             managed[handoff] = (state_markdown(key, role, date), None)
+        else:
+            rendered_hot_paths.append(handoff)
         inbox = department / "收件箱.md"
         if not inbox.exists() or "<!-- agent-team task index; use scripts/agent_team_task.py -->" not in read_utf8(inbox):
             managed[inbox] = (inbox_markdown(key, role, date), None)
+        else:
+            rendered_hot_paths.append(inbox)
 
     operation_id = "UPGRADE-" + dt.datetime.now().strftime("%Y%m%dT%H%M%S") + "-" + uuid.uuid4().hex[:8].upper()
     backup_root = backup_parent / operation_id
@@ -9500,7 +9543,7 @@ def run_upgrade(collab: Path, *, role_policy_overlay_file: str = "") -> int:
             )
         else:
             originals[dispatch_control_path] = upgrade_backup_record(dispatch_control_path, None)
-        for path in [*managed, *obsolete]:
+        for path in [*managed, *obsolete, *rendered_hot_paths]:
             if path.exists():
                 if path.is_symlink() or not path.is_file():
                     raise ValueError(f"受管文件不安全: {path}")
