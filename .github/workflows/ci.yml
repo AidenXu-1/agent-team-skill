@@ -90,11 +90,12 @@ jobs:
 
   publish_release:
     name: Publish explicitly authorized reviewed release
-    if: github.event_name == 'workflow_dispatch'
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     needs: verify
     runs-on: ubuntu-latest
     environment: agent-team-public-release
     permissions:
+      actions: read
       contents: write
     steps:
       - name: Checkout verified commit
@@ -124,8 +125,16 @@ jobs:
       - name: Verify explicit release authorization and review binding
         id: release
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
+          approval_history="${RUNNER_TEMP}/agent-team-release-approvals.json"
+          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/approvals" > "${approval_history}"
+          python scripts/verify_agent_team.py --check-independent-release-approval \
+            "${approval_history}" \
+            "${GITHUB_ACTOR}" \
+            "agent-team-public-release"
           version="$(python - <<'PY'
           import re
           from pathlib import Path
@@ -142,6 +151,9 @@ jobs:
           manifest_version="$(jq -r .source_version candidate-manifest.json)"
           runtime_sha="$(jq -r .runtime_set_sha256 candidate-manifest.json)"
           candidate_status="$(jq -r .status candidate-manifest.json)"
+          python scripts/verify_agent_team.py --check-release-candidate \
+            "${{ inputs.reviewed_commit }}" \
+            "${{ inputs.reviewed_runtime_sha256 }}"
           [[ "${{ inputs.release_version }}" == "${version}" ]]
           [[ "${manifest_version}" == "${version}" ]]
           [[ "${{ inputs.reviewed_commit }}" == "${GITHUB_SHA}" ]]
