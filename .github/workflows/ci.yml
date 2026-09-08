@@ -6,24 +6,6 @@ permissions:
 on:
   push:
   pull_request:
-  workflow_dispatch:
-    inputs:
-      release_version:
-        description: "Exact reviewed Skill version, for example 2.1.0"
-        required: true
-        type: string
-      reviewed_commit:
-        description: "Exact independently reviewed commit SHA"
-        required: true
-        type: string
-      reviewed_runtime_sha256:
-        description: "Exact independently reviewed runtime_set_sha256"
-        required: true
-        type: string
-      confirm_publish:
-        description: "Type PUBLISH v<version> to authorize a public Release"
-        required: true
-        type: string
 
 jobs:
   verify:
@@ -33,291 +15,37 @@ jobs:
       matrix:
         python-version: ["3.9", "3.11"]
     steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-
-      - name: Install validation dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
-
-      - name: Compile scripts
+      - name: Verify pure Skill
+        shell: bash
         run: |
-          python -m py_compile scripts/scaffold_team.py scripts/temporary_executor_runtime.py scripts/verify_agent_team.py
-
-      - name: Validate Skill metadata contract
-        run: |
+          set -euo pipefail
+          python -m py_compile scripts/scaffold_team.py scripts/temporary_executor_runtime.py
           python - <<'PY'
           import re
           from pathlib import Path
-          import yaml
 
-          text = Path("SKILL.md").read_text(encoding="utf-8")
-          match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
-          assert match, "SKILL.md frontmatter missing or malformed"
-          fields = yaml.safe_load(match.group(1))
-          assert isinstance(fields, dict), "frontmatter must be a YAML mapping"
-          allowed = {"name", "description", "license", "allowed-tools", "metadata"}
-          assert set(fields) <= allowed, f"unexpected frontmatter fields: {set(fields) - allowed}"
-          name = fields.get("name", "")
-          assert isinstance(name, str), "skill name must be a string"
-          assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", name), "invalid skill name"
-          assert len(name) <= 64, "skill name exceeds 64 characters"
-          description = fields.get("description", "")
-          assert isinstance(description, str), "skill description must be a string"
-          assert description and len(description) <= 1024 and "<" not in description and ">" not in description, "invalid description"
+          runtime = {
+              "SKILL.md",
+              "agents/openai.yaml",
+              "references/temporary-executor.md",
+              "scripts/scaffold_team.py",
+              "scripts/temporary_executor_runtime.py",
+          }
+          tracked = {
+              line.strip()
+              for line in __import__("subprocess").check_output(
+                  ["git", "ls-files"], text=True
+              ).splitlines()
+              if line.strip()
+          }
+          allowed = runtime | {".github/workflows/ci.yml"}
+          assert runtime <= tracked, f"missing runtime files: {sorted(runtime - tracked)}"
+          assert tracked <= allowed, f"development files leaked into pure Skill: {sorted(tracked - allowed)}"
+          skill = Path("SKILL.md").read_text(encoding="utf-8")
+          assert re.search(r"^name: agent-team$", skill, re.MULTILINE)
+          assert re.search(r"^  version: 2\.1\.1$", skill, re.MULTILINE)
           PY
-
-      - name: Run verifier
-        run: |
-          python scripts/verify_agent_team.py
-
-      - name: Verify exact installed runtime bundle
-        run: |
-          install_root="${RUNNER_TEMP}/agent-team-installed"
-          mkdir -p "${install_root}/agents" "${install_root}/references" "${install_root}/scripts"
-          cp SKILL.md "${install_root}/SKILL.md"
-          cp agents/openai.yaml "${install_root}/agents/openai.yaml"
-          cp references/temporary-executor.md "${install_root}/references/temporary-executor.md"
-          cp scripts/scaffold_team.py "${install_root}/scripts/scaffold_team.py"
-          cp scripts/temporary_executor_runtime.py "${install_root}/scripts/temporary_executor_runtime.py"
-          python scripts/verify_agent_team.py --check-installed-copy "${install_root}"
-
-  publish_release:
-    name: Publish explicitly authorized reviewed release
-    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
-    needs: verify
-    runs-on: ubuntu-latest
-    environment: agent-team-public-release
-    permissions:
-      actions: read
-      contents: write
-    steps:
-      - name: Checkout verified commit
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Setup Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.11"
-
-      - name: Install validation dependencies
-        run: python -m pip install --disable-pip-version-check -r requirements-dev.txt
-
-      - name: Require reproducible Agent Team 2.0.11 migration fixture
-        run: |
-          fixture="tests/fixtures/agent-team-2.0.11-runtime"
-          test -f "${fixture}/fixture-manifest.json"
-          test -f "${fixture}/SKILL.md"
-          test -f "${fixture}/agents/openai.yaml"
-          test -f "${fixture}/references/temporary-executor.md"
-          test -f "${fixture}/scripts/scaffold_team.py"
-          test -f "${fixture}/scripts/temporary_executor_runtime.py"
-          AGENT_TEAM_LEGACY_2011_ROOT="${fixture}" python scripts/verify_agent_team.py
-
-      - name: Verify explicit release authorization and review binding
-        id: release
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          approval_history="${RUNNER_TEMP}/agent-team-release-approvals.json"
-          gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}/approvals" > "${approval_history}"
-          python scripts/verify_agent_team.py --check-independent-release-approval \
-            "${approval_history}" \
-            "${GITHUB_ACTOR}" \
-            "agent-team-public-release"
-          version="$(python - <<'PY'
-          import re
-          from pathlib import Path
-          import yaml
-
-          text = Path("SKILL.md").read_text(encoding="utf-8")
-          match = re.match(r"^---\n(.*?)\n---", text, re.DOTALL)
-          if not match:
-              raise SystemExit("SKILL.md frontmatter missing")
-          data = yaml.safe_load(match.group(1))
-          print(data["metadata"]["version"])
-          PY
-          )"
-          manifest_version="$(jq -r .source_version candidate-manifest.json)"
-          runtime_sha="$(jq -r .runtime_set_sha256 candidate-manifest.json)"
-          candidate_status="$(jq -r .status candidate-manifest.json)"
-          python scripts/verify_agent_team.py --check-release-candidate \
-            "${{ inputs.reviewed_commit }}" \
-            "${{ inputs.reviewed_runtime_sha256 }}"
-          [[ "${{ inputs.release_version }}" == "${version}" ]]
-          [[ "${manifest_version}" == "${version}" ]]
-          [[ "${{ inputs.reviewed_commit }}" == "${GITHUB_SHA}" ]]
-          [[ "${{ inputs.reviewed_runtime_sha256 }}" == "${runtime_sha}" ]]
-          [[ "${{ inputs.confirm_publish }}" == "PUBLISH v${version}" ]]
-          [[ "${candidate_status}" == "reviewed-release-candidate" ]]
-          git diff --quiet
-          tag="v${version}"
-          if git rev-parse --verify "refs/tags/${tag}" >/dev/null 2>&1; then
-            echo "Release tag already exists and is immutable: ${tag}" >&2
-            exit 1
-          fi
-          printf 'version=%s\n' "${version}" >> "${GITHUB_OUTPUT}"
-          printf 'tag=%s\n' "${tag}" >> "${GITHUB_OUTPUT}"
-          printf 'zip_name=agent-team-%s-pure.zip\n' "${version}" >> "${GITHUB_OUTPUT}"
-
-      - name: Build and verify pure runtime package
-        id: package
-        shell: bash
-        run: |
-          set -euo pipefail
-          release_dir="${RUNNER_TEMP}/agent-team-release"
-          extract_dir="${RUNNER_TEMP}/agent-team-extracted"
-          mkdir -p "${release_dir}" "${extract_dir}"
-          zip_name="${{ steps.release.outputs.zip_name }}"
-          git archive --format=zip \
-            --output="${release_dir}/${zip_name}" \
-            "${GITHUB_SHA}" \
-            SKILL.md \
-            agents/openai.yaml \
-            references/temporary-executor.md \
-            scripts/scaffold_team.py \
-            scripts/temporary_executor_runtime.py
-          (
-            cd "${release_dir}"
-            sha256sum "${zip_name}" > "${zip_name}.sha256"
-          )
-          unzip -q "${release_dir}/${zip_name}" -d "${extract_dir}"
-          python scripts/verify_agent_team.py --check-installed-copy "${extract_dir}"
-          fresh_clone="${RUNNER_TEMP}/agent-team-fresh-clone"
-          git clone --no-checkout "https://github.com/${GITHUB_REPOSITORY}.git" "${fresh_clone}"
-          git -C "${fresh_clone}" checkout --detach "${GITHUB_SHA}"
-          git -C "${fresh_clone}" tag "${{ steps.release.outputs.tag }}" "${GITHUB_SHA}"
-          fresh_install="${RUNNER_TEMP}/agent-team-fresh-installed"
-          mkdir -p "${fresh_install}/agents" "${fresh_install}/references" "${fresh_install}/scripts"
-          cp "${fresh_clone}/SKILL.md" "${fresh_install}/SKILL.md"
-          cp "${fresh_clone}/agents/openai.yaml" "${fresh_install}/agents/openai.yaml"
-          cp "${fresh_clone}/references/temporary-executor.md" "${fresh_install}/references/temporary-executor.md"
-          cp "${fresh_clone}/scripts/scaffold_team.py" "${fresh_install}/scripts/scaffold_team.py"
-          cp "${fresh_clone}/scripts/temporary_executor_runtime.py" "${fresh_install}/scripts/temporary_executor_runtime.py"
-          python scripts/verify_agent_team.py --check-installed-copy "${fresh_install}"
-          printf 'release_dir=%s\n' "${release_dir}" >> "${GITHUB_OUTPUT}"
-          printf 'fresh_clone=%s\n' "${fresh_clone}" >> "${GITHUB_OUTPUT}"
-
-      - name: Upload reviewed immutable draft and verify before publication
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          RELEASE_DIR: ${{ steps.package.outputs.release_dir }}
-          VERSION: ${{ steps.release.outputs.version }}
-          TAG: ${{ steps.release.outputs.tag }}
-          ZIP_NAME: ${{ steps.release.outputs.zip_name }}
-          FRESH_CLONE: ${{ steps.package.outputs.fresh_clone }}
-        run: |
-          set -euo pipefail
-          repo="${GITHUB_REPOSITORY}"
-          zip_digest="sha256:$(sha256sum "${RELEASE_DIR}/${ZIP_NAME}" | awk '{print $1}')"
-          checksum_digest="sha256:$(sha256sum "${RELEASE_DIR}/${ZIP_NAME}.sha256" | awk '{print $1}')"
-          notes_file="${RUNNER_TEMP}/agent-team-release-notes.md"
-          printf '%s\n\n%s\n\n%s\n' \
-            "Agent Team ${VERSION} 的独立审查正式版本。" \
-            "源码提交：${GITHUB_SHA}" \
-            "运行集 SHA-256：${{ inputs.reviewed_runtime_sha256 }}" \
-            > "${notes_file}"
-          existing_release="$(gh release view "${TAG}" --repo "${repo}" --json isDraft,targetCommitish 2>/dev/null || true)"
-          reused_release="false"
-          if [[ -z "${existing_release}" ]]; then
-            gh release create "${TAG}" \
-              "${RELEASE_DIR}/${ZIP_NAME}" \
-              "${RELEASE_DIR}/${ZIP_NAME}.sha256" \
-              --repo "${repo}" \
-              --target "${GITHUB_SHA}" \
-              --title "Agent Team ${VERSION}" \
-              --notes-file "${notes_file}" \
-              --draft
-            existing_release="$(gh release view "${TAG}" --repo "${repo}" --json isDraft,targetCommitish)"
-          else
-            reused_release="true"
-            echo "Reusing exact reviewed draft release ${TAG} after an interrupted verification run."
-          fi
-          draft_is_draft="$(jq -r .isDraft <<<"${existing_release}")"
-          draft_target="$(jq -r .targetCommitish <<<"${existing_release}")"
-          [[ "${draft_is_draft}" == "true" ]]
-          if [[ "${reused_release}" == "true" ]]; then
-            unexpected_asset_count="$(gh release view "${TAG}" --repo "${repo}" --json assets | jq -r --arg zip "${ZIP_NAME}" --arg checksum "${ZIP_NAME}.sha256" '[.assets[] | select(.name != $zip and .name != $checksum)] | length')"
-            [[ "${unexpected_asset_count}" == "0" ]]
-            if [[ "${draft_target}" != "${GITHUB_SHA}" ]]; then
-              if ! git diff --quiet "${draft_target}" "${GITHUB_SHA}" -- \
-                SKILL.md \
-                agents/openai.yaml \
-                references/temporary-executor.md \
-                scripts/scaffold_team.py \
-                scripts/temporary_executor_runtime.py; then
-                echo "Existing draft runtime differs from the reviewed commit; refusing recovery." >&2
-                exit 1
-              fi
-              echo "Recovering unpublished draft onto runtime-identical reviewed commit ${GITHUB_SHA}."
-            fi
-            gh release edit "${TAG}" \
-              --repo "${repo}" \
-              --target "${GITHUB_SHA}" \
-              --title "Agent Team ${VERSION}" \
-              --notes-file "${notes_file}" \
-              --draft
-            gh release upload "${TAG}" \
-              "${RELEASE_DIR}/${ZIP_NAME}" \
-              "${RELEASE_DIR}/${ZIP_NAME}.sha256" \
-              --repo "${repo}" \
-              --clobber
-            existing_release="$(gh release view "${TAG}" --repo "${repo}" --json isDraft,targetCommitish)"
-            draft_is_draft="$(jq -r .isDraft <<<"${existing_release}")"
-            draft_target="$(jq -r .targetCommitish <<<"${existing_release}")"
-          fi
-          [[ "${draft_is_draft}" == "true" ]]
-          [[ "${draft_target}" == "${GITHUB_SHA}" ]]
-          metadata="${RUNNER_TEMP}/agent-team-draft-release.json"
-          gh release view "${TAG}" --repo "${repo}" --json tagName,assets > "${metadata}"
-          python scripts/verify_agent_team.py --check-release-assets \
-            "${metadata}" \
-            "${RELEASE_DIR}/${ZIP_NAME}" \
-            "${RELEASE_DIR}/${ZIP_NAME}.sha256" \
-            "${FRESH_CLONE}"
-          draft_zip_digest="$(gh release view "${TAG}" --repo "${repo}" --json assets | jq -r --arg name "${ZIP_NAME}" '.assets[] | select(.name == $name) | .digest')"
-          draft_checksum_digest="$(gh release view "${TAG}" --repo "${repo}" --json assets | jq -r --arg name "${ZIP_NAME}.sha256" '.assets[] | select(.name == $name) | .digest')"
-          draft_asset_count="$(gh release view "${TAG}" --repo "${repo}" --json assets --jq '.assets | length')"
-          [[ "${draft_zip_digest}" == "${zip_digest}" ]]
-          [[ "${draft_checksum_digest}" == "${checksum_digest}" ]]
-          [[ "${draft_asset_count}" == "2" ]]
-          if gh api "repos/${repo}/git/ref/tags/${TAG}" >/dev/null 2>&1; then
-            echo "Tag appeared before publication: ${TAG}" >&2
-            exit 1
-          fi
-          gh release edit "${TAG}" --repo "${repo}" --draft=false --latest
-          published_tag_sha="$(gh api "repos/${repo}/git/ref/tags/${TAG}" --jq .object.sha)"
-          [[ "${published_tag_sha}" == "${GITHUB_SHA}" ]]
-          published_tag="$(gh release view "${TAG}" --repo "${repo}" --json tagName --jq .tagName)"
-          [[ "${published_tag}" == "${TAG}" ]]
-          latest_tag="$(gh api "repos/${repo}/releases/latest" --jq .tag_name)"
-          [[ "${latest_tag}" == "${TAG}" ]]
-          published_dir="${RUNNER_TEMP}/agent-team-published"
-          published_install="${RUNNER_TEMP}/agent-team-published-install"
-          mkdir -p "${published_dir}" "${published_install}"
-          gh release download "${TAG}" \
-            --repo "${repo}" \
-            --dir "${published_dir}" \
-            --pattern "${ZIP_NAME}" \
-            --pattern "${ZIP_NAME}.sha256" \
-            --clobber
-          (
-            cd "${published_dir}"
-            sha256sum -c "${ZIP_NAME}.sha256"
-          )
-          reviewed_zip_sha="$(sha256sum "${RELEASE_DIR}/${ZIP_NAME}" | awk '{print $1}')"
-          published_zip_sha="$(sha256sum "${published_dir}/${ZIP_NAME}" | awk '{print $1}')"
-          [[ "${published_zip_sha}" == "${reviewed_zip_sha}" ]]
-          unzip -q "${published_dir}/${ZIP_NAME}" -d "${published_install}"
-          python scripts/verify_agent_team.py --check-installed-copy "${published_install}"
