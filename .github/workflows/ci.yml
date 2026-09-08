@@ -1,0 +1,51 @@
+name: CI
+
+permissions:
+  contents: read
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.9", "3.11"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Verify pure Skill
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m py_compile scripts/scaffold_team.py scripts/temporary_executor_runtime.py
+          python - <<'PY'
+          import re
+          from pathlib import Path
+
+          runtime = {
+              "SKILL.md",
+              "agents/openai.yaml",
+              "references/temporary-executor.md",
+              "scripts/scaffold_team.py",
+              "scripts/temporary_executor_runtime.py",
+          }
+          tracked = {
+              line.strip()
+              for line in __import__("subprocess").check_output(
+                  ["git", "ls-files"], text=True
+              ).splitlines()
+              if line.strip()
+          }
+          allowed = runtime | {".github/workflows/ci.yml"}
+          assert runtime <= tracked, f"missing runtime files: {sorted(runtime - tracked)}"
+          assert tracked <= allowed, f"development files leaked into pure Skill: {sorted(tracked - allowed)}"
+          skill = Path("SKILL.md").read_text(encoding="utf-8")
+          assert re.search(r"^name: agent-team$", skill, re.MULTILINE)
+          assert re.search(r"^  version: 2\.1\.1$", skill, re.MULTILINE)
+          PY
