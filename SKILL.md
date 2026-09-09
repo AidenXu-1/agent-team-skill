@@ -1,6 +1,6 @@
 ---
 name: agent-team
-description: Build low-context multi-agent teams with durable handoff, independent review, and user gates. Use when a project needs separate management, execution, and review roles.
+description: Build or maintain project multi-agent collaboration, including team setup, roles, session routing, handoff and protocol repair. Existing departments handle routine development and review through project role and TASK files.
 metadata:
   version: 2.1.1
 ---
@@ -13,19 +13,19 @@ metadata:
 
 1. 判断交付物、项目结构和最小团队。
 2. 用户确认部门与会话模式后再创建协作层。
-3. 新部门会话首次读 `上岗引导.md` 后只运行一次 `agent_team_task.py onboard-bundle --department ...`；它校验 freshness，输出岗位、收件箱、当前 TASK 和交接班机器区块，不带区块外的过期人工“当前任务”，不生成摘要、不读冷历史，后续不重复。
+3. 新部门会话先读 `上岗引导.md`，按“低上下文规则”运行一次 `onboard-bundle`；通过 freshness 并核对恢复说明后接续当前任务。
 4. 全项目同一时刻只有一个活动切片：一个执行 owner、最多两个审核 gate、一个当前候选。任务用唯一 ID 和原子状态工具流转，跨会话消息只发“任务 ID + 短状态”。
-5. 节点完成后提交产出、已验证/未验证和错题自检，以 `TASK_STATE_OK` 为完成收据；只记真实轨迹事件。
+5. 阶段交付回报产出、自检和未验证项；正式完成按任务协议取得 `TASK_STATE_OK`，不提前推进后续流程。只记真实轨迹事件。
 6. 依后文评估工作集；只建议换班，用户明确同意后才创建新会话。
-7. 临时外包是低频旁路。协议 1.5 暂不允许它另开第二 owner TASK；用户主动提出时读取 `references/temporary-executor.md`，说明当前为 P2 宿主适配缺口，不绕过单 owner 闸门。
+7. 临时外包是低频旁路。协议 1.5 暂不允许它另开第二 owner TASK；用户主动提出时读取 `references/temporary-executor.md`，当前返回 `TEMPORARY_EXECUTOR_P2_REQUIRED`，不绕过单 owner 闸门。
 
 ## 必守边界
 
-* 项目地基先说明目标、交付物和验收标准，再创建 `docs/collaboration/`。Agent 复核语义并用 `--foundation-file` 传入；脚本只检查路径、编码、类型、大小和非空。已有协作层异常时不覆盖并给方案。
+* 项目地基先说明目标、交付物和验收标准，再创建 `docs/collaboration/`。Agent 复核语义并用 `--foundation-file` 传入；脚本只检查路径、编码、类型、大小和非空，并在项目 `docs/agent-guide.md` 保留该入口。已有协作层异常时不覆盖并给方案。
 
 * 团队必须包含管理层、执行层、审核层；最小盘是 `lead,do,review`，不要为“多 Agent”硬拆部门。
 
-* 创建协作层、首次创建部门会话、增删/替换部门、改变跨会话路由或通知模式前，必须获得用户确认。
+* 创建协作层、首次创建部门会话、增删/替换部门、改变跨会话路由或通知模式前，必须获得用户确认；已明确覆盖本次动作的授权不重复询问。
 
 * 本 Skill 只搭协作机制，不替业务部门直接完成业务代码或产物。
 
@@ -41,23 +41,21 @@ metadata:
 
 * 用户确认正式收口后才检查并提交本节点相关 Git 变更；commit 不代表发布、外发或上线。
 
-* 任务执行状态、业务阶段、用户授权是三条独立轴，禁止用“测试通过”一类业务语义代替任务所有权或用户授权。
+* 任务执行状态、业务阶段和用户授权须分别判断；“测试通过”等业务结论不能代替任务所有权或用户授权。
 
 * 已有协作层的协议版本不同时，先运行显式升级并保留备份，不直接混入新规则。
 
 ## 低上下文规则
 
-* 四文档是固定入口，不生成第五份摘要。`onboard-bundle` 一次输出岗位、收件箱、交接班机器区块和当前 TASK；区块外人工文字不进入默认热入口，也不能充当 TASK 身份。失败时停止接班，由已登记统筹 actor 运行 `rebuild-index`；`tasks/`/日志保存冷历史。
+* 四文档是固定入口，不生成第五份摘要。`onboard-bundle` 一次输出岗位、收件箱、交接机器区块、绑定当前 TASK/候选的恢复说明和当前 TASK；人工说明不充当 TASK 身份。旧格式或绑定失效时先核对。失败先停止；freshness 过期由已登记统筹 actor 运行 `rebuild-index`，其余按提示处理。`tasks/`/日志保存冷历史。
 
-* 新会话通过 freshness 后，只读取当前切片指向的 TASK JSON。不要展开 blocked、waiting、replacement 或已核收冷历史；doctor 才做全历史机械体检。
+* freshness 通过后沿用接班输出中的当前 TASK 与受管冻结恢复任务，不另读一遍。其他 TASK 按本次依赖或显式审计读取；doctor 才做全历史机械体检。
 
-* 默认不读日志、长报告、决策正文、其他部门正文、代码 diff 或完整测试证据；当前任务明确依赖时再读。
+* 普通业务续做默认按项目岗位与 TASK；用户明确调用时读取本 Skill。日志、长报告、决策、其他部门正文、diff 或完整测试证据，仅在当前任务依赖时读取。
 
 * 按任务、权威性和遗漏风险决定读取范围。只检查索引或元数据时，不得声称覆盖正文。
 
-* 只有反复出现、确定、需要一致性的机械操作才写入脚本；语义检索、正文理解和证据取舍由 Agent 负责。
-
-* 长期真值留在项目文件；会话只带当前工作集。
+* 软件实现与复杂度检查沿用项目 `docs/agent-guide.md`，缺少规则时查协作总则；开发执行、审核独立检查，不增岗位或审批。仅反复、确定且需一致的机械操作脚本化，语义与证据取舍由 Agent 判断。
 
 ## 事实日志
 
@@ -89,8 +87,8 @@ metadata:
 AI 产品不单独创建 AI 部门，也不按技术名词拆部门。生成岗位的操作真值是 `scaffold_team.py` 中的 `ROLE_DEFS`；本节只保留不可被项目覆盖削弱的职责合同：
 
 * 产品部以用户需求、研究证据、资源约束和开发可行性建议为输入，负责完整产品规划及系统级技术路径、架构、模块/数据/接口边界、选型实验、依赖、迁移/回滚和实施阶段；输出 Spec、验收目标与系统 ADR，只写 `docs/decisions/system/` 等规划区，不写正式业务代码。产品选型实验必须是不可直接合并或发布的 disposable spike，采纳后由开发部重新实现和测试。
-* 开发部以已确认 Spec、系统 ADR、设计和实施规划为输入，负责开工可行性复核、代码级决定、正式实现、自测与集成；只在 `docs/decisions/code/` 维护代码 ADR。发现系统合同不合理时提交证据与建议，经统筹退回产品部修订，不得静默改合同或路线。
-* 系统 ADR 由产品部维护 `draft → proposed → accepted → superseded`；`accepted` 正文不可原地修改，实质变化必须新建 draft、重新评审确认，再把旧 ADR 标为 superseded。安全与测试只提交独立报告，不能直接改 Spec/ADR 或自证放行。
+* 开发部以已确认 Spec、系统 ADR、设计和实施规划为输入，负责开工可行性复核、代码级决定、正式实现、自测与集成；在 `docs/decisions/code/` 维护代码 ADR。系统合同需修订时先停下，由产品部提供方案，未配置产品部时由统筹协同用户确定；原 TASK 范围和验收仍有效、所需确认齐全后，由当前 owner 按方案落盘，不并行写入。原合同已失效时按任务交接协议处理，不能手改 TASK 或虚构放弃。
+* 系统 ADR 由产品部负责内容，当前 owner 按已确认方案维护 `draft → proposed → accepted → superseded`；`accepted` 正文不可原地修改，实质变化必须新建 draft、重新评审确认，再把旧 ADR 标为 superseded。安全与测试只提交独立报告，不能直接改 Spec/ADR 或自证放行。
 
 ## 创建协作层
 
@@ -113,7 +111,7 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 --foundation-resources "..." --foundation-risks "..."
 ```
 
-脚本生成协作文件与运行工具。缺 heartbeat、lease、查询、等待、恢复或归档适配器即为 `manual-degraded`：不轮询、不承诺无人值守或 Token 下降。
+脚本生成协作文件与运行工具。当前调度固定为 `manual-degraded`，`auto` 仅支持已授权的会话创建和短通知：不轮询、不承诺无人值守或 Token 下降。
 
 ## 任务事务
 
@@ -129,25 +127,21 @@ python3 <skill目录>/scripts/scaffold_team.py "<项目目录>" \
 
 * 统筹部只能核收 `completed` 任务；`acknowledged-by` 必须精确匹配会话状态中当前已登记的 `统筹部/会话ID`，用于防止普通部门误操作，核收后状态为 `acknowledged`。
 
-* 用户冻结、任务堆积、上下文/存储压力、同一 gate 跨两代连续 FAIL 或无用户出口时，立即 `freeze-new-work`；冻结、TASK、换班、增删部门和升级共用项目控制锁。冻结只准安全停下、记录 verdict/用户出口/指标、完成、核收、清账、交接、换班和保全证据；返工、派单、恢复、扩编仍被拒绝，仅凭用户证据解冻。
+* 用户冻结、任务堆积、上下文/存储压力、同一 gate 跨两代连续 FAIL，或验收出口缺失、无法验证时，立即 `freeze-new-work`；正常待验证或待用户反馈本身不触发冻结。冻结、TASK、换班、增删部门和升级共用项目控制锁。冻结只准安全停下、记录 verdict/用户出口/指标、完成、核收、清账、交接、换班和保全证据；返工、派单、恢复、扩编仍被拒绝，仅凭用户证据解冻。
 
 * 1.5 返工只换候选，不用 `supersede`；拒绝/放弃时先 block/wait，再 `resolve`。升级后的普通 1.4 TASK 只能清账、核收或 `--include-cold` 审计，禁止重新 claim/resume/complete；legacy temporary 也只能在 frozen、无活动切片时走专用恢复与收口白名单，完全终态前不得解冻或创建 1.5 owner。
 
 * `enqueue / authorize / resolve / ack / record-user-exit / record-metrics / set-notification` 的 actor 必须匹配已登记统筹会话。`block / wait / resume / record-user-exit` 完全相同的重试返回零写入 NOOP；目标状态、原因、证据、actor 或候选代次冲突时失败。actor 是防误操作和审计绑定，不是操作系统级认证。
 
-* 测试遵守前述用户影响门；有界面任务先冒烟和安全探针，体验确认后回归；无界面任务按验收出口验证。
+* 测试遵守前述用户影响门；有界面任务先冒烟和安全探针；仅当体验方向未定且影响后续验证，或用户要求的前置体验未完成时等待。已确认方向直接完成相关回归，无界面任务按验收出口验证。
 
 ## 用户闸门与汇报
 
-统筹不穷举场景，按用户意图、对当前 TASK 的影响，以及是否需用户独有信息、亲自体验/判断或授权分流：需则用户出口保持 `pending` 并停下；无依赖的纯代码/内部检查过自检和所需 gate 后记为 `not_applicable`，同一切片内继续，不开新切片或跳审核。临时提问/状态追问直接答并保留当前 TASK；同范围反馈续做，含义或实质影响不清再问。
+统筹不穷举场景，按用户意图、对当前 TASK 的影响，以及是否需用户独有信息、亲自体验/判断或授权分流：需则用户出口保持 `pending` 并停下；无依赖的纯代码/内部检查过自检和所需 gate 后记为 `not_applicable`，同一切片内继续，不跳审核。当前切片核收后，仅按已明确授权的计划顺序进入下一项；新增范围、风险或需要用户独有判断时停下确认。临时提问/状态追问直接答并保留当前 TASK；同范围反馈续做，含义或实质影响不清再问。
 
 统筹提出恢复、绑定候选等状态动作前，先运行只读 `next-action --task-id ...`。协议拒绝时只汇报第一阻断、当前允许动作和是否需要用户决定；不得擅自把局部协议拒绝扩张成修改 Skill、项目业务或发布流程。
 
 正式汇报用于体验、信息、选择、风险或阶段收口，稳定保留`结果`和`需要你做什么`，真实风险再写`还需注意`；未验出口写“当前不可确认可用”，体验给入口/操作顺序/预期结果/重点判断/已知限制。普通问答自然回复，不为凑格式制造空话；默认不展开 TASK ID、状态词、哈希、命令、日志或协议。
-
-## 单 TASK 临时外包（按需）
-
-用户主动提出临时外包时才读取参考文件。1.5 新建会返回 `TEMPORARY_EXECUTOR_P2_REQUIRED`；只允许按参考文件收口旧任务，不得用普通 enqueue 或隐式子会话绕过单 owner。
 
 ## 会话模式与换班
 

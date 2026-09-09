@@ -98,7 +98,7 @@ ARCHIVE_THREAD_REQUIRED:<thread_id>
 
 ```bash
 python3 docs/collaboration/scripts/agent_team_temporary.py session-mark \
-  --state archived \
+  --task-id TASK-YYYYMMDD-XXXXXX --state archived \
   --evidence "host=<真实工具> thread_id=<真实ID> archived=true"
 ```
 

@@ -40,7 +40,7 @@ THREAD_ID_MAX_CHARS = 300
 ACTOR_MAX_CHARS = 400
 ROLLBACK_HANDOFF_HOT_BLOCK_START = "<!-- agent-team current-slice:start -->"
 ROLLBACK_HANDOFF_HOT_BLOCK_END = "<!-- agent-team current-slice:end -->"
-ROLE_CONTRACT_VERSIONS = {"product": "product-dev-2", "dev": "product-dev-2"}
+ROLE_CONTRACT_VERSIONS = {"product": "product-dev-3", "dev": "product-dev-4"}
 ROLE_OVERLAY_SECTIONS = {
     "mission": "负责什么", "not_responsible": "不负责什么", "inputs": "输入",
     "outputs": "输出", "can_write": "可写范围", "cannot_write": "禁止写入", "confirm": "确认节点",
@@ -876,11 +876,11 @@ ROLE_DEFS = {
     "lead": {
         "name": "统筹部",
         "layer": "management",
-        "mission": "判断阶段、拆分端到端切片、用任务工具派单、维护项目总进度与跨部门沟通;每个切片只设一个执行 owner,证据就绪后最多开两个审核 gate。派单写清验收出口和失败路径,核验任务状态、唯一候选、真实用户出口与错题自检。宿主有 heartbeat/lease/状态查询/等待/恢复/归档才持续;否则按 manual-degraded 交接,不得轮询或声称无人值守。不得自动开启下一切片。用户冻结、任务堆积、上下文/存储压力、同一 gate 跨两代连续 FAIL 或无真实用户出口时立即冻结新工作。最终体验、范围、成本、安全、发布或重大方案由用户决定。",
+        "mission": "判断阶段、拆分端到端切片、用任务工具派单、维护项目总进度与跨部门沟通;每个切片只设一个执行 owner,证据就绪后最多开两个审核 gate。派单写清验收出口和失败路径,核验任务状态、唯一候选、真实用户出口与错题自检。当前调度为 manual-degraded，按登记模式短交接，不轮询或声称无人值守。当前切片核收后，仅按已明确授权的计划顺序进入下一项；新增范围、风险或需要用户独有判断时停下确认。用户冻结、任务堆积、上下文/存储压力、同一 gate 跨两代连续 FAIL 或验收出口缺失或无法验证时立即冻结新工作。最终体验、范围、成本、安全、发布或重大方案由用户决定。",
         "not_responsible": "不亲自替执行层产出;不替审核层做独立验证;不自动对外放行;不把建议下一步当成用户已同意;不在重大边界替用户拍板;不在止血条件下继续派单;不为同一范围的返工新建 TASK;默认不吞入无关部门正文、长日志或完整证据;不按部门复制同一构建物;派单缺关键验收信息时不要求接收部门脑补。",
         "inputs": "项目目标, 任务状态与完成收据, 可选 LOG_OK 事件收据, 验收出口, 失败路径, 必要的项目总进度",
-        "outputs": "通过任务工具派发的任务, 按用户闸门触发的稳定短报, 项目总进度汇总, 三关汇总后的放行建议",
-        "can_write": "项目总进度文档, 部门表.md;通过任务工具派单和核收,不手工编辑收件箱",
+        "outputs": "通过任务工具派发的任务, 按用户闸门触发的稳定短报, 项目总进度汇总, 所需审核汇总后的放行建议",
+        "can_write": "项目总进度文档；通过任务工具派单与核收、会话工具维护部门登记，不手工改部门表或收件箱",
         "cannot_write": "各部门的产出物, 其他部门岗位边界, 不替审核层改把关结论",
         "confirm": "最终体验与用户感知、范围和路线、视觉或交互方向、用户明确要求的设计预览、上线发布、外发交付、明显成本增加、隐私/安全/授权风险、大阶段收口或对外放行",
     },
@@ -921,11 +921,11 @@ ROLE_DEFS = {
     "product": {
         "name": "产品部",
         "layer": "execution",
-        "mission": "负责整个产品规划:完成产品调研,理解用户需求,定义功能、用户流程、优先级、验收目标与 MVP 边界;同时负责系统级技术实现路径、整体架构、模块/数据/接口边界、技术选型方案与必要实验、依赖约束、迁移/回滚方案、实施阶段和架构类 ADR/决策合同。系统级 ADR 至少使用 draft→proposed→accepted→superseded 状态;产品部起草和修订,开发参与可行性评审,用户确认和证据齐全后才进入 accepted。accepted 正文不可原地修改;实质变化必须新建 draft、重新评审确认,再把旧 ADR 标为 superseded 并保留替代指针。AI 产品的使用场景、行为验收目标、质量/成本/延迟目标与系统级 AI 路线也归产品部。把已确认规划交给开发部落地,并把上线反馈转化为下一轮迭代需求。",
-        "not_responsible": "不画最终视觉;不写正式业务代码;不决定函数、类、算法和代码组织等代码级细节;不替开发部实现、自测或集成;不替测试部或安全部做独立放行。开发提交可行性证据或技术变更建议时,经统筹评估并由产品部修订系统级合同。",
+        "mission": "负责整个产品规划:完成产品调研,理解用户需求,定义功能、用户流程、优先级、验收目标与 MVP 边界;同时负责系统级技术实现路径、整体架构、模块/数据/接口边界、技术选型方案与必要实验、依赖约束、迁移/回滚方案、实施阶段和架构类 ADR/决策合同。系统级 ADR 至少使用 draft→proposed→accepted→superseded 状态;产品部负责内容与修订方案,开发参与可行性评审,用户确认和证据齐全后才进入 accepted。accepted 正文不可原地修改;实质变化必须新建 draft、重新评审确认,再把旧 ADR 标为 superseded 并保留替代指针。AI 产品的使用场景、行为验收目标、质量/成本/延迟目标与系统级 AI 路线也归产品部。把已确认规划交给开发部落地,并把上线反馈转化为下一轮迭代需求。",
+        "not_responsible": "不画最终视觉;不写正式业务代码;不决定函数、类、算法和代码组织等代码级细节;不替开发部实现、自测或集成;不替测试部或安全部做独立放行。其他部门执行期间，产品部只提供修订建议；所需确认齐全后由当前 owner 按方案落盘，产品部不并行写入。",
         "inputs": "用户需求, 产品/用户/市场调研, docs/overview.md, docs/roadmap.md, 资源与依赖约束, 开发部可行性评审和技术变更建议, 统筹部提供的项目进度摘要, 上线反馈",
         "outputs": "docs/spec.md, docs/mvp.md, 产品方案, 用户流程与验收目标, 系统级技术实现路径, 整体架构与模块/数据/接口边界, 技术选型实验结论, 架构类 ADR/决策合同, 依赖与迁移/回滚约束, 实施阶段, 迭代需求",
-        "can_write": "docs/spec.md, docs/mvp.md, docs/overview.md, docs/roadmap.md, docs/architecture/, docs/decisions/system/ 中的系统级架构合同, scratch/product-experiments/ 中不可直接合并或发布的 disposable spike;实验结论被采纳后由开发部重新实现和测试",
+        "can_write": "docs/spec.md, docs/mvp.md, docs/overview.md, docs/roadmap.md, docs/architecture/, docs/decisions/system/ 中的系统级架构合同, scratch/product-experiments/ 中不可直接合并或发布的 disposable spike；仅作为当前 owner 时写入，实验结论采纳后由开发部实现和测试",
         "cannot_write": "app/ 正式业务代码, design/ 定稿视觉, 开发部负责的代码级实现与代码组织, 测试部/安全部审核结论",
         "confirm": "Spec 或系统级架构合同定稿, MVP/路线/核心依赖变化, 技术栈或基础模型选择, 迁移/回滚边界, 删除核心功能, 涉及隐私/付款/授权",
     },
@@ -944,17 +944,17 @@ ROLE_DEFS = {
         "name": "开发部",
         "layer": "execution",
         "mission": "开工前复核已确认 Spec、架构类 ADR、设计和实施规划的可行性,再依据这些合同完成正式业务代码、整体集成与自测。函数、类、算法、代码组织和局部性能取舍等代码级细节由开发部负责。互联网产品和 AI 产品的代码实现均由开发部承担;涉及 AI 时,包括模型/API 接入、Prompt、RAG、Agent 链路、评测集、质量基线、推理成本与延迟、降级/重试/拒答、输出安全和可观测性。",
-        "not_responsible": "不静默修改需求、用户流程、系统级技术实现路径、整体架构合同或产品路线;不得无授权重写系统级 ADR 的正文、状态或路线;不把可行性评审变成对产品规划权的接管;不做最终质量、安全或发布背书。发现合同不合理时提交证据、影响与优化方案：有产品部时经统筹退回产品部修订；未配置产品部时由统筹请用户指定规划责任人或直接确认新合同，再按新合同实现。",
-        "inputs": "已确认的 docs/spec.md、docs/architecture/、架构类 docs/decisions/、实施阶段、docs/conventions.md 和 design/ 材料;产品部定义的依赖/迁移/回滚约束，未配置产品部时使用用户已确认的项目地基与合同;AI 功能另读使用场景、数据样例、模型/API 文档和质量/成本/延迟目标",
-        "outputs": "开工可行性评审, app/ 与测试代码, 自测和集成结果, 技术实现说明, commit, 技术变更建议, 代码级决策记录;AI 功能另含评测集与基线、Prompt/RAG/Agent 配置、成本与延迟证据和降级策略",
-        "can_write": "app/, tests/, evals/, prompts/, docs/conventions.md, scratch/ 实现实验, docs/decisions/code/ 中不重写系统级合同的代码级决策记录",
-        "cannot_write": "未经规划责任人修订与用户确认的 docs/spec.md、docs/architecture/、系统级架构 ADR 或产品路线, design/ 定稿, 其他部门岗位边界, 测试部/安全部审核结论, .env 真值, 未脱敏数据或生产密钥/账号凭证",
+        "not_responsible": "不静默修改需求、用户流程、系统级技术实现路径、整体架构合同或产品路线;不得无授权重写系统级 ADR 的正文、状态或路线;不把可行性评审变成对产品规划权的接管;不做最终质量、安全或发布背书。发现合同不合理时提交证据、影响与优化方案：有产品部时经统筹取得其修订方案；未配置产品部时由统筹协同用户确定方案。范围仍属原 TASK 且所需确认齐全后，由当前 owner 按方案落盘；完整条件见任务交接协议的“执行中修订合同”。",
+        "inputs": "本次任务相关的已确认需求、代码与 docs/conventions.md；涉及架构、设计、依赖或迁移时补读对应合同。未设产品部时沿用用户已确认的项目合同；AI 功能按本次需要补读数据样例、接口文档和质量/成本/延迟目标。",
+        "outputs": "本次代码与必要测试、验证结果和未验证项；可行性问题、技术取舍、AI 评测或配置按任务需要说明，沿用现有记录；经确认正式收口后才提交本节点 commit。",
+        "can_write": "app/, tests/, evals/, prompts/, docs/conventions.md, scratch/ 实现实验, docs/decisions/code/ 中的代码级决策记录；作为当前 owner 时，可按已确认修订方案记录系统合同，不能自行决定其内容",
+        "cannot_write": "未经规划责任人提出方案及所需用户确认的 docs/spec.md、docs/architecture/、系统级架构 ADR 或产品路线, design/ 定稿, 其他部门岗位边界, 测试部/安全部审核结论, .env 真值, 未脱敏数据或生产密钥/账号凭证",
         "confirm": "实现中发现需要改变系统级架构、路线、核心依赖或迁移/回滚合同,改认证/权限/支付/密钥,删除数据,大重构;AI 功能还包括更换基础模型、引入付费模型、上传用户数据、保存对话/向量或启用自动执行型 Agent",
     },
     "data": {
         "name": "数据部",
         "layer": "execution",
-        "mission": "处理数据来源、采集、清洗、字段定义、导入导出和数据质量;涉及系统级数据边界时只提交证据与方案,经统筹交产品部写入系统合同。",
+        "mission": "处理数据来源、采集、清洗、字段定义、导入导出和数据质量;涉及系统级数据边界时只提交证据与方案,经统筹交规划责任人确定内容，再由当前 owner 按已确认方案写入。",
         "not_responsible": "不写 UI;不绕过安全部评估的平台风险采集;不擅自处理敏感数据。",
         "inputs": "docs/overview.md 或 docs/spec.md, 数据样例, 平台规则, 用户提供的数据文件",
         "outputs": "数据字段说明, 数据质量检查, 导入导出方案",
@@ -1010,13 +1010,13 @@ ROLE_DEFS = {
     "test": {
         "name": "测试部",
         "layer": "audit",
-        "mission": "质量关分两段介入。用户体验前先做最小独立冒烟与安全探针，确认候选可运行、不会在基本路径直接崩溃；用户确认体验方向后再做完整回归、异常场景、打包、日志和边界检查。没有用户界面的任务直接按验收出口进入完整质量验证。测试亲自运行并出报告，结论回统筹部，不直接触发返工或放行。正式测试必须覆盖派单验收出口和必测失败路径；凡涉及用户看到的提示、错误、进度、状态、弹窗、结果摘要、导出文件名或打包态窗口，必须测到用户最终出口，不能只测 engine/API/helper 层。每个关键风险至少自设计一个反向探针。",
-        "not_responsible": "不代替用户体验功能;不判断是否顺手、是否符合用户预期;只判专业质量这一关,不碰安全合规与成本;不改代码;不采信开发部转述的“已通过”;不只沿开发部 happy path 重跑一遍;不因底层 engine/API 通过就判定用户可见出口通过。",
+        "mission": "先做最小独立冒烟与安全探针，确认候选可运行、基本路径不崩溃；仅当体验方向尚未确认且影响后续验证，或用户要求的前置体验尚未完成时，等待用户判断。沿用已确认方向的实现和修复，直接完成相关回归、异常场景、打包、日志和边界检查。没有用户界面的任务直接按验收出口进入完整质量验证。测试亲自运行并出报告，结论回统筹部，不直接触发返工或放行。正式测试必须覆盖派单验收出口和必测失败路径；凡涉及用户看到的提示、错误、进度、状态、弹窗、结果摘要、导出文件名或打包态窗口，必须测到用户最终出口，不能只测 engine/API/helper 层。每个关键风险至少自设计一个反向探针。未设安全部时兼做本任务的轻量风险检查，未设财务部时兼做轻量成本检查；重大或超出能力的问题交统筹决定专项复核，不代用户授权。",
+        "not_responsible": "不代替用户体验功能;不判断是否顺手、是否符合用户预期;不改代码;不采信开发部转述的“已通过”;不只沿开发部 happy path 重跑一遍;不因底层 engine/API 通过就判定用户可见出口通过。",
         "inputs": "docs/spec.md, 验收标准, 验收出口, 必测失败路径, 可运行的产出, 复现方式, 变更摘要(仅用于定位)",
         "outputs": "报告/ 测试报告(附自己跑出的证据:实际输出/测试结果/截图/复现步骤,并写明验证层级、用户可见出口、自设计反向探针、未覆盖层级、是否触发子 Agent 盲审/抽检), bug 清单, 是否通过建议",
         "can_write": "报告/",
         "cannot_write": "app/ 代码, 验收标准本身",
-        "confirm": "低影响的体验前最小冒烟无需用户先确认；测试会明显妨碍用户正常使用设备时遵守高影响测试例外，前台独占或难以自行退出时取得当次明确确认。完整体验方向由用户确认后再做正式回归。无用户界面的任务按验收出口直接完整验证。测试结论只回统筹部，不得直接返工或放行；涉及体验取舍、范围变化、成本、安全、发布、方案选择或重大事项时由统筹部请用户确认",
+        "confirm": "低影响测试无需用户先确认；测试会明显妨碍用户正常使用设备时遵守高影响测试例外，前台独占或难以自行退出时取得当次明确确认。体验等待条件见上文；已确认方向无需重复确认。无用户界面的任务按验收出口直接完整验证。测试结论只回统筹部，不得直接返工或放行；涉及体验取舍、范围变化、成本、安全、发布、方案选择或重大事项时由统筹部请用户确认",
     },
     "security": {
         "name": "安全部",
@@ -1712,6 +1712,7 @@ STATES = ("queued", "claimed", "blocked", "waiting_input", "completed", "acknowl
 THREAD_ID_MAX_CHARS = 300
 ACTOR_MAX_CHARS = 400
 HOT_CONTEXT_WARNING_BYTES = 24_000
+USER_EXIT_ASSESSMENT = "统筹核对任务、等待原因及已有授权：需用户参与且证据未齐则保持 pending；已验收记 verified，无用户依赖才记 not_applicable，并留依据。"
 BUSY_STATES = {"claimed"}
 VISIBLE_ACTIVE_STATES = {"claimed", "blocked", "waiting_input"}
 STATE_CN = {
@@ -3118,12 +3119,8 @@ def department_onboard_tasks(
             and task.get("resolution") is None
             and state != "acknowledged"
         )
-        lead_review = (
-            department == "统筹部"
-            and state == "completed"
-            and task.get("resolution") is None
-        )
-        if own_open_task or lead_review:
+        lead_current_slice = department == "统筹部"
+        if own_open_task or lead_current_slice:
             current.append((state, path, task))
 
     recovery: list[tuple[str, Path, dict]] = []
@@ -3275,6 +3272,8 @@ def render_handoff_hot_block(
             f"- 下一合法动作：`{decision['allowed'][0] if decision['allowed'] else 'none'}`"
             + (f" · 目标 `{decision['target_task_id']}`" if decision.get("target_task_id") else ""),
         ])
+        if decision["user_decision"] is None:
+            lines.append(f"- 用户依赖待判断：{USER_EXIT_ASSESSMENT}")
     lines.extend(visible or ["- 本部门当前没有活动切片 TASK"])
     if recovery:
         lines.extend(["", "### 冻结恢复任务", ""])
@@ -3294,6 +3293,96 @@ def extract_handoff_hot_block(text: str) -> str:
     if HANDOFF_HOT_BLOCK_END in text[:start]:
         raise ValueError("交接班文档机器区块顺序无效")
     return text[start:end]
+
+
+def handoff_recovery_scope(department: str) -> tuple[str, str, tuple[tuple[str, str], ...]]:
+    """Bind recovery prose to machine-owned tasks and the current candidate, never prose IDs."""
+    active = load_slice_control().get("active_slice")
+    candidate_id = ((active.get("candidate") or {}).get("candidate_id") or "none") if active else "none"
+    current, recovery = department_onboard_tasks(department)
+    bindings = {(task["task_id"], candidate_id) for _, _, task in current}
+    if active and department == "统筹部":
+        bindings.add((active["owner_task_id"], candidate_id))
+    bindings.update((task["task_id"], "legacy") for _, _, task in recovery)
+    return (active["slice_id"] if active else "none", candidate_id, tuple(sorted(bindings)))
+
+
+def extract_handoff_recovery(text: str, scope: tuple[str, str, tuple[tuple[str, str], ...]]) -> str:
+    allowed = set(scope[2])
+    if not allowed:
+        return ""
+    headings = []
+    fence = ""
+    fence_start = -1
+    offset = 0
+    for line in text.splitlines(keepends=True):
+        marker = re.match(r" {0,3}(`{3,}|~{3,})(.*)$", line.rstrip("\r\n"))
+        if fence:
+            if marker and marker[1][0] == fence[0] and len(marker[1]) >= len(fence) and not marker[2].strip():
+                fence = ""
+                fence_start = -1
+        elif marker:
+            fence, fence_start = marker[1], offset
+        else:
+            heading = re.fullmatch(r"(##|###) ([^\r\n]+)[\r\n]*", line)
+            if heading:
+                headings.append((offset, offset + len(line), len(heading[1]), heading[2].strip()))
+        offset += len(line)
+    sections = [item for item in headings if item[2:] == (2, "当前任务补充说明")]
+    if len(sections) > 1:
+        raise ValueError("HANDOFF_RECOVERY_AMBIGUOUS | 当前任务补充说明重复")
+    warning = (
+        "> HANDOFF_RECOVERY_REVIEW | 恢复说明未绑定当前 TASK/候选；"
+        "先核对本文件当前任务补充说明及相关下一步/已知坑，再继续；不得据旧说明认领任务或重跑操作。"
+    )
+    if not sections:
+        return warning
+    start = sections[0][1]
+    end = next((item[0] for item in headings if item[0] >= start and item[2] == 2), len(text))
+    if fence and start <= fence_start < end:
+        raise ValueError("HANDOFF_RECOVERY_AMBIGUOUS | 恢复说明的代码围栏未闭合")
+    entries = [item for item in headings if start <= item[0] < end and item[2] == 3]
+    if not entries:
+        return warning
+    selected = []
+    seen = set()
+    stale_tasks = set()
+    needs_review = bool(re.sub(r"(?m)^>.*$", "", text[start:entries[0][0]]).strip())
+    for index, entry in enumerate(entries):
+        entry_end = entries[index + 1][0] if index + 1 < len(entries) else end
+        body = text[entry[1]:entry_end].strip()
+        binding = re.fullmatch(
+            r"(TASK-[0-9]{8}-[A-Z0-9]{6}|none) / (CAND-[0-9]{8}-[A-Z0-9]{6}|none|legacy)",
+            entry[3],
+        )
+        if not binding:
+            needs_review = True
+            continue
+        identity = binding.groups()
+        if identity == ("none", "none"):
+            placeholders = {
+                "- 已做到:无", "- 已定决策/限制/不能重复:无", "- 下一步:无", "- 证据与文件指针:无",
+            }
+            needs_review |= any(line.strip() and line.strip() not in placeholders for line in body.splitlines())
+            continue
+        if identity not in allowed:
+            if identity[0] in {task_id for task_id, _ in allowed}:
+                stale_tasks.add(identity[0])
+            continue
+        if identity in seen:
+            raise ValueError("HANDOFF_RECOVERY_AMBIGUOUS | 同一任务候选有重复恢复说明")
+        seen.add(identity)
+        selected.append(text[entry[0]:entry_end].strip())
+    output = []
+    if selected:
+        output = [
+            "## 当前任务补充说明",
+            "> 人工恢复记录；所有权、状态、授权和验收仍以 TASK 及候选记录为准。",
+            *selected,
+        ]
+    if needs_review or stale_tasks - {task_id for task_id, _ in seen}:
+        output.append(warning)
+    return "\n\n".join(output)
 
 
 def update_handoff_freshness(
@@ -4659,7 +4748,7 @@ def slice_progress_priority(
         ] if state in {"blocked", "waiting_input"} else ["complete", "bind-candidate"]
         return {
             "first_blocker": "P0_FREEZE_ACTIVE" if frozen else "USER_EXIT_PENDING",
-            "allowed": allowed, "forbidden": forbidden, "user_decision": True,
+            "allowed": allowed, "forbidden": forbidden, "user_decision": True if frozen else None,
         }
     if not task_owner_is_current(task):
         return owner_rebind_priority()
@@ -4853,7 +4942,7 @@ def next_action_decision(task_id: str) -> dict[str, object]:
     if user_exit == "pending":
         return {
             "first_blocker": "USER_EXIT_PENDING", "allowed": ["record-user-exit", "wait", "block", "next-action"],
-            "forbidden": ["complete", "bind-candidate"], "user_decision": True,
+            "forbidden": ["complete", "bind-candidate"], "user_decision": None,
         }
     if user_exit == "needs_revision":
         return {
@@ -4897,13 +4986,17 @@ def cmd_next_action(args) -> int:
         raise ValueError("HOT_STATE_BUSY | next-action 查询期间机械真值发生变化")
     allowed = ",".join(decision["allowed"]) or "none"
     forbidden = ",".join(decision["forbidden"]) or "none"
-    user_decision = "yes" if decision["user_decision"] else "no"
+    user_decision = "assess" if decision["user_decision"] is None else (
+        "yes" if decision["user_decision"] else "no"
+    )
     target_task = decision.get("target_task_id", task["task_id"])
     print(
         f"NEXT_ACTION | task={task['task_id']} | state={state} | "
         f"first_blocker={decision['first_blocker']} | target_task={target_task} | allowed={allowed} | "
         f"forbidden={forbidden} | user_decision={user_decision}"
     )
+    if decision["user_decision"] is None:
+        print(f"USER_EXIT_ASSESS | {USER_EXIT_ASSESSMENT}")
     return 0
 
 
@@ -5539,6 +5632,7 @@ def cmd_onboard_bundle(args) -> int:
     )
     if any(path.exists() for path in transactions):
         raise ValueError("HOT_STATE_BUSY | 当前有未恢复事务；请统筹先运行任一任务工具完成恢复")
+    recovery_scope = handoff_recovery_scope(department)
     verify_hot_state(department)
     department_root = DEPARTMENTS / department
     documents = [
@@ -5553,7 +5647,10 @@ def cmd_onboard_bundle(args) -> int:
         source_data = path.read_bytes()
         source_snapshots.append((label, path, source_data))
         data = (
-            (extract_handoff_hot_block(source_data.decode("utf-8-sig")) + "\n").encode("utf-8")
+            ("\n\n".join(part for part in (
+                extract_handoff_hot_block(source_data.decode("utf-8-sig")),
+                extract_handoff_recovery(source_data.decode("utf-8-sig"), recovery_scope),
+            ) if part) + "\n").encode("utf-8")
             if label == "交接班文档.md" else source_data
         )
         snapshots.append((label, path, data))
@@ -5576,6 +5673,8 @@ def cmd_onboard_bundle(args) -> int:
             snapshots.append((f"tasks/{path.name}", path, path.read_bytes()))
     verify_hot_state(department)
     current_after, recovery_after = department_onboard_tasks(department)
+    if handoff_recovery_scope(department) != recovery_scope:
+        raise ValueError("HOT_STATE_BUSY | 接班快照读取期间切片或候选绑定发生变化")
     if identity_rows(current_after, recovery_after) != selected_identity:
         raise ValueError("HOT_STATE_BUSY | 接班快照读取期间 TASK 身份集合发生变化")
     if any(path.exists() for path in transactions):
@@ -5598,7 +5697,9 @@ def cmd_onboard_bundle(args) -> int:
             f"HOT_CONTEXT_WARNING | {department} | bytes={hot_context_bytes} | "
             f"threshold={HOT_CONTEXT_WARNING_BYTES} | 内容未截断，请先收紧岗位说明或热交接"
         )
-    for label, _, data in snapshots:
+    for label, path, data in snapshots:
+        view = "excerpt" if label == "交接班文档.md" else "full"
+        print(f"SOURCE | {path.relative_to(PROJECT).as_posix()} | view={view}")
         print(f"===== BEGIN {label} =====")
         sys.stdout.write(data.decode("utf-8-sig"))
         if not data.endswith(b"\n"):
@@ -6570,18 +6671,18 @@ def role_markdown(
         else "- 执行/管理层先自检再回报,不得替审核层给出最终质量、风险或成本放行结论。"
     )
     management_rule = (
-        "- 正常模式一次只推进一个切片和一个执行 owner;最多两个 gate 且绑定同一候选。宿主有 heartbeat/lease/查询/等待/恢复/归档才自动等待;否则 manual-degraded 人工交接。不得自动开启下一切片。同一 gate 跨两代连续 FAIL 或出现冻结条件时运行 `freeze-new-work`;仅凭用户明确恢复证据运行 `unfreeze-new-work`。\n"
+        "- 正常模式一次只推进一个切片和一个执行 owner;最多两个 gate 且绑定同一候选。当前调度固定为 manual-degraded。切片续接沿用上文授权条件。同一 gate 跨两代连续 FAIL 或出现冻结条件时运行 `freeze-new-work`；正常待验证或待用户反馈本身不触发冻结；仅凭用户明确恢复证据运行 `unfreeze-new-work`。\n"
         "- 用户互动按意图、TASK 影响和是否需用户信息/体验判断/授权分流:需则 user_exit pending 停下,否则本切片验证后 not_applicable 继续。临时问题直接答并保留 TASK;正式汇报用“结果 / 需要你做什么 / 还需注意”,第三段按需,普通问答不套模板。"
         if key == "lead"
         else "- 项目总进度由统筹部维护;本部门用收件箱、交接班文档和产出路径完成闭环。"
     )
     confirmation_heading = (
-        "## 必须请用户确认的节点" if key == "lead" else "## 必须经统筹请用户确认的节点"
+        "## 用户决定事项" if key == "lead" else "## 经统筹处理的用户决定事项"
     )
     base = f"""# {role['name']}岗位说明
 
 > 角色 ID:`{key}` ·所在层:{layer_cn} ·创建日期:{date}
-> 本文件只放本岗位长期职责与边界;通用流程细则按需查 `../../README.md` 和 `../../任务交接模板.md`。
+> 细则按需查 `../../README.md` 和 `../../任务交接模板.md`。
 
 ## 负责什么
 
@@ -6611,11 +6712,14 @@ def role_markdown(
 
 {role['confirm']}
 
+已覆盖本次动作的授权继续有效；仅新增范围、风险或缺用户信息时确认。高影响测试例外见下文。
+
 ## 核心协作纪律
 
 - 手上只领取一件;任务正文、所有权和状态只认 `../../tasks/TASK-*.json`,并用 `../../scripts/agent_team_task.py` 流转。收件箱只是自动索引;缺验收出口或失败路径时回统筹部补齐。
-- 完成回报必须带真实产出、已验证/未验证项、`TASK_STATE_OK` 和错题自检;用户门禁由统筹部统一办理,本部门不得把建议写成授权。
+- 回报产出、自检与验证/未验证；待审核或验收时先交付，不提前 `complete`。正式完成才附 `TASK_STATE_OK`；用户门禁归统筹，建议不作授权。Git 仅提交用户已确认收口的本节点。
 - 后台及普通低影响测试照常自动执行,不增加用户汇报。测试可能明显妨碍用户正常使用设备时,执行前说明影响、预计时长、期间能否继续工作和退出方式;前台独占或难以自行退出时还须取得当次明确确认,阶段性 Kickoff / 开发授权不能替代。
+- 需求入口、目录约定、读取与软件取舍见项目 `docs/agent-guide.md`，未规定时见协作总则；岗位路径为默认位置，缺失不等于需要新建。
 {audit_rule}
 {management_rule}
 """
@@ -6642,19 +6746,16 @@ def bootstrap_markdown(key: str, role: dict[str, str]) -> str:
     layer_cn = LAYER_CN.get(role.get("layer", ""), "")
     return f"""# {role['name']} 上岗引导
 
-> 定位:本部门新会话首次接班与换班的唯一入口。同一会话后续不重复读取。
-> 自动模式由会话工具发送本段;人工模式由用户粘贴本段。
+> 接班入口不重复读取；由工具发送或用户粘贴。
 
 ```
 你现在是【{role['name']}】(角色 ID:{key} ·所在层:{layer_cn})。
 
-当前消息/文件就是第 1 份上岗入口,不要重复读取。接着按顺序读取:
-
 2. 运行 `python3 docs/collaboration/scripts/agent_team_task.py onboard-bundle --department "{role['name']}"`。
-3. 它校验 freshness 并原样输出岗位说明、交接班、收件箱和当前 TASK；不生成摘要、不读冷历史。失败时停止并请统筹重建；成功后不重复读取。
+3. 已含岗位、交接、收件箱和 TASK，不重复读。失败先停下：freshness 过期请统筹重建，其余按提示处理；恢复说明提示需核对时先核对。不生成摘要。
 
-- 交接或收件箱指向任务时只读对应 TASK JSON。已有授权清楚且无冲突的 `claimed` 任务,短报后同一轮续做;无任务、授权不清、存在冲突或用户只要求接班时停下。
-- 只按当前任务需要查项目正文、错题、报告或日志;默认不读冷历史、其他部门正文、完整 diff 或测试全文。处理任务期间不刷新收件箱。
+- 已授权且无冲突的 `claimed` 任务短报后续做；无任务、授权不清、存在冲突或用户只要求接班时停下。缺失内容或状态变化时补读相关原文，身份、授权和候选仍由状态工具核验。
+- 按当前任务需要查正文、错题、报告或日志；默认不读冷历史、其他部门正文、完整 diff 或测试全文。处理任务期间不刷新收件箱。
 - 需求变化、用户纠偏、关键决策和重大事故直接用日志工具写事实,不先读日志。通知沿用已登记模式,只发短状态。
 - “交班”只更新交接和必要日志;“换会话 / 换班”才按会话启动清单创建全新同部门会话。新会话登记成功后再归档旧会话,不 fork 旧历史,失败时保留旧会话。
 ```
@@ -6672,32 +6773,23 @@ def state_markdown(key: str, role: dict[str, str], date: str) -> str:
 <!-- agent-team current-slice:end -->
 
 > 角色 ID:`{key}` ·最近更新:{date}
-> 这是本部门的**语义交接**(给接班的人看),不是任务状态真值或流水账。任务所有权、状态和产物只认 `../../tasks/TASK-*.json`;若两者冲突,以任务 JSON 为准并修正本文件。
+> 只记恢复说明，不记流水账。所有权、状态和产物以 `../../tasks/TASK-*.json` 为准；冲突时据此修正。
 > 铁律:从这里删掉的档案级事实,必须先用 `../../scripts/agent_team_log.py append` 追加到本周日志末尾,绝不直接丢;普通过程不记。
 
 ## 当前任务补充说明
 
-> 只记录任务 JSON 不适合承载的恢复信息。没有时写“无”;干活时不刷收件箱。
+> 按 `### TASK-ID / 候选ID` 分条；无候选填 `none`，旧协议恢复填 `legacy`，统筹用 owner TASK。换候选后重新核对并绑定，旧说明不得直接改标。
 
+### none / none
 - 已做到:无
-- 关键中间结论:无
-- 相关产出路径:无
+- 已定决策/限制/不能重复:无
+- 下一步:无
+- 证据与文件指针:无
 
-## 已定、不再回退的决策
+## 历史决策与文件指针（按需）
 
-- _(决策 + 一句原因;后续会话不该再重新纠结)_
+- _(只放当前任务以外的长期信息；保留必要原因和证据)_
 
-## 下一步
-
-- _(做完在办的之后、或下个会话接手应先做什么)_
-
-## 已知坑 / 未决问题
-
-- _(踩过的坑怎么绕、还没解决的问题)_
-
-## 关键文件指针
-
-- _(本部门常碰的文件 / 产出路径)_
 """
 
 
@@ -6718,25 +6810,26 @@ _(没有在办任务)_
 
 
 def reports_readme_markdown(role: dict[str, str], date: str) -> str:
-    return f"""# 审核报告
-
-> 创建日期:{date}
-> {role['name']}使用。每份必须附本部门亲自取得的独立证据,不得把执行部门的完成陈述当成验证结果。
-> 证据结构由任务领域决定;涉及用户可见结果时必须验证真实用户出口。审核结论只回统筹部,不自动返工、放行或推进下一节点。
-> 文件命名:`YYYY-MM-DD-对象-审核报告.md`。正文使用 YAML frontmatter,每个标量字段保持单行,便于定位、归档和跨部门引用。
-
-<!-- 一份审核报告的格式:
----
+    return f"""---
 type: audit_report
 department: {role['name']}
 target: 待填
 status: pending
 date: {date}
 related_task: 待填
+candidate_id: 待填当前候选ID
 decision: 待定
 tags: []
 summary: 待填一句话结论
 ---
+
+# 审核报告
+
+> 创建日期:{date}
+> {role['name']}使用。每份必须附本部门亲自取得的独立证据,不得把执行部门的完成陈述当成验证结果。
+> 证据结构由任务领域决定;涉及用户可见结果时必须验证真实用户出口。审核结论只回统筹部,不自动返工、放行或推进下一节点。
+> 文件命名:`YYYY-MM-DD-对象-审核报告.md`。复制本文件并填写开头 YAML 字段,每个标量字段保持单行,便于定位、归档和跨部门引用。
+
 
 ## 审核对象与标准
 ## 独立证据
@@ -6751,20 +6844,12 @@ summary: 待填一句话结论
 ## 未覆盖项
 ## 结论:通过 / 不通过 + 理由
 ## 需要用户决定
--->
-> 完成审核任务前，必须把 `status` 改为 `final`，把 `decision` 改为 `pass` 或 `fail`，并写出真实 summary；草稿不能通过任务完成闸门。
+> 完成前填写当前任务与候选 ID，将 `status` 改为 `final`、`decision` 改为 `pass` 或 `fail`，写出真实 summary 和证据；草稿不能通过任务完成闸门。
 """
 
 
 def work_reports_readme_markdown(role: dict[str, str], date: str) -> str:
-    return f"""# 报告
-
-> 创建日期:{date}
-> 不是所有任务都需要正式报告。默认用任务完成记录 + 交接班闭环;只有复杂研究、设计、方案、架构、数据分析、阶段总结或用户决策材料才写工作报告。
-> 文件命名:`YYYY-MM-DD-对象-报告类型.md`。正文使用 YAML frontmatter,每个标量字段保持单行,便于定位、归档和跨部门引用。
-
-<!-- 工作报告模板:
----
+    return f"""---
 type: work_report
 department: {role['name']}
 target: 待填
@@ -6776,28 +6861,27 @@ tags: []
 summary: 待填一句话摘要
 ---
 
+# 报告
+
+> 创建日期:{date}
+> 默认用任务完成记录和交接班闭环;只有复杂研究、设计、方案、架构、数据分析、阶段总结或用户决策材料才写工作报告。
+> 文件命名:`YYYY-MM-DD-对象-报告类型.md`。复制本文件并填写开头 YAML 字段,每个标量字段保持单行,便于定位、归档和跨部门引用。
+
+
 ## 背景
 ## 结论
 ## 证据 / 过程
 ## 风险 / 未覆盖项
 ## 建议下一步
--->
 """
 
 
 def special_conclusion_readme(date: str) -> str:
-    return f"""# 专项结论
-
-> 创建日期:{date}
-> 只放会被多个部门复用的结论。只影响一个任务、一个部门的结论放在对应报告正文里;长期改变项目规则、架构、依赖、安全或发布方式的结论升级到 `docs/decisions/`。
-> 文件命名:`YYYY-MM-DD-对象-专项结论.md`。正文使用 YAML frontmatter,每个标量字段保持单行,便于定位、归档和跨部门引用。
-
-<!-- 专项结论模板:
----
+    return f"""---
 type: special_conclusion
 department: 统筹部
 target: 待填
-status: active
+status: draft
 date: {date}
 related_task: 待填
 decision: 待填
@@ -6805,12 +6889,18 @@ tags: []
 summary: 待填一句话结论
 ---
 
+# 专项结论
+
+> 创建日期:{date}
+> 只放会被多个部门复用的结论。只影响一个任务、一个部门的结论放在对应报告正文里;长期改变项目规则、架构、依赖、安全或发布方式的结论升级到 `docs/decisions/`。
+> 文件命名:`YYYY-MM-DD-对象-专项结论.md`。复制本文件并填写开头 YAML 字段,每个标量字段保持单行,便于定位、归档和跨部门引用。
+
+
 ## 结论
 ## 适用范围
 ## 不适用范围
 ## 证据 / 来源
 ## 后续引用方式
--->
 """
 
 
@@ -6898,7 +6988,7 @@ def route_table_markdown(roles: list[str], date: str) -> str:
 
 ## 统一路由规则
 
-- 只问一句、不改产物、不改状态的澄清:可直连目标部门。
+- 不改产物或状态的澄清、只读建议可直连相关部门；涉及合同修订与范围取舍仍由统筹处理，不另建第二写入任务。
 - 派单、返工、阻断、裁决、需求/范围变更、审核结论、放行、状态升级、增删部门:经统筹部。
 - 通知只带任务 ID 和“有新任务 / 已完成 / 遇到阻断”;任务真值在 `tasks/` 中。
 """
@@ -6991,6 +7081,8 @@ def handoff_template_markdown() -> str:
 5. gate 用 `gate-verdict` 把 PASS/FAIL 追加到同一 TASK 并绑定当前 candidate ID；跨两代连续 FAIL 自动冻结。
 6. 全部 gate PASS 后由统筹记录用户出口。gate 先完成和核收，owner 再以同一 manifest 完成和核收；活动切片随后进入冷历史。
 
+以下是派单与领取示例；后续按上述顺序执行，参数以各命令 `--help` 为准。
+
 ```bash
 python3 docs/collaboration/scripts/agent_team_task.py enqueue \
   --actor "统筹部/已登记会话ID" \
@@ -7004,14 +7096,48 @@ python3 docs/collaboration/scripts/agent_team_task.py enqueue \
   --required-gate test
 
 python3 docs/collaboration/scripts/agent_team_task.py claim --task-id TASK-YYYYMMDD-XXXXXX --claimed-by "开发部/已登记会话ID"
-python3 docs/collaboration/scripts/agent_team_task.py authorize --task-id TASK-YYYYMMDD-XXXXXX \
-  --state user_confirmed --evidence "用户确认消息或会话指针" --actor "统筹部/已登记会话ID"
-python3 docs/collaboration/scripts/agent_team_task.py complete --task-id TASK-YYYYMMDD-XXXXXX \
-  --actor "开发部/已登记会话ID" \
-  --artifact "产出路径" --verified "已验证内容" --unverified "未验证项;没有则写无" \
-  --mistake-check "已检查相关错题,无命中"
-python3 docs/collaboration/scripts/agent_team_task.py ack --task-id TASK-YYYYMMDD-XXXXXX --acknowledged-by "统筹部/已登记会话ID"
 ```
+
+## 固定可复查候选
+
+每代使用独立的产物快照和 manifest 文件，绑定后保留原字节。不要绑定随后还会编辑的工作文件，也不覆盖旧代文件；历史核验仍会检查它们。只保存本次交付所需内容，不要求复制整个项目。
+
+manifest 是项目内 UTF-8 JSON，字段固定如下；替换所有示例值后再绑定：
+
+```json
+{
+  "schema_version": 1,
+  "candidate_id": "CAND-YYYYMMDD-XXXXXX",
+  "artifact": {
+    "path": "项目内本代产物快照的相对路径",
+    "sha256": "该文件实际计算的64位小写SHA256",
+    "kind": "file"
+  },
+  "source_revision": "真实源码版本或可追溯的未提交快照标识"
+}
+```
+
+`candidate_id` 中日期为八位数字、后缀为六位大写字母或数字。`kind` 也支持 `directory-manifest` 或 `git-tree`，但 `artifact.path` 仍须指向一个保存清单或版本信息的普通文件，不能直接传目录。`source_revision` 不能虚构提交记录。
+
+```bash
+shasum -a 256 "本代产物快照路径"
+# 将上面实际摘要填入 manifest，再计算 manifest 自身摘要。
+shasum -a 256 "本代manifest路径"
+python3 docs/collaboration/scripts/agent_team_task.py bind-candidate \
+  --task-id TASK-YYYYMMDD-XXXXXX --candidate-id CAND-YYYYMMDD-XXXXXX \
+  --manifest "项目内本代manifest相对路径" --sha256 "manifest实际摘要" \
+  --actor "开发部/已登记会话ID"
+```
+
+## 执行中修订合同
+
+发现合同不合理时先暂停受影响实现，用 `block` 留下证据和建议。产品部可提供只读修订方案；未配置产品部时由统筹协同用户确定方案，不另开第二 owner TASK。已有授权仍适用时沿用，新增范围、风险或用户专属取舍才补确认。
+
+仅当原 TASK 的范围和验收仍有效、所需授权已齐全且项目未冻结时，当前 owner 才能按已确认方案落盘并继续；先查看 `next-action`，按提示 `resume`。产品部负责规划内容，当前 owner 负责写入，其他部门不并行修改。已 accepted 的系统 ADR 保留正文，实质修订新建 ADR，经评审确认后替代旧版。
+
+已绑定候选时保留旧代文件。新代只接受真实的当前 gate FAIL，或全部 gate PASS 后统筹记录的真实用户 `needs_revision`；尚未完成的审核先按实际结果收口。不得编造 FAIL 或用户修订来解锁。
+
+当前工具不支持直接修改已派发 TASK 的范围和验收。原合同已失效时保持阻断并说明缺口；只有真实拒绝或放弃符合 `resolve` 条件时才能收口后重派，不手改 TASK，也不虚构放弃来绕过单 owner。
 
 ## 三轴状态
 
@@ -7023,7 +7149,7 @@ python3 docs/collaboration/scripts/agent_team_task.py ack --task-id TASK-YYYYMMD
 
 - `TASK_STATE_OK` 只证明状态已持久化、本地产物路径已校验和外部产物已显式声明;不证明业务质量。
 - `LOG_OK` 只证明一条真实轨迹事件已写入。只在 `MILESTONE / CHANGE / CORRECTION / DECISION / INCIDENT` 真实发生时记录,并带上任务 ID。
-- 完成四件套:产出路径、验证结果(含未验证项)、`TASK_STATE_OK`、错题自检。
+- 阶段交付回报产出、验证结果与未验证项、自检和后续归属即可；不等同 TASK 正式完成。只有完成条件齐全并成功执行 `complete` 后才附 `TASK_STATE_OK`，不为取得收据提前推进后续流程。
 
 ## 短唤醒
 
@@ -7070,9 +7196,9 @@ def session_startup_markdown(roles: list[str], session_mode: str, date: str) -> 
 4. 把对应 `上岗引导.md` 发给该会话;成功后用相同 thread ID 标记 `onboarded`,并记录外部收据。
 5. 用相同 thread ID 标记 `registered` 并记录登记证据;会话工具随后刷新 `部门表.md` 派生索引,不要手工改表。
 6. 任一步失败都用 `mark ... --step failed --evidence "真实错误"` 记录。重试只能从失败前最后成功点继续,不重复创建已有 thread ID 的会话。
-7. 宿主确有 heartbeat、lease、状态查询、等待、恢复和归档适配器时才自动接收与恢复；缺任一能力时记录 `manual-degraded`，只做人工短交接，不轮询、不承诺无人值守。
+7. 当前调度固定为 `manual-degraded`。`auto` 只用于已授权的会话创建和短通知，不代表自动接管或恢复；不轮询、不承诺无人值守。
 
-初始通知模式继承协作层的 `auto / manual`。用户确认改变通知模式后运行 `agent_team_session.py set-notification --department ... --mode auto|manual --evidence "用户确认指针"`;不要手工改部门表。
+初始通知模式继承协作层的 `auto / manual`。用户确认改变通知模式后运行 `agent_team_session.py set-notification --department ... --mode auto|manual --actor "统筹部/已登记会话ID" --evidence "用户确认指针"`;不要手工改部门表。
 
 ## 手动模式(其他 Agent / 无会话管理工具)
 
@@ -7090,7 +7216,7 @@ def session_startup_markdown(roles: list[str], session_mode: str, date: str) -> 
 
 - 会话出现反复遗忘边界、与项目文件矛盾、偏离当前任务或质量明显下降时,先说明具体原因、继续使用旧会话的风险和当前在办事项,然后询问用户是否换班。未获明确同意时保留当前会话,不自动创建、登记或归档。
 - 用户在部门会话说“换会话 / 切换会话 / 换班”,即明确授权本次创建同部门新会话并在接班成功后归档旧会话。
-- 用户授权后先执行 `agent_team_session.py begin-switch --department ... --old-thread-id ...`;旧会话再更新 `交接班文档.md` 和必要日志。没有已登记旧 ID 时不得自动归档。
+- 用户授权后先执行 `agent_team_session.py begin-switch --department ... --old-thread-id ... --reason "换班原因与用户授权指针"`;旧会话再更新 `交接班文档.md` 和必要日志。没有已登记旧 ID 时不得自动归档。
 - 使用当前宿主提供的会话管理能力创建同项目新会话并发送接班消息;具体工具由 Agent 按当前环境选择。不要用复制旧聊天历史的 fork。
 - 新会话接班消息必须带部门名、新旧会话 ID 和四文档路径;读取成功后依次用 `mark --step created / onboarded / registered --evidence ...` 登记同一新 thread ID。
 - 旧会话归档必须最后执行。归档成功后运行 `finish-switch --department ... --new-thread-id ... --evidence "归档收据"` 清理旧 ID。新会话尚未创建时，失败可直接执行 `restore-old --department ... --note "真实错误"`。一旦已登记新 thread ID，不得直接覆盖；若确定放弃新会话并恢复旧会话，先归档新会话，再用 `restore-old ... --evidence "host=<真实工具> thread_id=<新ID> archived=true"` 登记收据；无归档能力时保留新旧两个 ID 并提醒用户，不得让任一会话从真值中消失。新会话已 registered 而只是旧会话归档失败时，保持当前换班状态并重试 `finish-switch`。
@@ -7123,7 +7249,7 @@ def session_startup_markdown(roles: list[str], session_mode: str, date: str) -> 
 
 请按以下顺序直接读取,不要运行接班总结脚本:
 1. docs/collaboration/部门/【部门名】/上岗引导.md
-2. 运行 agent_team_task.py onboard-bundle --department "【部门名】"；失败时停止并请统筹 rebuild-index
+2. 运行 agent_team_task.py onboard-bundle --department "【部门名】"；失败先停下，仅 freshness 过期请统筹 rebuild-index，其余按真实错误处理
 3. 校验通过后直接使用命令原样输出的岗位说明、交接班、收件箱和当前 TASK，不再重复读取
 
 读取成功后先短报职责、当前任务和待确认问题;已有授权清楚的 claimed 任务且无冲突时同一轮续做。
@@ -7186,13 +7312,13 @@ docs/collaboration/
 ## 运行原则
 
 1. 团队至少包含管理、执行、审核三层；先用最小团队，有明确职责差异再加部门。
-2. 新会话读取上岗引导后运行一次 `onboard-bundle`；它校验 freshness 并原样输出岗位说明、交接班、收件箱及当前 TASK。`list` 默认只显示当前切片，`--include-cold` 才审计全历史。
+2. 新会话读取上岗引导后运行一次 `onboard-bundle`；它校验 freshness 并输出岗位、交接机器区块及当前恢复说明、收件箱和当前 TASK；恢复说明需核对时先核对。`list` 默认只显示当前切片，`--include-cold` 才审计全历史。
 3. Agent 按任务、权威性、遗漏风险和当前能力自主决定读取哪些项目正文；不限制篇数，也不规定全文或局部读取。只看索引或元数据时，不得声称覆盖正文。
 4. 所有任务状态变化通过 `agent_team_task.py`；`TASK_STATE_OK` 只证明状态持久化、本地路径校验和外部产物声明，不证明业务质量。
 5. 普通 TASK 动作必须匹配当前登记会话；该绑定用于防漂移和审计，不构成操作系统认证。体验、范围、发布、成本或安全风险仍以用户决定为准。
 6. 后台及普通低影响测试照常自动执行，不增加用户汇报。测试可能明显妨碍用户正常使用设备时，执行前说明影响、预计时长、期间能否继续工作和退出方式；前台独占或难以自行退出时还须取得当次明确确认，阶段性 Kickoff / 开发授权不能替代。
-7. 正常模式一次只推进一个切片、一个 owner、最多两个 gate 和一个当前候选；返工增加候选代次，不新建 replacement owner TASK，不自动开启下一切片。
-8. 用户要求冻结、开放任务堆积、上下文或存储压力、同一 gate 跨两代连续 FAIL，或节点仍无真实用户出口时，立即用任务工具 `freeze-new-work`。冻结后拒绝新派单、影响声明、领取、恢复和临时外包推进，只保留已领取任务完成或安全停下、清账、核收、交接、换班和证据；只有用户明确同意并留下证据才 `unfreeze-new-work`。
+7. 正常模式一次只推进一个切片、一个 owner、最多两个 gate 和一个当前候选；返工增加候选代次，不新建 replacement owner TASK。当前切片核收后，仅按已明确授权的计划顺序进入下一项；新增范围、风险或需要用户独有判断时停下确认。
+8. 用户要求冻结、开放任务堆积、上下文或存储压力、同一 gate 跨两代连续 FAIL，或验收出口缺失、无法验证时，立即用任务工具 `freeze-new-work`。冻结后拒绝新派单、影响声明、领取、恢复和临时外包推进，只保留已领取任务完成或安全停下、清账、核收、交接、换班和证据；只有用户明确同意并留下证据才 `unfreeze-new-work`。
 9. 审核部门必须亲自取得独立证据，覆盖任务指定的失败路径，并写清未覆盖项；证据结构由领域决定。
 10. 设计意图预览仅在用户明确提出或任务列为交付物时制作。触发后必须让用户直接看到，并说明与最终实现的保真差距。
 11. 会话变重时只说明具体症状、风险和当前任务，询问用户是否换班；用户未授权时不自动创建、登记或归档。
@@ -7201,20 +7327,41 @@ docs/collaboration/
 14. 协议 1.5 暂不允许临时外包另开第二 owner TASK；工具返回 `TEMPORARY_EXECUTOR_P2_REQUIRED`，不得绕过。
 15. `LOG_OK` 只用于 `MILESTONE / CHANGE / CORRECTION / DECISION / INCIDENT`，普通任务不凑日志。
 
+## 读取与输出
+
+普通业务按项目岗位与 TASK；用户明确调用或维护协作机制时读取本 Skill，运行工具不必先读脚本全文。接班与状态核验按上岗引导；内容缺失、变化或判断有冲突时补读相关原文。
+
+项目未规定输出规则时：长输出保留原文，先查退出状态、汇总与失败位置，再读相关段落；缺失、截断或矛盾时扩大范围，筛选为空不能判定通过。引用已读内容用已有路径，确需行号时只补相关段落。
+
+## 软件实现取舍
+
+开发与代码审核沿用项目 `docs/agent-guide.md` 的相关规则，岗位只保留入口。项目未规定时，先理解相关流程、查找项目已有实现及语言/平台/已有依赖的能力，再做当前需求必需的新增；以功能、体验、可靠性和维护成本判断，不以行数或文件数判优。保留明确要求、数据保护、权限检查、必要异常处理、可访问性和有效验证。
+
+复杂度自检只看本次改动及相关调用：同一业务规则有无重复，新增层次有无实际用途；只合并同义逻辑，保留不同职责。有具体问题才修，不扩为全仓审计、重构或新审核节点。分工、授权、独立验收、候选绑定与接班规则照常执行。
+
 ## 报告
 
 普通任务默认用 TASK 完成记录与真实产物闭环。复杂研究、方案、阶段总结或用户决策材料才写工作报告；审核任务写审核报告。共享格式只在 `模板/` 保留一份，各部门统一写入自己的 `报告/`。
 
-部门完成四件套只供统筹核收。用户互动不得依赖穷举场景；统筹先理解用户意图和它对当前 TASK 的影响，再判断是否需要用户独有信息、亲自操作或主观判断、方向或风险授权。需要时保持用户出口 `pending`，说明所需动作并停下；无上述依赖的纯代码或内部检查，在当前已确认切片通过自检和所需 gate 后记录 `not_applicable` 并继续内部步骤，不强制汇报，也不得自动开启下一切片。临时提问、状态追问直接回答并保留当前 TASK；清楚的同范围反馈沿用原 owner，只有含义不清或实质改变范围、优先级、方向、成本、安全、隐私、发布时再请求必要决定。
+部门完成四件套只供统筹核收。用户互动不得依赖穷举场景；统筹先理解用户意图和它对当前 TASK 的影响，再判断是否需要用户独有信息、亲自操作或主观判断、方向或风险授权。需要时保持用户出口 `pending`，说明所需动作并停下；无上述依赖的纯代码或内部检查，在当前已确认切片通过自检和所需 gate 后记录 `not_applicable` 并继续内部步骤，不强制汇报。切片续接按前述运行原则，不跳过独立审核。临时提问、状态追问直接回答并保留当前 TASK；清楚的同范围反馈沿用原 owner，只有含义不清或实质改变范围、优先级、方向、成本、安全、隐私、发布时再请求必要决定。
 
 正式体验、选择、风险和重要收口使用“结果 / 需要你做什么 / 还需注意”的稳定信息骨架，篇幅按情况伸缩，无真实注意项时省略第三段。体验时给出入口、操作顺序、预期结果、重点判断和已知限制。普通问答不套模板，不为格式制造空话；内部任务号、状态词、哈希、命令、日志和协议默认不展开。
 """
 
 
 
-def append_agent_guide(target: Path) -> None:
+def append_agent_guide(target: Path, foundation_file: str | None = None) -> None:
     guide = target / "docs" / "agent-guide.md"
     text = read_utf8(guide) if guide.exists() else "# Agent 协作入口\n"
+    # Keep the reviewed project input outside the replaceable protocol block.
+    prefix = "> 协作地基入口（相对项目根目录）："
+    if foundation_file is not None:
+        expected = prefix + json.dumps(foundation_file, ensure_ascii=False)
+        existing = [line for line in text.splitlines() if line.startswith(prefix)]
+        if existing and existing != [expected]:
+            raise ValueError("项目地基入口与本次声明冲突；核对既有入口，不静默替换")
+        if not existing:
+            text = text.rstrip() + "\n\n" + expected + "\n"
     start = "<!-- agent-team-guide:start -->"
     end = "<!-- agent-team-guide:end -->"
     block = f"""{start}
@@ -7314,7 +7461,7 @@ def ensure_core_docs(target: Path, date: str) -> list[Path]:
 
 ## 文件分工
 
-- `docs/spec.md` 或 `docs/overview.md`:项目目标、交付物、边界、验收标准。
+- 需求与验收:从本指南登记的项目地基入口读取。
 - `docs/progress.md`:项目级进度摘要,启用协作层后由统筹部维护。
 - `docs/collaboration/`:多会话部门协作层。
 """)
@@ -10203,7 +10350,7 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
                 resources=args.foundation_resources,
                 risks=args.foundation_risks,
             )
-            validate_foundation_file(target, "docs/overview.md")
+            foundation_path = validate_foundation_file(target, "docs/overview.md")
         else:
             ensure_core_docs(target, date)
 
@@ -10268,7 +10415,7 @@ def run_locked(args: argparse.Namespace, target: Path) -> int:
         os.replace(build_collab, collab)
         build_collab = None
         collab_published = True
-        append_agent_guide(target)
+        append_agent_guide(target, foundation_path.relative_to(target).as_posix())
     except Exception as exc:
         if build_collab is not None:
             shutil.rmtree(build_collab, ignore_errors=True)

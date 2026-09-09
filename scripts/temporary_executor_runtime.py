@@ -934,7 +934,7 @@ def rule_text(task: dict, temp: dict) -> str:
 
 你是只绑定 `{task['task_id']}` 的{temp['display_name']}。当前目标：{temp['current_brief']}
 
-## 允许写入
+## 历史任务写入范围（收口不能扩权）
 
 {allowed}
 
@@ -950,7 +950,7 @@ def rule_text(task: dict, temp: dict) -> str:
 
 ## 收口
 
-任务内调整必须同步 TASK brief。用户确认后固定候选；独立子 Agent 审查只在用户要求时调用且只给结论。最终 delivery submit 后进入 standby。正式吸收或用户明确放弃前不得清理 workspace。
+当前协议只允许旧任务恢复与收口，不能继续实现或执行 amend、resume、rework、candidate、submit。原 TASK brief 和允许路径仅用于识别既有范围，不授予新写入权限。保持 frozen，由统筹按 legacy 收口白名单处理已开始事务的 reconcile、明确 abandon、必要知识收口、cleanup、acknowledge、失败记账与真实会话归档；资源与证据未满足清理条件前保留。
 """
 
 
